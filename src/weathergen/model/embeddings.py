@@ -184,7 +184,7 @@ class StreamEmbedTransformer(torch.nn.Module):
         # final normalize and dropout
         out = self.dropout_final(self.ln_final(out))
 
-        return out.to(torch.float16)
+        return out.to(torch.bfloat16)
 
 
 class StreamEmbedLinear(torch.nn.Module):
