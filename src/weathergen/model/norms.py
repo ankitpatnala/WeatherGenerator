@@ -74,7 +74,7 @@ class AdaLayerNorm(torch.nn.Module):
         self.embed_aux.append(torch.nn.SiLU())
         self.embed_aux.append(torch.nn.Linear(4 * dim_aux, 2 * dim_embed_x))
 
-        self.norm = torch.nn.LayerNorm(dim_embed_x, norm_eps, norm_elementwise_affine)
+        self.norm = torch.nn.LayerNorm(dim_embed_x, norm_eps, norm_elementwise_affine, dtype=torch.float32)
 
     def forward(self, x: torch.Tensor, aux: torch.Tensor | None = None) -> torch.Tensor:
         for block in self.embed_aux:
