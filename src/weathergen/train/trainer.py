@@ -30,6 +30,7 @@ from weathergen.utils.config import Config
 from weathergen.utils.distributed import is_root
 from weathergen.utils.train_logger import TrainLogger
 from weathergen.utils.validation_io import write_validation
+import wandb
 
 _logger = logging.getLogger(__name__)
 
@@ -70,7 +71,11 @@ class Trainer(Trainer_Base):
         self.path_run = path_run
 
         self.init_perf_monitoring()
-        self.train_logger = TrainLogger(cf, self.path_run)
+        self.train_logger = TrainLogger(cf, self.path_run) 
+        if cf.wandb_logger and self.cf.rank == 0 :
+            wandb.init(project="quickstart_playground",
+                name=cf.run_id,
+                config=dict(cf))
 
     ###########################################
     def evaluate(self, cf, run_id_trained, epoch):
@@ -733,6 +738,19 @@ class Trainer(Trainer_Base):
                 pstr = "{:03d} : {:05d}/{:05d} : {:06d} : loss = {:.4E} "
                 pstr += "(lr={:.2E}, s/sec={:.3f})"
                 len_dataset = len(self.data_loader) // self.cf.batch_size
+                if self.cf.wandb_logger :
+                    log_dict = { 'epoch':epoch,
+                                 'step':bidx,
+                                 'len_dataset':len_dataset,
+                                 'total_steps':self.cf.istep,
+                                 'loss':np.nanmean(l_avg[0]),
+                                 'lr':self.lr_scheduler.get_lr()}
+
+                    for i_obs, rt in enumerate(self.cf.streams):
+                        log_dict[rt["name"]] = l_avg[0, i_obs]
+
+                    wandb.log(log_dict)
+
                 print(
                     pstr.format(
                         epoch,

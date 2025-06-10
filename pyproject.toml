@@ -25,6 +25,7 @@ dependencies = [
  "flash-attn; sys_platform == 'linux'",
  "polars~=1.25.2",
  "omegaconf~=2.3.0",
+ "wandb==0.20.1",
 ]
 
 [project.urls]

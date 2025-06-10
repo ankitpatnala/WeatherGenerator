@@ -78,7 +78,7 @@ masking_rate_sampling: True
 # sample a subset of all target points, useful e.g. to reduce memory requirements
 sampling_rate_target: 1.0
 
-num_epochs: 48
+num_epochs: 2
 samples_per_epoch: 512
 samples_per_validation: 512
 shuffle: True
@@ -118,6 +118,7 @@ run_history: []
 desc: ""
 data_loader_rng_seed: ???
 run_id: ???
+wandb_logger: True
 
 # Parameters for logging/printing in the training loop
 train_log:
