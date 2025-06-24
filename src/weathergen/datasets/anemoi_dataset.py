@@ -95,6 +95,7 @@ class AnemoiDataset:
         # Determine source and target channels, filtering out forcings etc and using
         # specified source and target channels if specified
         source_channels = stream_info["source"] if "source" in stream_info else None
+        source_exclude_channels = stream_info["source_exclude"] if "source_exclude" in stream_info else None 
         self.source_idx = np.sort(
             [
                 ds.name_to_index[k]
@@ -107,10 +108,16 @@ class AnemoiDataset:
                         if source_channels
                         else True
                     )
+                    and (
+                        np.invert(np.array([f in k for f in source_exclude_channels]).any())
+                        if source_exclude_channels
+                        else True
+                    )
                 )
             ]
         )
         target_channels = stream_info["target"] if "target" in stream_info else None
+        target_exclude_channels = stream_info["target_exclude"] if "target_exclude" in stream_info else None
         self.target_idx = np.sort(
             [
                 ds.name_to_index[k]
@@ -121,6 +128,11 @@ class AnemoiDataset:
                     and (
                         np.array([f in k for f in target_channels]).any()
                         if target_channels
+                        else True
+                    )
+                    and (
+                        np.invert(np.array([f in k for f in target_exclude_channels]).any())
+                        if target_exclude_channels
                         else True
                     )
                 )
