@@ -1,0 +1,51 @@
+{
+   "assets": {
+      "ocean_elem": {
+         "description": "Ocean element component of the AWI model using OpenIFS (CY43R3 version).",
+         "href": "ocean_elem/*.zarr",
+         "inodes": "154452",
+         "locations": [
+            "juwels_booster",
+            "jureca",
+         ],
+         "roles": [
+            "data"
+         ],
+         "size": "4.4 TB",
+         "title": "ocean_elem/*.zarr",
+         "type": "application/zarr"
+      }
+   },
+   "bbox": [
+      0,
+      -90,
+      360,
+      90
+   ],
+   "geometry": {
+      "coordinates": [
+         [
+            [
+               0,
+               -90
+            ],
+            [
+               0,
+               90
+            ],
+            [
+               360,
+               90
+            ],
+            [
+               360,
+               -90
+            ],
+            [
+               0,
+               -90
+            ]
+         ]
+      ],
+      "type": "Polygon"
+   },

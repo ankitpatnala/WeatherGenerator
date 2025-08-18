@@ -193,6 +193,7 @@ bar
 *.nc
 *.npz
 *.json
+!stac/jsons/*.json
 *.zarr/
 ~$images.pptx
 test.py
