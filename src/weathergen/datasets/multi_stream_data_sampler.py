@@ -7,12 +7,12 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+import logging
 import pathlib
 
 import numpy as np
 import torch
 
-from weathergen.common.io import IOReaderData
 from weathergen.datasets.data_reader_anemoi import DataReaderAnemoi
 from weathergen.datasets.data_reader_base import (
     DataReaderBase,
@@ -33,10 +33,17 @@ from weathergen.datasets.utils import (
     compute_offsets_scatter_embed,
     compute_source_cell_lens,
 )
-from weathergen.utils.logger import logger
-from weathergen.utils.train_logger import Stage
+from weathergen.utils.logger import init_loggers, logger
+from weathergen.utils.train_logger import Stage, TrainLogger
 
-type AnyDataReader = DataReaderBase | DataReaderAnemoi | DataReaderObs
+_logger = logging.getLogger(__name__)
+
+type AnyDataReader = (
+    DataReaderBase
+    | DataReaderAnemoi
+    | DataReaderObs
+    # | FesomDataset | AtmorepDataset
+)
 
 
 class MultiStreamDataSampler(torch.utils.data.IterableDataset):
@@ -48,6 +55,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         end_date_,
         batch_size,
         samples_per_epoch,
+        train_logger: TrainLogger,
         stage: Stage,
         shuffle=True,
     ):
@@ -59,12 +67,13 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         assert end_date > start_date, (end_date, start_date)
 
         self.mask_value = 0.0
+        self._train_logger = train_logger
         self._stage = stage
 
         self.len_hrs: int = cf.len_hrs
         self.step_hrs: int = cf.step_hrs
         self.time_window_handler = TimeWindowHandler(start_date, end_date, cf.len_hrs, cf.step_hrs)
-        logger.info(
+        _logger.info(
             f"Time window handler: start={start_date}, end={end_date},"
             f"len_hrs={cf.len_hrs}, step_hrs={cf.step_hrs}"
         )
@@ -122,8 +131,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                 else:
                     filename = pathlib.Path(datapath) / fname
 
-                    # DataReaderFesom can take regular expressions so this check is bypassed
-                    if not filename.exists() and stream_info["type"] != "fesom":  # see above
+                    if not filename.exists():  # see above
                         msg = (
                             f"Did not find input data for {stream_info['type']} "
                             f"stream '{stream_info['name']}': {filename}."
@@ -153,7 +161,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         # adjust len to split loading across all workers and ensure it is multiple of batch_size
         len_chunk = ((self.len // cf.num_ranks) // batch_size) * batch_size
         self.len = min(self.len, len_chunk)
-        logger.info(f"index_range={index_range}, len={self.len}, len_chunk={len_chunk}")
+        _logger.info(f"index_range={index_range}, len={self.len}, len_chunk={len_chunk}")
 
         self.rank = cf.rank
         self.num_ranks = cf.num_ranks
@@ -184,7 +192,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         if cf.training_mode == "forecast":
             self.tokenizer = TokenizerForecast(cf.healpix_level)
         elif cf.training_mode == "masking":
-            masker = Masker(cf)
+            masker = Masker(cf.masking_rate, cf.masking_strategy, cf.masking_rate_sampling)
             self.tokenizer = TokenizerMasking(cf.healpix_level, masker)
             assert self.forecast_offset == 0, "masked token modeling requires auto-encoder training"
             msg = "masked token modeling does not support self.input_window_steps > 1; "
@@ -288,8 +296,9 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             len : number of batch items
             len[*] : number of streams
         """
+        init_loggers()
         iter_start, iter_end = self.worker_workset()
-        logger.info(f"iter_start={iter_start}, iter_end={iter_end}, len={self.len}")
+        _logger.info(f"iter_start={iter_start}, iter_end={iter_end}, len={self.len}")
 
         # create new shuffeling
         self.reset()
@@ -331,15 +340,14 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                         # source window (of potentially multi-step length)
                         rdata: ReaderData = ds.get_source(idx)
 
-                        # rdata needs to be wrapped in a different class
-                        # to avoid unwanted dependencies => see IOReaderData docstring
-                        rdata_wrapped = IOReaderData.create(rdata)
-
                         if rdata.is_empty():
-                            stream_data.add_empty_source(rdata_wrapped)
+                            stream_data.add_empty_source()
                         else:
                             # TODO: handling of conversion from numpy to torch here and below
                             # TODO: this should only be collected in validation mode
+                            source_raw = torch.from_numpy(
+                                np.concatenate((rdata.coords, rdata.geoinfos, rdata.data), 1)
+                            )
 
                             (ss_cells, ss_lens, ss_centroids) = self.tokenizer.batchify_source(
                                 stream_info,
@@ -351,7 +359,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                                 ds,
                             )
 
-                            stream_data.add_source(rdata_wrapped, ss_lens, ss_cells, ss_centroids)
+                            stream_data.add_source(source_raw, ss_lens, ss_cells, ss_centroids)
 
                         # target
 
@@ -442,7 +450,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             iter_end = iter_start + per_worker
             if worker_info.id + 1 == worker_info.num_workers:
                 iter_end = local_end
-            logger.info(
+            _logger.info(
                 f"{self.rank}::{worker_info.id}"
                 + f" : dataset [{local_start},{local_end}) : [{iter_start},{iter_end})"
             )
