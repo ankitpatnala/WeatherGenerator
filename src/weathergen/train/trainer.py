@@ -69,6 +69,8 @@ class Trainer(TrainerBase):
 
         self.freeze_modules = cf.get("freeze_modules", "")
 
+        self.freeze_modules = cf.get("freeze_modules", "")
+
         assert cf.samples_per_epoch % cf.batch_size_per_gpu == 0
         assert cf.samples_per_validation % cf.batch_size_validation_per_gpu == 0
         config.validate_forecast_policy_and_steps(cf=cf)
