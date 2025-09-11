@@ -70,6 +70,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         )
 
         self.forecast_offset = cf.forecast_offset
+        self.forecast_start = cf.forecast_start
         self.forecast_delta_hrs = (
             cf.forecast_delta_hrs if cf.forecast_delta_hrs > 0 else self.len_hrs
         )
@@ -232,7 +233,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         # initialize the random number generator: self.data_loader_rng_seed is set to a DDP-unique
         # value in worker_workset()
         self.rng = np.random.default_rng(self.data_loader_rng_seed)
-        self.forecast_start = torch.randint(low=0, self.cf.forecast_start)
+        self.forecast_start = torch.randint(low=0, self.forecast_start, (1,))
 
         fsm = (
             self.forecast_steps[min(self.epoch, len(self.forecast_steps) - 1)]
