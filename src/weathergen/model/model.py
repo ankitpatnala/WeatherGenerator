@@ -519,7 +519,10 @@ class Model(torch.nn.Module):
 
         # roll-out in latent space
         preds_all = []
-        for fstep in range(forecast_offset, forecast_offset + forecast_steps):
+        for step in range(self.cf.forecast_start):
+            tokens = self.forecast(model_params, tokens)
+
+        for fstep in range(forecast_offset + self.cf.forecast_start, forecast_offset + self.forecast_start + forecast_steps):
             # prediction
             preds_all += [
                 self.predict(

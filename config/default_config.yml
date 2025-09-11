@@ -42,6 +42,7 @@ pred_mlp_adaln: True
 # one is training an auto-encoder
 forecast_offset : 1
 forecast_delta_hrs: 0
+forecast_start : 100
 forecast_steps: 2
 forecast_policy: "fixed"
 forecast_freeze_model: False
