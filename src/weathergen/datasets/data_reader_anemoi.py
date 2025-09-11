@@ -245,7 +245,7 @@ class DataReaderAnemoi(DataReaderTimestep):
                     and (
                         np.array([f in k for f in channels]).any() if channels is not None else True
                     )
-                    and not np.array([f in k for f in channels_exclude]).any()
+                    and not np.array([f in k for f in channels_exclude]).any() if channels_exclude is not None else True
                 )
             ]
         )
