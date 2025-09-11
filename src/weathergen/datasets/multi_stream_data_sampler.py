@@ -233,7 +233,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         # initialize the random number generator: self.data_loader_rng_seed is set to a DDP-unique
         # value in worker_workset()
         self.rng = np.random.default_rng(self.data_loader_rng_seed)
-        self.forecast_start = torch.randint(low=0, self.forecast_start, (1,))
+        self.forecast_start = torch.randint(0, self.forecast_start, (1,))
 
         fsm = (
             self.forecast_steps[min(self.epoch, len(self.forecast_steps) - 1)]
