@@ -509,25 +509,27 @@ class Model(torch.nn.Module):
 
         (streams_data, source_cell_lens, target_coords_idxs) = batch
 
+        self.forecast_start = len(streams_data[0][0].target_coords) - forecast_offset - forecast_steps
+
         # embed
         tokens = self.embed_cells(model_params, streams_data)
 
         # local assimilation engine and adapter
         tokens, posteriors = self.assimilate_local(model_params, tokens, source_cell_lens)
-
+        
         tokens = self.assimilate_global(model_params, tokens)
-
+        
         # roll-out in latent space
         preds_all = []
-        for step in range(self.cf.forecast_start):
+        for step in range(self.forecast_start):
             tokens = self.forecast(model_params, tokens)
-
-        for fstep in range(forecast_offset + self.cf.forecast_start, forecast_offset + self.forecast_start + forecast_steps):
+        
+        for fstep in range(forecast_offset + self.forecast_start , forecast_offset + self.forecast_start + forecast_steps -1):
             # prediction
             preds_all += [
                 self.predict(
                     model_params,
-                    fstep,
+                    fstep ,
                     tokens,
                     streams_data,
                     target_coords_idxs,
@@ -536,11 +538,11 @@ class Model(torch.nn.Module):
 
             tokens = self.forecast(model_params, tokens)
 
-        # prediction for final step
+       # prediction for final step
         preds_all += [
             self.predict(
                 model_params,
-                forecast_offset + forecast_steps,
+                forecast_offset + forecast_steps + self.forecast_start -1 ,
                 tokens,
                 streams_data,
                 target_coords_idxs,

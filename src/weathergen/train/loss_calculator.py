@@ -121,7 +121,7 @@ class LossCalculator:
         """
 
         tok_spacetime = stream_info.get("tokenize_spacetime", None)
-        target_times = stream_data.target_times_raw[self.cf.forecast_offset + fstep]
+        target_times = stream_data.target_times_raw[-self.cf.forecast_steps + fstep]
         target_times_unique = np.unique(target_times) if tok_spacetime else [target_times]
         substep_masks = []
         for t in target_times_unique:
@@ -147,11 +147,11 @@ class LossCalculator:
 
         loss_lfct = torch.tensor(0.0, device=target.device, requires_grad=True)
         losses_chs = torch.zeros(target.shape[-1], device=target.device, dtype=torch.float32)
-
+        
         ctr_substeps = 0
         for mask_t in substep_masks:
             assert mask_t.sum() == len(weights_locations) if weights_locations is not None else True
-
+            
             loss, loss_chs = loss_fct(
                 target[mask_t], pred[:, mask_t], weights_channels, weights_locations
             )
@@ -226,8 +226,7 @@ class LossCalculator:
         i_batch = 0
         for i_stream_info, stream_info in enumerate(self.cf.streams):
             # extract target tokens for current stream from the specified forecast offset onwards
-            targets = streams_data[i_batch][i_stream_info].target_tokens[self.cf.forecast_offset :]
-
+            targets = streams_data[i_batch][i_stream_info].target_tokens[-self.cf.forecast_steps :]
             stream_data = streams_data[i_batch][i_stream_info]
 
             loss_fsteps = torch.tensor(0.0, device=self.device, requires_grad=True)

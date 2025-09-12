@@ -324,7 +324,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                 # for all streams
                 for stream_info, stream_ds in zip(self.streams, self.streams_datasets, strict=True):
                     stream_data = StreamData(
-                        idx, forecast_dt + self.forecast_offset, nhc_source, nhc_target
+                        idx, forecast_dt + self.forecast_offset + self.forecast_start, nhc_source, nhc_target
                     )
 
                     # for all sources for current stream
@@ -403,7 +403,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
 
             # compute offsets and auxiliary data needed for prediction computation
             # (info is not per stream so separate data structure)
-            target_coords_idx = compute_idxs_predict(self.forecast_offset + forecast_dt, batch)
+            target_coords_idx = compute_idxs_predict(self.forecast_offset + self.forecast_start+ forecast_dt, batch)
 
             assert len(batch) == self.batch_size
             yield (batch, source_cell_lens, target_coords_idx, forecast_dt)
