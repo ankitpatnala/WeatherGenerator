@@ -10,8 +10,8 @@ evaluation:
 
 run_ids :
 
-  ptluswdo:
-    label: "ptluswdo: 64ep 2fs (naoj54ch) + 32ep 8fs 2e-5"
+  f5zoutvj:
+    label: "train on varying offset forecast with fs=2 (for 40-80 steps)"
     epoch: 0
     rank: 0
     streams:
@@ -26,3 +26,4 @@ run_ids :
           forecast_step: [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
           plot_maps: true
           plot_histograms: false
+          plot_animations: true

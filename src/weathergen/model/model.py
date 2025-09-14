@@ -511,11 +511,23 @@ class Model(torch.nn.Module):
 
         # embed
         tokens = self.embed_cells(model_params, streams_data)
-
+        print("tokens_shape after embedding",tokens.shape)
+        print("len of source_cell_lens", len(source_cell_lens))
+        
         # local assimilation engine and adapter
-        tokens, posteriors = self.assimilate_local(model_params, tokens, source_cell_lens)
-
-        tokens = self.assimilate_global(model_params, tokens)
+        tokens_split = torch.split(tokens, forecast_steps + 1)
+        tokens_collect = []
+        for token in tokens_split:
+            token, posteriors = self.assimilate_local(model_params, token, source_cell_lens)
+            print("tokens_shape after local_assiimaltion",token.shape)
+            
+            token = self.assimilate_global(model_params, token)
+            print("tokens_shape after global_assiimaltion",token.shape)
+            tokens_collect.append(token)
+        tokens = torch.cat(tokens_collect)
+        print("shape of tokens after local adapter", tokens.shape) 
+        
+        assert False
 
         # roll-out in latent space
         preds_all = []
@@ -595,6 +607,7 @@ class Model(torch.nn.Module):
                     # )
 
                     # scatter write to reorder from per stream to per cell ordering
+                    print("shape of x_embed",x_embed.shape)
                     tokens_all.scatter_(0, idxs, x_embed + model_params.pe_embed[idxs_pe])
 
         return tokens_all
@@ -688,6 +701,8 @@ class Model(torch.nn.Module):
             else:
                 tokens_c, posteriors = tokens_c, 0.0
 
+            print("shape of tokens_c ",tokens_c.shape)
+
             for block in self.ae_adapter:
                 tokens_global_c = checkpoint(
                     block,
@@ -701,7 +716,8 @@ class Model(torch.nn.Module):
             tokens_global_all += [tokens_global_c]
 
         tokens_global = torch.cat(tokens_global_all)
-
+        print("shape of tokens_global",tokens_global.shape)
+        
         # recover batch dimension and build global token list
         tokens_global = (
             tokens_global.reshape([batch_size, self.num_healpix_cells, s[-2], s[-1]])

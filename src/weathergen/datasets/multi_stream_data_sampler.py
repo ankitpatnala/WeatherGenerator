@@ -364,10 +364,27 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                             time_win2 = self.time_window_handler.window(step_forecast_dt)
 
                             rdata = ds.get_target(step_forecast_dt)
+                            if fstep <  self.forecast_offset + forecast_dt : 
+                                rdata_source = ds.get_source(step_forecast_dt)
+                                rdata_wrapped = IOReaderData.create(rdata_source)
 
                             if rdata.is_empty():
+                                if fstep <  self.forecast_offset + forecast_dt : 
+                                    stream_data.add_empty_source(rdata_wrapped)
                                 stream_data.add_empty_target(fstep)
                             else:
+                                if fstep <  self.forecast_offset + forecast_dt : 
+                                    (ss_cells, ss_lens, ss_centroids) = self.tokenizer.batchify_source(
+                                        stream_info,
+                                        torch.from_numpy(rdata_source.coords),
+                                        torch.from_numpy(rdata_source.geoinfos),
+                                        torch.from_numpy(rdata_source.data),
+                                        rdata_source.datetimes,
+                                        (time_win2.start, time_win2.end),
+                                        ds,
+                                    )
+                                    stream_data.add_source(rdata_wrapped, ss_lens, ss_cells, ss_centroids)
+
                                 (tt_cells, tc, tt_c, tt_t) = self.tokenizer.batchify_target(
                                     stream_info,
                                     self.sampling_rate_target,
