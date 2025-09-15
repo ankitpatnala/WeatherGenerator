@@ -295,7 +295,7 @@ class ForecastingEngine:
                             with_qk_lnorm=self.cf.fe_with_qk_lnorm,
                             with_flash=self.cf.with_flash_attention,
                             norm_type=self.cf.norm_type,
-                            dim_aux=1,
+                            dim_aux=2,
                             norm_eps=self.cf.norm_eps,
                             attention_dtype=get_dtype(self.cf.attention_dtype),
                         )
@@ -311,7 +311,7 @@ class ForecastingEngine:
                             with_qk_lnorm=self.cf.fe_with_qk_lnorm,
                             with_flash=self.cf.with_flash_attention,
                             norm_type=self.cf.norm_type,
-                            dim_aux=1,
+                            dim_aux=2,
                             norm_eps=self.cf.norm_eps,
                             attention_dtype=get_dtype(self.cf.attention_dtype),
                         )
@@ -324,7 +324,7 @@ class ForecastingEngine:
                         with_residual=True,
                         dropout_rate=self.cf.fe_dropout_rate,
                         norm_type=self.cf.norm_type,
-                        dim_aux=1,
+                        dim_aux=2,
                         norm_eps=self.cf.mlp_norm_eps,
                     )
                 )
