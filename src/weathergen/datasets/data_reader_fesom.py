@@ -12,7 +12,10 @@ import logging
 from pathlib import Path
 from typing import override
 
+<<<<<<< HEAD
 import dask
+=======
+>>>>>>> 3d11b5c (rebased)
 import dask.array as da
 import numpy as np
 import zarr
@@ -44,12 +47,37 @@ class DataReaderFesom(DataReaderTimestep):
         filename: Path,
         stream_info: dict,
     ) -> None:
-        # Store configuration but DO NOT open files here
-        self.filenames = sorted(glob.glob(str(filename) + "/*"))
-        self._tw_handler = tw_handler
-        self._stream_info = stream_info
+        self.filenames = sorted(glob.glob(str(filename)))
 
         if len(self.filenames) == 0:
+            name = stream_info["name"]
+            _logger.warning(
+                f"{name} couldn't find any files matching {filename}. Stream is skipped."
+            )
+            super().__init__(tw_handler, stream_info)
+            self.init_empty()
+            return
+
+        groups: list[zarr.Group] = [zarr.open_group(name, mode="r") for name in self.filenames]
+        times: list[zarr.Array] = [group["dates"] for group in groups]
+        data: list[zarr.Array] = [group["data"] for group in groups]
+
+        self.time = da.concatenate(times, axis=0)
+        self.data = da.concatenate(data, axis=0)
+
+        if "nod2" in groups[0].data.attrs:
+            self.mesh_size = groups[0].data.attrs["nod2"]
+        else:
+            self.mesh_size = groups[0].data.attrs["n_points"]
+
+        # TODO: time conversion to datetime64 should happen here.
+        start_ds = self.time[0][0].compute()
+        end_ds = self.time[-1][0].compute()
+
+        if start_ds > tw_handler.t_end or end_ds < tw_handler.t_start:
+            name = stream_info["name"]
+            _logger.warning(f"{name} is not supported over data loader window. Stream is skipped.")
+            super().__init__(tw_handler, stream_info)
             self.init_empty()
             self._initialized = True
             return
@@ -65,6 +93,7 @@ class DataReaderFesom(DataReaderTimestep):
         self.geoinfo_channels = []
         self.geoinfo_idx = []
         self.properties = {}
+        period = (self.time[self.mesh_size][0] - self.time[0][0]).compute()
 
         if len(self.filenames) == 0:
             name = stream_info["name"]
@@ -136,7 +165,15 @@ class DataReaderFesom(DataReaderTimestep):
             self._initialized = True
             return
 
-        self.colnames: list[str] = list(first_group.data.attrs["colnames"])
+        super().__init__(
+            tw_handler,
+            stream_info,
+            start_ds,
+            end_ds,
+            period,
+        )
+
+        self.colnames: list[str] = list(groups[0].data.attrs["colnames"])
         self.cols_idx = list(np.arange(len(self.colnames)))
         self.lat_index = self.colnames.index("lat")
         self.lon_index = self.colnames.index("lon")
@@ -170,11 +207,15 @@ class DataReaderFesom(DataReaderTimestep):
 
         self.properties = {"stream_id": first_group.data.attrs["obs_id"]}
 
-        self.mean = np.concatenate((np.array([0, 0]), np.array(first_group.data.attrs["means"])))
+        self.properties = {
+            "stream_id": groups[0].data.attrs["obs_id"],
+        }
+
+        self.mean = np.concatenate((np.array([0, 0]), np.array(groups[0].data.attrs["means"])))
         self.stdev = np.sqrt(
-            np.concatenate((np.array([1, 1]), np.array(first_group.data.attrs["std"])))
+            np.concatenate((np.array([1, 1]), np.array(groups[0].data.attrs["std"])))
         )
-        self.stdev[self.stdev <= 1e-5] = 1.0
+        self.stdev[self.stdev == 0.0] = 1.0
 
         self.data = da.concatenate(reordered_data_arrays, axis=0)
 
@@ -289,10 +330,11 @@ class DataReaderFesom(DataReaderTimestep):
         start_row = t_idxs[0] * self.mesh_size
         end_row = (t_idxs[-1] + 1) * self.mesh_size
 
-        # Note: we read all columns from start_row to end_row once,
-        # then select the ones we need. This is more efficient for Zarr.
-        full_data_slice = self.data[start_row:end_row]
-        time_slice = self.time[start_row:end_row]
+        _logger.info(f"Started loading data from : {start_row} {end_row}")
+
+        data = self.data[start_row:end_row, channels_idx].compute()
+        lat = np.expand_dims(self.data[start_row:end_row, self.lat_index].compute(), 1)
+        lon = np.expand_dims(self.data[start_row:end_row, self.lon_index].compute(), 1)
 
         # Define the specific slices we need from the larger block
         data_lazy = full_data_slice[:, channels_idx]
@@ -307,7 +349,7 @@ class DataReaderFesom(DataReaderTimestep):
 
         coords = np.stack([lat, lon], axis=1)
         geoinfos = np.zeros((data.shape[0], 0), dtype=data.dtype)
-        datetimes = np.squeeze(datetimes)
+        datetimes = np.squeeze(self.time[start_row:end_row].compute())
 
         rd = ReaderData(
             coords=coords,

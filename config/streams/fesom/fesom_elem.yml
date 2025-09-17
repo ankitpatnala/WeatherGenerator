@@ -9,7 +9,7 @@
 
 FESOM_ELEM :
   type : fesom
-  filenames : ['ocean_elem']
+  filenames : ['ocean_elem/*']
   loss_weight : 1.
   source : null
   target : null
@@ -19,7 +19,7 @@ FESOM_ELEM :
   embed : 
     net : transformer
     num_tokens : 1
-    num_heads : 8
+    num_heads : 2
     dim_embed : 256
     num_blocks : 2
   embed_target_coords :
