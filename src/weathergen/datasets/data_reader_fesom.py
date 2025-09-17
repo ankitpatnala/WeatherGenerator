@@ -10,24 +10,19 @@
 import glob
 import logging
 from pathlib import Path
-from typing import override
+from typing import override, Optional
 
-<<<<<<< HEAD
 import dask
-=======
->>>>>>> 3d11b5c (rebased)
 import dask.array as da
 import numpy as np
 import zarr
 
 from weathergen.datasets.data_reader_base import (
     DataReaderTimestep,
-    DTRange,
-    NDArray,
     ReaderData,
     TimeWindowHandler,
     TIndex,
-    t_epsilon,
+    check_reader_data,
 )
 
 _logger = logging.getLogger(__name__)
@@ -47,44 +42,19 @@ class DataReaderFesom(DataReaderTimestep):
         filename: Path,
         stream_info: dict,
     ) -> None:
+        # Store configuration but DO NOT open files here
         self.filenames = sorted(glob.glob(str(filename)))
+        self._tw_handler = tw_handler
+        self._stream_info = stream_info
 
         if len(self.filenames) == 0:
-            name = stream_info["name"]
-            _logger.warning(
-                f"{name} couldn't find any files matching {filename}. Stream is skipped."
-            )
-            super().__init__(tw_handler, stream_info)
-            self.init_empty()
-            return
-
-        groups: list[zarr.Group] = [zarr.open_group(name, mode="r") for name in self.filenames]
-        times: list[zarr.Array] = [group["dates"] for group in groups]
-        data: list[zarr.Array] = [group["data"] for group in groups]
-
-        self.time = da.concatenate(times, axis=0)
-        self.data = da.concatenate(data, axis=0)
-
-        if "nod2" in groups[0].data.attrs:
-            self.mesh_size = groups[0].data.attrs["nod2"]
-        else:
-            self.mesh_size = groups[0].data.attrs["n_points"]
-
-        # TODO: time conversion to datetime64 should happen here.
-        start_ds = self.time[0][0].compute()
-        end_ds = self.time[-1][0].compute()
-
-        if start_ds > tw_handler.t_end or end_ds < tw_handler.t_start:
-            name = stream_info["name"]
-            _logger.warning(f"{name} is not supported over data loader window. Stream is skipped.")
-            super().__init__(tw_handler, stream_info)
             self.init_empty()
             self._initialized = True
             return
 
         # Initialize data-dependent attributes to None. They will be set by _lazy_init.
-        self.time: da.Array | None = None
-        self.data: da.Array | None = None
+        self.time: Optional[da.Array] = None
+        self.data: Optional[da.Array] = None
         self.len = 0  # Default length is 0 until initialized
         self.source_channels = []
         self.source_idx = []
@@ -93,7 +63,6 @@ class DataReaderFesom(DataReaderTimestep):
         self.geoinfo_channels = []
         self.geoinfo_idx = []
         self.properties = {}
-        period = (self.time[self.mesh_size][0] - self.time[0][0]).compute()
 
         if len(self.filenames) == 0:
             name = stream_info["name"]
@@ -114,7 +83,7 @@ class DataReaderFesom(DataReaderTimestep):
     def _lazy_init(self) -> None:
         """
         Initializes the dataset object. This method is called once per worker process
-        to ensure dask scheduler is not shared between them.
+        to ensure file handles are not shared across forked processes.
         """
         if self._initialized:
             return
@@ -122,7 +91,10 @@ class DataReaderFesom(DataReaderTimestep):
         # Each worker now opens its own file handles safely
         groups: list[zarr.Group] = [zarr.open_group(name, mode="r") for name in self.filenames]
         times: list[zarr.Array] = [group["dates"] for group in groups]
+        data: list[zarr.Array] = [group["data"] for group in groups]
+
         self.time = da.concatenate(times, axis=0)
+        self.data = da.concatenate(data, axis=0)
 
         # Use the first group for metadata
         first_group = groups[0]
@@ -165,35 +137,10 @@ class DataReaderFesom(DataReaderTimestep):
             self._initialized = True
             return
 
-        super().__init__(
-            tw_handler,
-            stream_info,
-            start_ds,
-            end_ds,
-            period,
-        )
-
-        self.colnames: list[str] = list(groups[0].data.attrs["colnames"])
+        self.colnames: list[str] = list(first_group.data.attrs["colnames"])
         self.cols_idx = list(np.arange(len(self.colnames)))
         self.lat_index = self.colnames.index("lat")
         self.lon_index = self.colnames.index("lon")
-
-        reordered_data_arrays: list[zarr.Group] = []
-
-        for group in groups:
-            local_colnames = group["data"].attrs["colnames"]
-
-            # If the order is already correct, no need to do anything.
-            if local_colnames == self.colnames:
-                reordered_data_arrays.append(da.from_zarr(group["data"]))
-            else:
-                # Create the list of indices to re-shuffle the columns.
-                reorder_indices = [local_colnames.index(name) for name in self.colnames]
-
-                # Lazily re-index the dask array. This operation is not executed immediately.
-                dask_array = da.from_zarr(group["data"])
-                reordered_array = dask_array[:, reorder_indices]
-                reordered_data_arrays.append(reordered_array)
 
         # Modify a copy, not the original list while iterating
         temp_colnames = list(self.colnames)
@@ -205,52 +152,33 @@ class DataReaderFesom(DataReaderTimestep):
         self.cols_idx.remove(self.lon_index)
         self.cols_idx = np.array(self.cols_idx)
 
+        self.step_hrs = 1  # TODO
+
         self.properties = {"stream_id": first_group.data.attrs["obs_id"]}
 
-        self.properties = {
-            "stream_id": groups[0].data.attrs["obs_id"],
-        }
-
-        self.mean = np.concatenate((np.array([0, 0]), np.array(groups[0].data.attrs["means"])))
+        self.mean = np.concatenate((np.array([0, 0]), np.array(first_group.data.attrs["means"])))
         self.stdev = np.sqrt(
-            np.concatenate((np.array([1, 1]), np.array(groups[0].data.attrs["std"])))
+            np.concatenate((np.array([1, 1]), np.array(first_group.data.attrs["std"])))
         )
         self.stdev[self.stdev == 0.0] = 1.0
 
-        self.data = da.concatenate(reordered_data_arrays, axis=0)
-
         source_channels = self._stream_info.get("source")
-        source_excl = self._stream_info.get("source_exclude")
-        self.source_channels, self.source_idx = self.select_channels(source_channels, source_excl)
+        self.source_channels, self.source_idx = (
+            self.select(source_channels) if source_channels else (self.colnames, self.cols_idx)
+        )
 
         target_channels = self._stream_info.get("target")
-        target_excl = self._stream_info.get("target_exclude")
-        self.target_channels, self.target_idx = self.select_channels(target_channels, target_excl)
+        self.target_channels, self.target_idx = (
+            self.select(target_channels) if target_channels else (self.colnames, self.cols_idx)
+        )
 
         self.geoinfo_channels = []
         self.geoinfo_idx = []
 
         self._initialized = True
 
-    def select_channels(
-        self, ch_filters: list[str] | None, excl: list[str] | None = None
-    ) -> tuple[list[str], NDArray]:
-        """
-        Allow user to specify which columns they want to access.
-        Get functions only returned for these specified columns.
-        """
-        if excl and ch_filters:
-            mask = [
-                any(f == c for f in ch_filters) and all(ex not in c for ex in excl)
-                for c in self.colnames
-            ]
-        elif ch_filters:
-            mask = [any(f == c for f in ch_filters) for c in self.colnames]
-        elif excl:
-            mask = [all(ex not in c for ex in excl) for c in self.colnames]
-        else:
-            return self.colnames, self.cols_idx
-
+    def select(self, ch_filters: list[str]) -> tuple[list[str], np.ndarray]:
+        mask = [any(f in c for f in ch_filters) for c in self.colnames]
         selected_cols_idx = self.cols_idx[np.where(mask)[0]]
         selected_colnames = [self.colnames[i] for i in np.where(mask)[0]]
         return selected_colnames, selected_cols_idx
@@ -267,61 +195,11 @@ class DataReaderFesom(DataReaderTimestep):
         return self.len
 
     @override
-    def _get_dataset_idxs(self, idx: TIndex) -> tuple[NDArray, DTRange]:
-        """
-        Get dataset indexes for a given time window index, when the dataset is periodic.
-
-        This function assumes state of a variable is persistent, thus if no data is found
-        in the time window, last measurement is used before the beggining of the windows is used.
-
-        Parameters
-        ----------
-        idx : TIndex
-            Index of the time window.
-
-        Returns
-        -------
-        NDArray[np.int64]
-            Array of dataset indexes corresponding to the time window.
-        """
-        tw_handler = self.time_window_handler
-
-        # Function is separated from the class to allow testing without instantiating the class.
-        dtr = tw_handler.window(idx)
-        # If there is no or only marginal overlap with the dataset, return empty index ranges
-        if (
-            not self.data_start_time
-            or not self.data_end_time
-            or dtr.end < self.data_start_time
-            or dtr.start > self.data_end_time
-            or dtr.start < self.data_start_time
-            or dtr.end > self.data_end_time
-            or (self.data_end_time is not None and dtr.start > self.data_end_time)
-        ):
-            return (np.array([], dtype=np.int64), dtr)
-
-        # relative time in dataset
-        delta_t_start = dtr.start - self.data_start_time
-        delta_t_end = dtr.end - self.data_start_time - t_epsilon
-        assert isinstance(delta_t_start, np.timedelta64), "delta_t_start must be timedelta64"
-        start_didx = delta_t_start // self.period
-        end_didx = delta_t_end // self.period
-
-        # adjust start_idx if not exactly on start time
-        if (delta_t_start % self.period) > np.timedelta64(0, "s"):
-            # empty window in between two timesteps
-            if start_didx == end_didx:
-                return (np.array([start_didx], dtype=np.int64), dtr)
-            start_didx += 1
-
-        end_didx = start_didx + int((dtr.end - dtr.start - t_epsilon) / self.period)
-
-        return (np.arange(start_didx, end_didx + 1, dtype=np.int64), dtr)
-
-    @override
     def _get(self, idx: TIndex, channels_idx: list[int]) -> ReaderData:
         self._lazy_init()
+
         (t_idxs, dtr) = self._get_dataset_idxs(idx)
+
         if self.len == 0 or len(t_idxs) == 0:
             return ReaderData.empty(
                 num_data_fields=len(channels_idx), num_geo_fields=len(self.geoinfo_idx)
@@ -332,9 +210,10 @@ class DataReaderFesom(DataReaderTimestep):
 
         _logger.info(f"Started loading data from : {start_row} {end_row}")
 
-        data = self.data[start_row:end_row, channels_idx].compute()
-        lat = np.expand_dims(self.data[start_row:end_row, self.lat_index].compute(), 1)
-        lon = np.expand_dims(self.data[start_row:end_row, self.lon_index].compute(), 1)
+        # Note: we read all columns from start_row to end_row once,
+        # then select the ones we need. This is more efficient for Zarr.
+        full_data_slice = self.data[start_row:end_row]
+        time_slice = self.time[start_row:end_row]
 
         # Define the specific slices we need from the larger block
         data_lazy = full_data_slice[:, channels_idx]
@@ -349,7 +228,7 @@ class DataReaderFesom(DataReaderTimestep):
 
         coords = np.stack([lat, lon], axis=1)
         geoinfos = np.zeros((data.shape[0], 0), dtype=data.dtype)
-        datetimes = np.squeeze(self.time[start_row:end_row].compute())
+        datetimes = np.squeeze(datetimes)
 
         rd = ReaderData(
             coords=coords,
@@ -357,5 +236,6 @@ class DataReaderFesom(DataReaderTimestep):
             data=data,
             datetimes=datetimes,
         )
+        check_reader_data(rd, dtr)
 
         return rd
