@@ -489,6 +489,42 @@ class Model(torch.nn.Module):
         return tuple(preds_all[0])
 
     #########################################
+    def forward_finetune(self, model_params: ModelParams, batch, forecast_offset: int, forecast_steps: int):
+        """Performs the forward pass of the model to generate forecasts
+
+        Tokens are processed through the model components, which were defined in the create method.
+        Args:
+            model_params : Query and embedding parameters
+            batch :
+                streams_data : Contains tokenized source data and target data for each dataset and
+                    each stream
+                source_cell_lens : Used to identify range of tokens to use from generated tokens in
+                    cell embedding
+                target_coords_idxs : Indices of target coordinates for each dataset.
+            forecast_offset : Starting index for iteration
+            forecast_steps : Number of forecast steps to calculate from forecast_offset
+        Returns:
+            A list containing all prediction results
+        """
+        latent_dataset = []
+        for i in range(self.cf.finetuner_fcst):
+            (streams_data, source_cell_lens, target_coords_idxs) = batch
+            
+            with torch.no_grad():
+                # embed
+                tokens = self.embed_cells(model_params, streams_data)
+
+                # local assimilation engine and adapter
+                tokens, _ = self.assimilate_local(model_params, tokens, source_cell_lens)
+
+                tokens = self.assimilate_global(model_params, tokens)
+
+                latent_dataset.append(tokens)
+        latent_dataset = torch.cat(latent_dataset)
+        print(latent_dataset.shape)
+
+    #########################################
+    #########################################
     def forward(self, model_params: ModelParams, batch, forecast_offset: int, forecast_steps: int):
         """Performs the forward pass of the model to generate forecasts
 

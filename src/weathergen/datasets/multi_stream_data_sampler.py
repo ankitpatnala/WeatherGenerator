@@ -191,7 +191,8 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             assert self.input_window_steps == 1, msg
         else:
             assert False, f"Unsupported training mode: {cf.training_mode}"
-
+        
+        self.finetuner_fcst = cf.finetuner_fcst
         self.epoch = 0
 
     ###################################################
@@ -227,6 +228,30 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             (ds[0].get_geoinfo_size() + (5 * (3 * 5)) + 3 * 8) + 6 for ds in self.streams_datasets
         ]
 
+    def reset_finetuner(self):
+        # initialize the random number generator: self.data_loader_rng_seed is set to a DDP-unique
+        # value in worker_workset()
+        self.rng = np.random.default_rng(self.data_loader_rng_seed)
+
+        finetuner_fcst_steps = self.finetuner_fcst
+        if fsm > 0:
+            logger.info(f"forecast_steps at epoch={self.epoch} : {fsm}")
+
+        # data
+        index_range = self.time_window_handler.get_index_range()
+        idx_end = index_range.end // finetuner_fcst_steps
+        # native length of datasets, independent of epoch length that has potentially been specified
+        assert idx_end > 0, "dataset size too small for forecast range"
+        self.perms = np.arange(index_range.start, idx_end)
+        self.len = self.perms.shape[0]
+        if self.shuffle:
+            self.perms = self.rng.permutation(self.perms)
+        self.perms = self.perms.reshape[-1]
+        # forecast time steps
+        len_dt_samples = len(self) // self.batch_size
+
+        self.tokenizer.reset_rng(self.rng)
+    
     ###################################################
     def reset(self):
         # initialize the random number generator: self.data_loader_rng_seed is set to a DDP-unique
@@ -291,7 +316,10 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         logger.info(f"iter_start={iter_start}, iter_end={iter_end}, len={self.len}")
 
         # create new shuffeling
-        self.reset()
+        if self.finetuner_fcst:
+            self.reset_finetuner()
+        else:
+            self.reset()
 
         nhc_target = self.num_healpix_cells_target
         nhc_source = self.num_healpix_cells_source
@@ -309,6 +337,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             batch = []
             while len(batch) < self.batch_size:
                 idx: TIndex = self.perms[idx_raw % self.perms.shape[0]]
+                logger.info("idx",idx)
                 idx_raw += 1
 
                 time_win1 = self.time_window_handler.window(idx)

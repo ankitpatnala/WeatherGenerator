@@ -50,6 +50,7 @@ fe_num_blocks: 8
 fe_num_heads: 16
 fe_dropout_rate: 0.1
 fe_with_qk_lnorm: True
+finetuner_fcst: True
 
 healpix_level: 5
 
