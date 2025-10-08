@@ -234,19 +234,21 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.rng = np.random.default_rng(self.data_loader_rng_seed)
 
         finetuner_fcst_steps = self.finetuner_fcst
-        if fsm > 0:
-            logger.info(f"forecast_steps at epoch={self.epoch} : {fsm}")
 
         # data
         index_range = self.time_window_handler.get_index_range()
-        idx_end = index_range.end // finetuner_fcst_steps
+        logger.info(index_range.start,index_range.end)
+        idx_end = index_range.end - index_range.end % finetuner_fcst_steps
+        logger.info("idx_end",idx_end,idx_end%finetuner_fcst_steps)
         # native length of datasets, independent of epoch length that has potentially been specified
         assert idx_end > 0, "dataset size too small for forecast range"
         self.perms = np.arange(index_range.start, idx_end)
+        self.perms = self.perms.reshape((-1,finetuner_fcst_steps))
         self.len = self.perms.shape[0]
         if self.shuffle:
             self.perms = self.rng.permutation(self.perms)
-        self.perms = self.perms.reshape[-1]
+        self.perms = self.perms.reshape((-1))
+        logger.info("perms_idx",self.perms[45:75])
         # forecast time steps
         len_dt_samples = len(self) // self.batch_size
 
@@ -312,15 +314,15 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             len : number of batch items
             len[*] : number of streams
         """
-        iter_start, iter_end = self.worker_workset()
-        logger.info(f"iter_start={iter_start}, iter_end={iter_end}, len={self.len}")
-
         # create new shuffeling
         if self.finetuner_fcst:
             self.reset_finetuner()
         else:
             self.reset()
 
+        iter_start, iter_end = self.worker_workset()
+        logger.info(f"iter_start={iter_start}, iter_end={iter_end}, len={self.len}")
+        
         nhc_target = self.num_healpix_cells_target
         nhc_source = self.num_healpix_cells_source
 
@@ -328,16 +330,20 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         # idx_raw is used to index into the dataset; the decoupling is needed
         # since there are empty batches
         idx_raw = iter_start
-        for i, _bidx in enumerate(range(iter_start, iter_end, self.batch_size)):
+        for i, _bidx in enumerate(range(iter_start*(self.finetuner_fcst), (iter_start+1)*self.finetuner_fcst, self.batch_size)):
             # forecast_dt needs to be constant per batch (amortized through data parallel training)
-            forecast_dt = self.perms_forecast_dt[i]
+            if self.finetuner_fcst:
+                forecast_dt = 1 
+            else:
+                forecast_dt = self.perms_forecast_dt[i]
 
             # use while loop due to the scattered nature of the data in time and to
             # ensure batches are not empty
             batch = []
             while len(batch) < self.batch_size:
+                idx_picked = idx_raw % self.perms.shape[0]
+                logger.info(f"perms of {i}", self.perms[idx_picked-1:idx_picked+9])
                 idx: TIndex = self.perms[idx_raw % self.perms.shape[0]]
-                logger.info("idx",idx)
                 idx_raw += 1
 
                 time_win1 = self.time_window_handler.window(idx)
