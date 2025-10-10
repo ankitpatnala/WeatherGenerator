@@ -25,7 +25,7 @@ ae_adapter_dropout_rate: 0.1
 
 ae_global_dim_embed: 2048
 ae_global_num_blocks: 4
-ae_global_num_heads: 32
+ae_global_num_heads: 16
 ae_global_dropout_rate: 0.1
 ae_global_with_qk_lnorm: True
 ae_global_att_dense_rate: 0.2
@@ -42,11 +42,11 @@ pred_mlp_adaln: True
 # one is training an auto-encoder
 forecast_offset : 1
 forecast_delta_hrs: 0
-forecast_steps: 2
+forecast_steps: 1
 forecast_policy: "fixed"
-forecast_freeze_model: False
+forecast_freeze_model: True
 forecast_att_dense_rate: 1.0
-fe_num_blocks: 8
+fe_num_blocks: 2
 fe_num_heads: 16
 fe_dropout_rate: 0.1
 fe_with_qk_lnorm: True
@@ -138,7 +138,7 @@ input_window_steps: 1
 
 val_initial: False
 
-loader_num_workers: 8
+loader_num_workers: 1
 log_validation: 0
 analysis_streams_output: ["ERA5"]
 

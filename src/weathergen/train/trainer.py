@@ -176,6 +176,7 @@ class Trainer(TrainerBase):
             "shuffle": False,
             "num_workers": cf.loader_num_workers,
             "pin_memory": True,
+            #"in_order": True if cf.finetuner_fcst>1 else False
         }
         self.data_loader = torch.utils.data.DataLoader(self.dataset, **loader_params, sampler=None)
         self.data_loader_validation = torch.utils.data.DataLoader(
@@ -262,7 +263,7 @@ class Trainer(TrainerBase):
         eps = 2e-08 / np.sqrt(kappa)
 
         self.optimizer = torch.optim.AdamW(
-            self.ddp_model.parameters(),
+            [p for p in self.ddp_model.parameters() if p.requires_grad],
             lr=cf.lr_start,
             weight_decay=cf.weight_decay,
             betas=(beta1, beta2),
@@ -347,10 +348,10 @@ class Trainer(TrainerBase):
 
         for epoch in range(epoch_base, cf.num_epochs):
             logger.info(f"Epoch {epoch} of {cf.num_epochs}: train.")
-            self.train(epoch)
+            self.train(epoch) if cf.finetuner_fcst < 2 else self.train_finetune_fcst(epoch)
 
             logger.info(f"Epoch {epoch} of {cf.num_epochs}: validate.")
-            self.validate(epoch)
+            #self.validate(epoch) if cf.finetuner_fcst< 2 else self.validate_finetune_fcst(epoch)
 
             logger.info(f"Epoch {epoch} of {cf.num_epochs}: save_model.")
             self.save_model(epoch)
@@ -476,6 +477,83 @@ class Trainer(TrainerBase):
             targets_lens,
         )
 
+    def train_finetune_fcst(self, epoch):
+        cf = self.cf
+        self.ddp_model.train()
+        log_interval = self.cf.train_log.log_interval
+
+        dataset_iter = iter(self.data_loader)
+
+        self.optimizer.zero_grad()
+
+        # Unweighted loss, real weighted loss, std for losses that need it
+        self.loss_unweighted_hist, self.loss_model_hist, self.stdev_unweighted_hist = [], [], []
+        # training loop
+        self.t_start = time.time()
+        loss = torch.nn.MSELoss()
+        temporal_tokens = []
+        indexes = []
+        for bidx, batch in enumerate(dataset_iter):
+            idx=batch[-1]
+            forecast_steps = batch[-2]
+            batch = self.batch_to_device(batch)
+            indexes.append(idx)
+
+            # evaluate model
+            with torch.autocast(
+                device_type="cuda",
+                dtype=self.mixed_precision_dtype,
+                enabled=cf.with_mixed_precision,
+            ):
+                tokens = self.ddp_model.forward_latents(
+                    self.model_params, batch, cf.forecast_offset, forecast_steps
+                )
+                temporal_tokens.append(tokens)
+            
+                if (bidx+1) % cf.finetuner_fcst == 0: 
+                    logger.info(f"indexes are {indexes}")
+                    temporal_tokens = torch.cat(temporal_tokens)
+                    split_cell_index = torch.arange(temporal_tokens.shape[1]).split(2048)
+                    loss_values = 0.0
+                    for split_cells in split_cell_index:
+                        preds = self.ddp_model.forecast_llm(temporal_tokens[:,split_cells])
+                        loss_values += loss(
+                                preds[:-1],
+                                temporal_tokens[1:,split_cells])
+                    # backward pass
+                    logger.info(f"train loss is {loss_values}")
+                    self.grad_scaler.scale(loss_values).backward()
+
+                    # gradient clipping
+                    self.grad_scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.ddp_model.parameters(), max_norm=cf.grad_clip)
+
+                    # optimizer step
+                    self.grad_scaler.step(self.optimizer)
+                    self.grad_scaler.update()
+                    self.optimizer.zero_grad()
+
+                    # update learning rate
+                    self.lr_scheduler.step()
+
+                    perf_gpu, perf_mem = self.get_perf()
+                    self.perf_gpu = ddp_average(torch.tensor([perf_gpu])).item()
+                    self.perf_mem = ddp_average(torch.tensor([perf_mem])).item()
+
+                    self._log_terminal(bidx, epoch, TRAIN)
+                    if bidx % log_interval == 0:
+                        self._log(TRAIN)
+
+                    # save checkpoint (with designation _latest)
+                    if bidx % self.checkpoint_freq == 0 and bidx > 0:
+                        self.save_model(-1)
+
+                    self.cf.istep += cf.batch_size_per_gpu
+                    temporal_tokens = []
+                    indexes = []
+
+                self.dataset.advance()
+
     def train(self, epoch):
         cf = self.cf
         self.ddp_model.train()
@@ -546,6 +624,53 @@ class Trainer(TrainerBase):
 
         self.dataset.advance()
 
+    def validate_finetune_fcst(self, epoch):
+        cf = self.cf
+        self.ddp_model.eval()
+
+        dataset_val_iter = iter(self.data_loader_validation)
+        self.loss_unweighted_hist, self.loss_model_hist, self.stdev_unweighted_hist = [], [], []
+
+        with torch.no_grad():
+            # print progress bar but only in interactive mode, i.e. when without ddp
+            with tqdm.tqdm(
+                total=len(self.data_loader_validation), disable=self.cf.with_ddp
+            ) as pbar:
+                temporal_tokens = []
+                indexes = []
+                for bidx, batch in enumerate(dataset_val_iter):
+                    idx = batch[-1]
+                    forecast_steps = batch[-2]
+                    batch = self.batch_to_device(batch)
+                    indexes.append(idx)
+                    # evaluate model
+                    with torch.autocast(
+                        device_type="cuda",
+                        dtype=self.mixed_precision_dtype,
+                        enabled=cf.with_mixed_precision,
+                    ):
+                        tokens = self.ddp_model.forward_latents(
+                            self.model_params, batch, cf.forecast_offset, forecast_steps
+                        )
+                        temporal_tokens.append(tokens)
+
+                    if (bidx+1) % cf.finetuner_fcst == 0: 
+                        logger.info(f"val indexes are {indexes}")
+                        temporal_tokens = torch.cat(temporal_tokens)
+                        preds = self.ddp_model.forecast_llm(temporal_tokens)
+                        loss_values += loss(
+                                preds[:-1],
+                                temporal_tokens[1:])
+                        logger.info(f"val loss is {loss_values}")
+
+                    pbar.update(self.cf.batch_size_validation_per_gpu)
+
+                self._log_terminal(bidx, epoch, VAL)
+                self._log(VAL)
+
+        # avoid that there is a systematic bias in the validation subset
+        self.dataset_val.advance()
+    
     def validate(self, epoch):
         cf = self.cf
         self.ddp_model.eval()
@@ -559,7 +684,7 @@ class Trainer(TrainerBase):
                 total=len(self.data_loader_validation), disable=self.cf.with_ddp
             ) as pbar:
                 for bidx, batch in enumerate(dataset_val_iter):
-                    forecast_steps = batch[-1]
+                    forecast_steps = batch[-2]
                     batch = self.batch_to_device(batch)
 
                     # evaluate model
@@ -568,9 +693,11 @@ class Trainer(TrainerBase):
                         dtype=self.mixed_precision_dtype,
                         enabled=cf.with_mixed_precision,
                     ):
-                        preds, _ = self.ddp_model(
+                        preds, _ = self.ddp_model.forward_with_llm(
                             self.model_params, batch, cf.forecast_offset, forecast_steps
                         )
+                        print(len(preds))
+
 
                     # compute loss and log output
                     if bidx < cf.log_validation:

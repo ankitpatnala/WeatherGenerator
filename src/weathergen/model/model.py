@@ -29,6 +29,7 @@ from weathergen.model.engines import (
     LocalAssimilationEngine,
     TargetPredictionEngine,
     TargetPredictionEngineClassic,
+    LLMForecastingEngine
 )
 from weathergen.model.layers import MLP, NamedLinear
 from weathergen.model.parametrised_prob_dist import LatentInterpolator
@@ -258,8 +259,8 @@ class Model(torch.nn.Module):
                 "Empty forecast engine (fe_num_blocks = 0), but forecast_steps[i] > 0 for some i"
             )
 
-        self.fe_blocks = ForecastingEngine(cf, self.num_healpix_cells).create()
-
+        #self.fe_blocks = ForecastingEngine(cf, self.num_healpix_cells).create()
+        self.fe_blocks = LLMForecastingEngine(cf, self.num_healpix_cells).create()
         ###############
         # embed coordinates yielding one query token for each target token
         dropout_rate = cf.embed_dropout_rate
@@ -489,7 +490,7 @@ class Model(torch.nn.Module):
         return tuple(preds_all[0])
 
     #########################################
-    def forward_finetune(self, model_params: ModelParams, batch, forecast_offset: int, forecast_steps: int):
+    def forward_latents(self, model_params: ModelParams, batch, forecast_offset: int, forecast_steps: int):
         """Performs the forward pass of the model to generate forecasts
 
         Tokens are processed through the model components, which were defined in the create method.
@@ -506,24 +507,83 @@ class Model(torch.nn.Module):
         Returns:
             A list containing all prediction results
         """
-        latent_dataset = []
-        for i in range(self.cf.finetuner_fcst):
-            (streams_data, source_cell_lens, target_coords_idxs) = batch
-            
-            with torch.no_grad():
-                # embed
-                tokens = self.embed_cells(model_params, streams_data)
+        (streams_data, source_cell_lens, target_coords_idxs) = batch
+        
+        with torch.no_grad():
+            # embed
+            tokens = self.embed_cells(model_params, streams_data)
 
-                # local assimilation engine and adapter
-                tokens, _ = self.assimilate_local(model_params, tokens, source_cell_lens)
+            # local assimilation engine and adapter
+            tokens, _ = self.assimilate_local(model_params, tokens, source_cell_lens)
 
-                tokens = self.assimilate_global(model_params, tokens)
+            tokens = self.assimilate_global(model_params, tokens)
 
-                latent_dataset.append(tokens)
-        latent_dataset = torch.cat(latent_dataset)
-        print(latent_dataset.shape)
+        return tokens
 
     #########################################
+    def forward_with_llm(self, model_params: ModelParams, batch, forecast_offset: int, forecast_steps: int):
+        """Performs the forward pass of the model to generate forecasts
+
+        Tokens are processed through the model components, which were defined in the create method.
+        Args:
+            model_params : Query and embedding parameters
+            batch :
+                streams_data : Contains tokenized source data and target data for each dataset and
+                    each stream
+                source_cell_lens : Used to identify range of tokens to use from generated tokens in
+                    cell embedding
+                target_coords_idxs : Indices of target coordinates for each dataset.
+            forecast_offset : Starting index for iteration
+            forecast_steps : Number of forecast steps to calculate from forecast_offset
+        Returns:
+            A list containing all prediction results
+        """
+
+        (streams_data, source_cell_lens, target_coords_idxs) = batch
+
+        # embed
+        tokens = self.embed_cells(model_params, streams_data)
+
+        # local assimilation engine and adapter
+        tokens, posteriors = self.assimilate_local(model_params, tokens, source_cell_lens)
+
+        tokens = self.assimilate_global(model_params, tokens)
+
+        tokens_all = [tokens]
+        logger.info(f"Initial tokens shape is {tokens.shape}")
+
+        # roll-out in latent space
+        preds_all = []
+        for fstep in range(forecast_offset, forecast_offset + forecast_steps):
+            logger.info(f"Processing forecast step: {fstep}")
+            # prediction
+            preds_all += [
+                self.predict(
+                    model_params,
+                    fstep,
+                    tokens_all[-1],
+                    streams_data,
+                    target_coords_idxs,
+                )
+            ]
+
+            tokens = self.forecast_llm(torch.cat(tokens_all[-20:]))[[-1]]
+            logger.info(f"shape of tokens {tokens.shape}")
+            tokens_all.append(tokens)
+
+        # prediction for final step
+        preds_all += [
+            self.predict(
+                model_params,
+                forecast_offset + forecast_steps,
+                tokens,
+                streams_data,
+                target_coords_idxs,
+            )
+        ]
+
+        return preds_all, posteriors
+
     #########################################
     def forward(self, model_params: ModelParams, batch, forecast_offset: int, forecast_steps: int):
         """Performs the forward pass of the model to generate forecasts
@@ -762,6 +822,25 @@ class Model(torch.nn.Module):
 
         return tokens
 
+    #########################################
+    def forecast_llm(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Advances latent space representation in time
+
+        Args:
+            model_params : Query and embedding parameters (never used)
+            tokens : Input tokens to be processed by the model.
+        Returns:
+            Processed tokens
+        Raises:
+            ValueError: For unexpected arguments in checkpoint method
+        """
+        tokens = tokens.permute([1,0,2])
+        for it, block in enumerate(self.fe_blocks):
+            tokens = checkpoint(block, tokens, use_reentrant=False)
+        tokens = tokens.permute([1,0,2])
+
+        return tokens
+    
     #########################################
     def forecast(self, model_params: ModelParams, tokens: torch.Tensor) -> torch.Tensor:
         """Advances latent space representation in time
