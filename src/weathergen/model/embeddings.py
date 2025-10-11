@@ -19,6 +19,8 @@ from weathergen.model.norms import RMSNorm
 from weathergen.model.positional_encoding import positional_encoding_harmonic
 
 
+from weathergen.utils.logger import logger
+
 class StreamEmbedTransformer(torch.nn.Module):
     def __init__(
         self,
@@ -149,6 +151,7 @@ class StreamEmbedTransformer(torch.nn.Module):
         peh = positional_encoding_harmonic
 
         # embed provided input data
+        logger.info(f"shape of x_in is {x_in.transpose(-2,-1).shape} {self.embed.weight.shape} {self.embed.bias.shape}")
         x = peh(checkpoint(self.embed, x_in.transpose(-2, -1), use_reentrant=False))
 
         for layer in self.layers:

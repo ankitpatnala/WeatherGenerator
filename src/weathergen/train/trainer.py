@@ -264,6 +264,7 @@ class Trainer(TrainerBase):
 
         self.optimizer = torch.optim.AdamW(
             [p for p in self.ddp_model.parameters() if p.requires_grad],
+            #self.ddp_model.parameters(),
             lr=cf.lr_start,
             weight_decay=cf.weight_decay,
             betas=(beta1, beta2),
@@ -516,7 +517,9 @@ class Trainer(TrainerBase):
                     split_cell_index = torch.arange(temporal_tokens.shape[1]).split(2048)
                     loss_values = 0.0
                     for split_cells in split_cell_index:
-                        preds = self.ddp_model.forecast_llm(temporal_tokens[:,split_cells])
+                        preds = self.ddp_model.forecast_llm(
+                                self.model_params.forecast_params[:,split_cells],
+                                temporal_tokens[:,split_cells])
                         loss_values += loss(
                                 preds[:-1],
                                 temporal_tokens[1:,split_cells])

@@ -242,7 +242,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         assert idx_end > 0, "dataset size too small for forecast range"
         self.perms = np.arange(index_range.start, idx_end)
         self.perms = self.perms.reshape((-1,finetuner_fcst_steps))
-        self.len = self.len//finetuner_fcst_steps
+        #self.len = self.len//finetuner_fcst_steps
         if self.shuffle:
             self.perms = self.rng.permutation(self.perms)
         self.perms = self.perms.reshape((-1))
@@ -317,9 +317,10 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         else:
             self.reset()
 
-        iter_start, iter_end = self.worker_workset()
-        logger.info(f"iter_start={iter_start}, iter_end={iter_end}, len={self.len}")
-        
+        #iter_start, iter_end = self.worker_workset()
+        iterables = self.worker_workset()
+        #logger.info(f"iter_start={iter_start}, iter_end={iter_end}, len={self.len}")
+        logger.info(f"iterables={iterables}, len={self.len}")
         nhc_target = self.num_healpix_cells_target
         nhc_source = self.num_healpix_cells_source
 
@@ -327,7 +328,8 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         # idx_raw is used to index into the dataset; the decoupling is needed
         # since there are empty batches
         #idx_raw = iter_start
-        for i, _bidx in enumerate(range(iter_start, iter_end, self.batch_size)):
+        #for i, _bidx in enumerate(range(iter_start, iter_end, self.batch_size)):
+        for i, _bidx in enumerate(iterables):
             # forecast_dt needs to be constant per batch (amortized through data parallel training)
             if self.finetuner_fcst > 1:
                 forecast_dt = 1 
@@ -336,113 +338,112 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
 
             # use while loop due to the scattered nature of the data in time and to
             # ensure batches are not empty
-            for index in range(self.finetuner_fcst):
-                batch = []
-                while len(batch) < self.batch_size:
+            batch = []
+            while len(batch) < self.batch_size:
 
-                    idx: TIndex = self.perms[(_bidx*self.finetuner_fcst + index)% self.perms.shape[0]]
-                    #idx_raw += 1
-                    time_win1 = self.time_window_handler.window(idx)
+                idx: TIndex = self.perms[_bidx % self.perms.shape[0]]
+                #idx_raw += 1
+                time_win1 = self.time_window_handler.window(idx)
 
-                    # Sample masking strategy once per batch item
-                    if hasattr(self.tokenizer, "masker"):
-                        self.tokenizer.masker.set_batch_strategy()
+                # Sample masking strategy once per batch item
+                if hasattr(self.tokenizer, "masker"):
+                    self.tokenizer.masker.set_batch_strategy()
 
-                    streams_data: list[StreamData] = []
+                streams_data: list[StreamData] = []
 
-                    # for all streams
-                    for stream_info, stream_ds in zip(self.streams, self.streams_datasets, strict=True):
-                        stream_data = StreamData(
-                            idx, forecast_dt + self.forecast_offset, nhc_source, nhc_target
-                        )
+                # for all streams
+                for stream_info, stream_ds in zip(self.streams, self.streams_datasets, strict=True):
+                    stream_data = StreamData(
+                        idx, forecast_dt + self.forecast_offset, nhc_source, nhc_target
+                    )
 
-                        # for all sources for current stream
-                        for _, ds in enumerate(stream_ds):
-                            # source window (of potentially multi-step length)
-                            rdata: ReaderData = ds.get_source(idx)
+                    # for all sources for current stream
+                    for _, ds in enumerate(stream_ds):
+                        # source window (of potentially multi-step length)
+                        rdata: ReaderData = ds.get_source(idx)
 
-                            # rdata needs to be wrapped in a different class
-                            # to avoid unwanted dependencies => see IOReaderData docstring
-                            rdata_wrapped = IOReaderData.create(rdata)
+                        # rdata needs to be wrapped in a different class
+                        # to avoid unwanted dependencies => see IOReaderData docstring
+                        rdata_wrapped = IOReaderData.create(rdata)
 
-                            if rdata.is_empty():
-                                stream_data.add_empty_source(rdata_wrapped)
-                            else:
-                                # TODO: handling of conversion from numpy to torch here and below
-                                # TODO: this should only be collected in validation mode
+                        if rdata.is_empty():
+                            stream_data.add_empty_source(rdata_wrapped)
+                        else:
+                            # TODO: handling of conversion from numpy to torch here and below
+                            # TODO: this should only be collected in validation mode
 
-                                (ss_cells, ss_lens, ss_centroids) = self.tokenizer.batchify_source(
-                                    stream_info,
-                                    torch.from_numpy(rdata.coords),
-                                    torch.from_numpy(rdata.geoinfos),
-                                    torch.from_numpy(rdata.data),
-                                    rdata.datetimes,
-                                    (time_win1.start, time_win1.end),
-                                    ds,
+                            (ss_cells, ss_lens, ss_centroids) = self.tokenizer.batchify_source(
+                                stream_info,
+                                torch.from_numpy(rdata.coords),
+                                torch.from_numpy(rdata.geoinfos),
+                                torch.from_numpy(rdata.data),
+                                rdata.datetimes,
+                                (time_win1.start, time_win1.end),
+                                ds,
+                            )
+
+                            stream_data.add_source(rdata_wrapped, ss_lens, ss_cells, ss_centroids)
+
+                        # target
+
+                        # collect for all forecast steps
+                        for fstep in range(
+                            self.forecast_offset, self.forecast_offset + forecast_dt + 1
+                        ):
+                            if self.finetuner_fcst < 2:
+                                step_forecast_dt = (
+                                    idx + (self.forecast_delta_hrs * fstep) // self.step_hrs
                                 )
+                                time_win2 = self.time_window_handler.window(step_forecast_dt)
 
-                                stream_data.add_source(rdata_wrapped, ss_lens, ss_cells, ss_centroids)
+                                rdata = ds.get_target(step_forecast_dt)
 
-                            # target
-
-                            # collect for all forecast steps
-                            for fstep in range(
-                                self.forecast_offset, self.forecast_offset + forecast_dt + 1
-                            ):
-                                if self.finetuner_fcst < 2:
-                                    step_forecast_dt = (
-                                        idx + (self.forecast_delta_hrs * fstep) // self.step_hrs
-                                    )
-                                    time_win2 = self.time_window_handler.window(step_forecast_dt)
-
-                                    rdata = ds.get_target(step_forecast_dt)
-
-                                    if rdata.is_empty():
-                                        stream_data.add_empty_target(fstep)
-                                    else:
-                                        (tt_cells, tc, tt_c, tt_t) = self.tokenizer.batchify_target(
-                                            stream_info,
-                                            self.sampling_rate_target,
-                                            torch.from_numpy(rdata.coords),
-                                            torch.from_numpy(rdata.geoinfos),
-                                            torch.from_numpy(rdata.data),
-                                            rdata.datetimes,
-                                            (time_win2.start, time_win2.end),
-                                            ds,
-                                        )
-
-                                        stream_data.add_target(fstep, tt_cells, tc, tt_c, tt_t)
-                                else:
+                                if rdata.is_empty():
                                     stream_data.add_empty_target(fstep)
+                                else:
+                                    (tt_cells, tc, tt_c, tt_t) = self.tokenizer.batchify_target(
+                                        stream_info,
+                                        self.sampling_rate_target,
+                                        torch.from_numpy(rdata.coords),
+                                        torch.from_numpy(rdata.geoinfos),
+                                        torch.from_numpy(rdata.data),
+                                        rdata.datetimes,
+                                        (time_win2.start, time_win2.end),
+                                        ds,
+                                    )
 
-                        # merge inputs for sources and targets for current stream
-                        stream_data.merge_inputs()
-                        streams_data += [stream_data]
+                                    stream_data.add_target(fstep, tt_cells, tc, tt_c, tt_t)
+                            else:
+                                stream_data.add_empty_target(fstep)
 
-                    # Reset masking strategy for next batch item
-                    if hasattr(self.tokenizer, "masker"):
-                        self.tokenizer.masker.reset_batch_strategy()
+                    # merge inputs for sources and targets for current stream
+                    stream_data.merge_inputs()
+                    streams_data += [stream_data]
 
-                    # skip completely empty batch item or when all targets are empty -> no grad
-                    if self.finetuner_fcst < 2:
-                        if not (all(s.empty() or s.target_empty() for s in streams_data)):
-                            batch += [streams_data]
-                    else:
-                        if not (all(s.empty() for s in streams_data)):
-                            batch += [streams_data]
+                # Reset masking strategy for next batch item
+                if hasattr(self.tokenizer, "masker"):
+                    self.tokenizer.masker.reset_batch_strategy()
 
-                # aggregated lens of tokens per cell
-                source_cell_lens = compute_source_cell_lens(batch)
+                # skip completely empty batch item or when all targets are empty -> no grad
+                if self.finetuner_fcst < 2:
+                    if not (all(s.empty() or s.target_empty() for s in streams_data)):
+                        batch += [streams_data]
+                else:
+                    if not (all(s.empty() for s in streams_data)):
+                        batch += [streams_data]
 
-                # compute offsets for scatter computation after embedding
-                batch = compute_offsets_scatter_embed(batch)
+            # aggregated lens of tokens per cell
+            source_cell_lens = compute_source_cell_lens(batch)
 
-                # compute offsets and auxiliary data needed for prediction computation
-                # (info is not per stream so separate data structure)
-                target_coords_idx = compute_idxs_predict(self.forecast_offset + forecast_dt, batch)
+            # compute offsets for scatter computation after embedding
+            batch = compute_offsets_scatter_embed(batch)
 
-                assert len(batch) == self.batch_size
-                yield (batch, source_cell_lens, target_coords_idx, forecast_dt, idx)
+            # compute offsets and auxiliary data needed for prediction computation
+            # (info is not per stream so separate data structure)
+            target_coords_idx = compute_idxs_predict(self.forecast_offset + forecast_dt, batch)
+
+            assert len(batch) == self.batch_size
+            yield (batch, source_cell_lens, target_coords_idx, forecast_dt, idx)
 
     ###################################################
     def __len__(self):
@@ -483,4 +484,8 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                 f"{self.rank}::{worker_info.id}"
                 + f" : dataset [{local_start},{local_end}) : [{iter_start},{iter_end})"
             )
-        return iter_start, iter_end
+
+            iter_start = local_start + worker_info.id
+            
+
+        return range(iter_start,local_end,self.finetuner_fcst)

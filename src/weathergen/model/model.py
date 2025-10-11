@@ -131,6 +131,18 @@ class ModelParams(torch.nn.Module):
         q_cells_lens = torch.cat([torch.zeros(1, dtype=torch.int32), q_cells_lens])
         self.q_cells_lens = torch.nn.Parameter(q_cells_lens, requires_grad=False)
 
+        max_time_expected = 120
+        forecast_params = torch.empty((max_time_expected,self.num_healpix_cells,cf.ae_global_dim_embed))
+        time_range = torch.unsqueeze(torch.arange(max_time_expected)/1000,dim=1)
+        spatial_range = torch.unsqueeze(torch.arange(num_healpix_cells)/num_healpix_cells,dim=1)
+        assert cf.ae_global_dim_embed % 2==0, "global_dim_embed should be divisible by 2"
+        global_dim_frequencies = torch.unsqueeze(torch.arange(cf.ae_global_dim_embed//2),dim=0)
+        time_params = torch.cat((torch.sin(time_range*global_dim_frequencies),torch.cos(time_range*global_dim_frequencies)),dim=-1)
+        spatial_params = torch.cat((torch.sin(spatial_range*global_dim_frequencies),torch.cos(spatial_range*global_dim_frequencies)),dim=-1)
+        forecast_params[:,:,0::2] = torch.unsqueeze(time_params[:,0::2],dim=1) + torch.unsqueeze(spatial_params[:,0::2],dim=0)
+        forecast_params[:,:,1::2] = torch.unsqueeze(time_params[:,1::2],dim=1) + torch.unsqueeze(spatial_params[:,1::2],dim=0)
+        self.forecast_params = torch.nn.Parameter(forecast_params, requires_grad=False)
+
         return self
 
 
@@ -567,9 +579,10 @@ class Model(torch.nn.Module):
                 )
             ]
 
-            tokens = self.forecast_llm(torch.cat(tokens_all[-20:]))[[-1]]
+            tokens = self.forecast_llm(model_params.forecast_params,torch.cat(tokens_all))[[-1]]
             logger.info(f"shape of tokens {tokens.shape}")
             tokens_all.append(tokens)
+            tokens_all = tokens_all[-15:]
 
         # prediction for final step
         preds_all += [
@@ -823,7 +836,7 @@ class Model(torch.nn.Module):
         return tokens
 
     #########################################
-    def forecast_llm(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forecast_llm(self, forecast_params, tokens: torch.Tensor) -> torch.Tensor:
         """Advances latent space representation in time
 
         Args:
@@ -834,6 +847,9 @@ class Model(torch.nn.Module):
         Raises:
             ValueError: For unexpected arguments in checkpoint method
         """
+        
+        seq_length = tokens.shape[0]
+        tokens += forecast_params[:seq_length]
         tokens = tokens.permute([1,0,2])
         for it, block in enumerate(self.fe_blocks):
             tokens = checkpoint(block, tokens, use_reentrant=False)
