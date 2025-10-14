@@ -110,6 +110,13 @@ class DataReaderAnemoi(DataReaderTimestep):
         self.target_idx = self.select_channels(ds0, "target")
         self.target_channels = [ds.variables[i] for i in self.target_idx]
 
+        self.source_target_channel_order = [int(np.where(self.target_idx == idx)[0][0]) for idx in self.source_idx]
+        self.forcing_channels, self.forcing_channels_idx = self.find_forcing_channel_indices(ds0)
+        if len(self.forcing_channels_idx) > 0:
+            self.forcing_idx_in_source = [ int(np.where(self.source_idx == idx)[0][0]) for idx in self.forcing_channels_idx]
+        else:
+            self.forcing_idx_in_source = [] 
+
         self.geoinfo_channels = []
         self.geoinfo_idx = []
 
@@ -251,6 +258,35 @@ class DataReaderAnemoi(DataReaderTimestep):
         )
 
         return np.array(chs_idx, dtype=np.int64)
+   
+    def find_forcing_channel_indices(self,ds0: anemoi_datasets):
+        """
+        find channels whihc are there in source but not in target
+        """
+
+        target_exclude_channels = self.stream_info.get("target_exclude")
+        source_exclude_channels = self.stream_info.get("source_exclude")
+
+        forcing_channels = []
+        for target_exclude_channel in target_exclude_channels:
+            if target_exclude_channel not in source_exclude_channels:
+                forcing_channels.append(target_exclude_channel)
+        chs_idx = np.sort(
+            [
+                ds0.name_to_index[k]
+                for (k, v) in ds0.typed_variables.items()
+                if (
+                    not v.is_computed_forcing
+                    and not v.is_constant_in_time
+                    and (
+                        np.array([f in k for f in forcing_channels]).any() if len(forcing_channels) !=0 else True
+                    )
+                )
+            ]
+        )
+        return forcing_channels, chs_idx
+
+
 
 
 def _clip_lat(lats: NDArray) -> NDArray[np.float32]:
