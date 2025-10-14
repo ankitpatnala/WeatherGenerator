@@ -18,13 +18,14 @@ from weathergen.model.attention import (
     MultiSelfAttentionHead,
     MultiSelfAttentionHeadLocal,
     MultiSelfAttentionHeadVarlen,
+    LLMDecoder
 )
 from weathergen.model.blocks import CrossAttentionBlock, OriginalPredictionBlock, SelfAttentionBlock
 from weathergen.model.embeddings import (
     StreamEmbedLinear,
     StreamEmbedTransformer,
 )
-from weathergen.model.layers import MLP
+from weathergen.model.layers import MLP, FeedForwardLayer
 from weathergen.model.utils import ActivationFactory
 from weathergen.utils.utils import get_dtype
 
@@ -262,6 +263,57 @@ class GlobalAssimilationEngine:
             )
         return self.ae_global_blocks
 
+class LLMForecastingEngine:
+    name: "LLMForecastingEngine"
+
+    def __init__(self, cf: Config, num_healpix_cells: int) -> None:
+        """
+        Initialize the ForecastingEngine with the configuration.
+        :param cf: Configuration object containing parameters for the engine.
+        :param num_healpix_cells: Number of healpix cells used for local queries.
+        """
+        self.cf = cf
+        self.num_healpix_cells = num_healpix_cells
+        self.fe_blocks = torch.nn.ModuleList()
+
+    def create(self) -> torch.nn.ModuleList:
+        """
+        Creates and returns the module list (fe_blocks).
+        :return: torch.nn.ModuleList containing the forecasting blocks.
+        """
+        if self.cf.forecast_policy is not None:
+            for i in range(self.cf.fe_num_blocks):
+                # Alternate between global and local attention
+                self.fe_blocks.append(
+                    LLMDecoder(
+                        self.cf.ae_global_dim_embed,
+                        self.cf.fe_num_heads,
+                        dropout=self.cf.fe_dropout_rate,
+                        norm_type=self.cf.norm_type,
+                        norm_eps=self.cf.norm_eps,
+                    )
+                )
+                # Add MLP block
+                self.fe_blocks.append(
+                    FeedForwardLayer(
+                        self.cf.ae_global_dim_embed,
+                        self.cf.ae_global_dim_embed,
+                        dropout=self.cf.fe_dropout_rate,
+                        norm_type=self.cf.norm_type,
+                        norm_eps=self.cf.mlp_norm_eps,
+                    )
+                )
+
+        def init_weights_final(m):
+            if isinstance(m, torch.nn.Linear):
+                torch.nn.init.normal_(m.weight, mean=0, std=0.001)
+                if m.bias is not None:
+                    torch.nn.init.normal_(m.bias, mean=0, std=0.001)
+
+        for block in self.fe_blocks:
+            block.apply(init_weights_final)
+
+        return self.fe_blocks
 
 class ForecastingEngine:
     name: "ForecastingEngine"

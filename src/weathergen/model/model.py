@@ -32,10 +32,12 @@ from weathergen.model.engines import (
     LocalAssimilationEngine,
     TargetPredictionEngine,
     TargetPredictionEngineClassic,
+    LLMForecastingEngine
 )
 from weathergen.model.layers import MLP, NamedLinear
 from weathergen.model.parametrised_prob_dist import LatentInterpolator
 from weathergen.model.utils import get_num_parameters
+from weathergen.datasets.data_reader_wg import convert_wg_output_to_dataloader_output
 from weathergen.utils.distributed import is_root
 from weathergen.utils.utils import get_dtype
 
@@ -100,7 +102,31 @@ class ModelParams(torch.nn.Module):
             torch.ones(self.num_healpix_cells + 1, dtype=torch.int32), requires_grad=False
         )
         self.q_cells_lens.data[0] = 0
+        
+        max_time_expected = 120
+        
+        assert cf.ae_global_dim_embed % 2==0, "global_dim_embed should be divisible by 2"
+        
+        global_dim_frequencies = torch.arange(cf.ae_global_dim_embed // 2, dtype=torch.float32).unsqueeze(0)
+        div_term = 1 / (10000 ** (2 * global_dim_frequencies / cf.ae_global_dim_embed))
 
+        time_positions = torch.arange(max_time_expected, dtype=torch.float32).unsqueeze(1)
+        spatial_positions = torch.arange(self.num_healpix_cells, dtype=torch.float32).unsqueeze(1) / self.num_healpix_cells
+
+        time_enc = torch.cat([
+            torch.sin(time_positions * div_term),
+            torch.cos(time_positions * div_term)
+        ], dim=-1)
+
+        spatial_enc = torch.cat([
+            torch.sin(spatial_positions * div_term),
+            torch.cos(spatial_positions * div_term)
+        ], dim=-1)
+
+        forecast_params = time_enc[:, None, :] + spatial_enc[None, :, :]
+        self.forecast_params = torch.nn.Parameter(forecast_params, requires_grad=False)
+
+    
     def create(self, cf: Config) -> "ModelParams":
         self.reset_parameters(cf)
         return self
@@ -310,18 +336,19 @@ class Model(torch.nn.Module):
         # global assimilation engine
         self.ae_global_blocks = GlobalAssimilationEngine(cf, self.num_healpix_cells).create()
 
-        ###############
-        # forecasting engine
-        if isinstance(cf.forecast_steps, int):
-            assert not (cf.forecast_steps > 0 and cf.fe_num_blocks == 0), (
-                "Empty forecast engine (fe_num_blocks = 0), but forecast_steps > 0"
-            )
-        else:
-            assert not (min(cf.forecast_steps) > 0 and cf.fe_num_blocks == 0), (
-                "Empty forecast engine (fe_num_blocks = 0), but forecast_steps[i] > 0 for some i"
-            )
+        ################
+        ## forecasting engine
+        #if isinstance(cf.forecast_steps, int):
+        #    assert not (cf.forecast_steps > 0 and cf.fe_num_blocks == 0), (
+        #        "Empty forecast engine (fe_num_blocks = 0), but forecast_steps > 0"
+        #    )
+        #else:
+        #    assert not (min(cf.forecast_steps) > 0 and cf.fe_num_blocks == 0), (
+        #        "Empty forecast engine (fe_num_blocks = 0), but forecast_steps[i] > 0 for some i"
+        #    )
 
-        self.fe_blocks = ForecastingEngine(cf, self.num_healpix_cells).create()
+        #self.fe_blocks = ForecastingEngine(cf, self.num_healpix_cells).create()
+        self.fe_blocks = LLMForecastingEngine(cf, self.num_healpix_cells).create()
 
         ###############
         # embed coordinates yielding one query token for each target token
@@ -548,7 +575,7 @@ class Model(torch.nn.Module):
         return tuple(preds_all[0])
 
     #########################################
-    def forward(self, model_params: ModelParams, batch, forecast_offset: int, forecast_steps: int):
+    def forward_original(self, model_params: ModelParams, batch, forecast_offset: int, forecast_steps: int):
         """Performs the forward pass of the model to generate forecasts
 
         Tokens are processed through the model components, which were defined in the create method.
@@ -604,6 +631,146 @@ class Model(torch.nn.Module):
         ]
 
         return preds_all, posteriors
+
+    #########################################
+    def forward_physical_space(self, model_params: ModelParams, batch, forecast_offset: int, forecast_steps: int, streams_dataset_val):
+        """Performs the forward pass of the model to generate forecasts
+        Tokens are processed through the model components, which were defined in the create method.
+        Args:
+            model_params : Query and embedding parameters
+            batch :
+                streams_data : Contains tokenized source data and target data for each dataset and
+                    each stream
+                source_cell_lens : Used to identify range of tokens to use from generated tokens in
+                    cell embedding
+                target_coords_idxs : Indices of target coordinates for each dataset.
+            forecast_offset : Starting index for iteration
+            forecast_steps : Number of forecast steps to calculate from forecast_offset
+        Returns:
+            A list containing all prediction results
+        """
+
+        (streams_data, source_cell_lens, target_coords_idxs) = batch
+
+        streams_data_for_source = streams_data
+
+        preds_all = []
+
+        for fstep in range(forecast_offset, forecast_offset + forecast_steps + 1):
+
+            print(f"Processing {fstep}")
+            # embed
+            tokens = self.embed_cells(model_params, streams_data_for_source)
+
+            # local assimilation engine and adapter
+            tokens, posteriors = self.assimilate_local(model_params, tokens, source_cell_lens)
+
+            tokens = self.assimilate_global(model_params, tokens)
+
+            preds = self.predict(
+                        model_params,
+                        fstep,
+                        tokens,
+                        streams_data,
+                        target_coords_idxs,
+                     )
+            preds_all+= [preds]
+            streams_data_for_source, source_cell_lens = convert_wg_output_to_dataloader_output(preds,streams_data, streams_dataset_val, self.healpix_level, fstep)
+        return preds_all, posteriors
+
+    #########################################
+    def forward(self, model_params: ModelParams, batch, forecast_offset: int, forecast_steps: int):
+        """Performs the forward pass of the model to generate forecasts
+        Tokens are processed through the model components, which were defined in the create method.
+        Args:
+            model_params : Query and embedding parameters
+            batch :
+                streams_data : Contains tokenized source data and target data for each dataset and
+                    each stream
+                source_cell_lens : Used to identify range of tokens to use from generated tokens in
+                    cell embedding
+                target_coords_idxs : Indices of target coordinates for each dataset.
+            forecast_offset : Starting index for iteration
+            forecast_steps : Number of forecast steps to calculate from forecast_offset
+        Returns:
+            A list containing all prediction results
+        """
+
+        with torch.no_grad():
+            (streams_data, source_cell_lens, target_coords_idxs) = batch
+
+            # embed
+            tokens = self.embed_cells(model_params, streams_data)
+
+            # local assimilation engine and adapter
+            tokens, _ = self.assimilate_local(model_params, tokens, source_cell_lens)
+
+            tokens = self.assimilate_global(model_params, tokens)
+
+        return tokens
+
+    #########################################
+    def forward_with_llm(self, model_params: ModelParams, batch, forecast_offset: int, forecast_steps: int):
+        """Performs the forward pass of the model to generate forecasts
+        Tokens are processed through the model components, which were defined in the create method.
+        Args:
+            model_params : Query and embedding parameters
+            batch :
+                streams_data : Contains tokenized source data and target data for each dataset and
+                    each stream
+                source_cell_lens : Used to identify range of tokens to use from generated tokens in
+                    cell embedding
+                target_coords_idxs : Indices of target coordinates for each dataset.
+            forecast_offset : Starting index for iteration
+            forecast_steps : Number of forecast steps to calculate from forecast_offset
+        Returns:
+            A list containing all prediction results
+        """
+
+        (streams_data, source_cell_lens, target_coords_idxs) = batch
+
+        # embed
+        tokens = self.embed_cells(model_params, streams_data)
+
+        # local assimilation engine and adapter
+        tokens, posteriors = self.assimilate_local(model_params, tokens, source_cell_lens)
+
+        tokens = self.assimilate_global(model_params, tokens)
+
+        tokens_all = [tokens]
+
+        # roll-out in latent space
+        preds_all = []
+        for fstep in range(forecast_offset, forecast_offset + forecast_steps):
+            # prediction
+            preds_all += [
+                self.predict(
+                    model_params,
+                    fstep,
+                    tokens_all[-1],
+                    streams_data,
+                    target_coords_idxs,
+                )
+            ]
+
+            tokens = self.forecast_llm(model_params.forecast_params,torch.cat(tokens_all))[[-1]]
+            tokens_all.append(tokens)
+            tokens_all = tokens_all[-15:]
+
+        # prediction for final step
+        preds_all += [
+            self.predict(
+                model_params,
+                forecast_offset + forecast_steps,
+                tokens,
+                streams_data,
+                target_coords_idxs,
+            )
+        ]
+
+        return preds_all, posteriors
+
+
 
     #########################################
     def embed_cells(self, model_params: ModelParams, streams_data) -> torch.Tensor:
@@ -787,6 +954,27 @@ class Model(torch.nn.Module):
         return tokens
 
     #########################################
+    def forecast_llm(self, forecast_params, tokens: torch.Tensor) -> torch.Tensor:
+        """Advances latent space representation in time
+        Args:
+            model_params : Query and embedding parameters (never used)
+            tokens : Input tokens to be processed by the model.
+        Returns:
+            Processed tokens
+        Raises:
+            ValueError: For unexpected arguments in checkpoint method
+        """
+
+        seq_length = tokens.shape[0]
+        tokens += forecast_params[:seq_length]
+        tokens = tokens.permute([1,0,2])
+        for it, block in enumerate(self.fe_blocks):
+            tokens = checkpoint(block, tokens, use_reentrant=False)
+        tokens = tokens.permute([1,0,2])
+
+        return tokens
+
+    #########################################
     def forecast(self, model_params: ModelParams, tokens: torch.Tensor) -> torch.Tensor:
         """Advances latent space representation in time
 
@@ -848,6 +1036,7 @@ class Model(torch.nn.Module):
             ## embed token coords, concatenating along batch dimension
             # (which is taking care of through the varlen attention)
             # arguably we should to the mixed precision policy when creating the model in FSDP
+
             tc_tokens = torch.cat(
                 [
                     checkpoint(

@@ -11,6 +11,7 @@ from functools import partial
 
 import torch
 from flash_attn import flash_attn_func, flash_attn_varlen_func
+from flash_attn.flash_attn_interface import flash_attn_qkvpacked_func
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from weathergen.model.norms import AdaLayerNorm, RMSNorm
@@ -530,6 +531,7 @@ class MultiSelfAttentionHead(torch.nn.Module):
     def forward(self, x, ada_ln_aux=None):
         if self.with_residual:
             x_in = x
+
         x = self.lnorm(x) if ada_ln_aux is None else self.lnorm(x, ada_ln_aux)
 
         # project onto heads and q,k,v and
@@ -628,3 +630,46 @@ class MultiCrossAttentionHead(torch.nn.Module):
             outs = x_q_in + outs
 
         return outs
+
+class LLMDecoder(torch.nn.Module):
+    def __init__(
+            self, 
+            hidden_dim, 
+            num_heads,
+            dropout=0.0,
+            norm_type="LayerNorm",
+            norm_eps=1e-5,
+            attention_dtype=torch.bfloat16,
+            ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+
+        self.qkv_proj = torch.nn.Linear(hidden_dim, 3 * hidden_dim, bias=False)
+        self.out_proj = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.dropout = torch.nn.Dropout(dropout)
+        if norm_type == "LayerNorm":
+            norm = partial(torch.nn.LayerNorm, elementwise_affine=False, eps=norm_eps)
+        else:
+            norm = RMSNorm
+        self.lnorm = norm(self.hidden_dim,eps=norm_eps)
+        self.dtype = attention_dtype
+
+    def forward(self, x):
+        B, T, C = x.shape
+
+        # Project to QKV
+        x_in = x
+        x = self.lnorm(x)
+        qkv = self.qkv_proj(x).to(self.dtype)  # (B, T, 3*C)
+        qkv = qkv.view(B, T, 3, self.num_heads, self.head_dim)
+
+        # Flash attention expects qkv packed: (B, T, 3, num_heads, head_dim)
+        # Causal=True for decoder masking
+        attn_output = flash_attn_qkvpacked_func(qkv, dropout_p=0.0, causal=True)
+
+        # attn_output shape: (B, T, num_heads, head_dim)
+        attn_output = attn_output.reshape(B, T, C)
+        out = x_in + self.out_proj(attn_output)
+        return out

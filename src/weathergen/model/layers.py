@@ -93,3 +93,28 @@ class MLP(torch.nn.Module):
                 x = x + x_in.repeat([*[1 for _ in x.shape[:-1]], x.shape[-1] // x_in.shape[-1]])
 
         return x
+
+class FeedForwardLayer(torch.nn.Module):
+    def __init__(
+            self,
+            hidden_dim, 
+            ff_dim, 
+            norm_type="LayerNorm",
+            norm_eps=1e-5,
+            dropout=0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim, ff_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_dim, hidden_dim),
+        )
+
+        norm = torch.nn.LayerNorm if norm_type == "LayerNorm" else RMSNorm
+        
+        self.lnorm = norm(hidden_dim, eps=norm_eps)
+
+    def forward(self, x):
+        x_in = x
+        x = self.lnorm(x)
+        return x_in+self.net(x)
