@@ -200,7 +200,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.finetuner_fcst = cf.finetuner_fcst
         self.epoch = 0
 
-    ###################################################
+    ####pl##############################################
     def advance(self):
         """
         Advance epoch (this is applied to the template for the worker processes)
@@ -243,10 +243,12 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
 
         # data
         index_range = self.time_window_handler.get_index_range()
-        idx_end = index_range.end - index_range.end % finetuner_fcst_steps
+        idx_start = index_range.start + (self.epoch % self.finetuner_fcst)
+        idx_end = idx_start + ((index_range.end - idx_start) // finetuner_fcst_steps)*finetuner_fcst_steps
+
         # native length of datasets, independent of epoch length that has potentially been specified
         assert idx_end > 0, "dataset size too small for forecast range"
-        self.perms = np.arange(index_range.start, idx_end)
+        self.perms = np.arange(idx_start, idx_end)
         self.perms = self.perms.reshape((-1,finetuner_fcst_steps))
         if self.shuffle:
             self.perms = self.rng.permutation(self.perms)
@@ -500,5 +502,9 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             #    + f" : dataset [{local_start},{local_end}) : [{iter_start},{iter_end})"
             #)
             iter_start = local_start + worker_info.id
+            is_divisible = (worker_info.num_workers % self.finetuner_fcst == 0 
+                             or self.finetuner_fcst % worker_info.num_workers == 0)
+            
+            assert is_divisible,"num_workers should be divisible by y fineuner_fcs parameter"
 
-        return range(iter_start,local_end,self.finetuner_fcst)
+        return range(iter_start,local_end,worker_info.num_workers)

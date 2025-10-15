@@ -402,15 +402,16 @@ class Trainer(TrainerBase):
         if cf.val_initial:
             self.validate(-1)
 
-        for epoch in range(epoch_base, cf.num_epochs):
+        for epoch in range(epoch_base*cf.finetuner_fcst, cf.num_epochs*cf.finetuner_fcst):
             logger.info(f"Epoch {epoch} of {cf.num_epochs}: train.")
             self.train(epoch) if cf.finetuner_fcst < 2 else self.train_finetune_fcst(epoch)
 
             logger.info(f"Epoch {epoch} of {cf.num_epochs}: validate.")
             #self.validate(epoch)
 
-            logger.info(f"Epoch {epoch} of {cf.num_epochs}: save_model.")
-            self.save_model(epoch)
+            if (epoch+1)%cf.finetuner_fcst:
+                logger.info(f"Epoch {epoch} of {cf.num_epochs}: save_model.")
+                self.save_model(epoch//cf.finetuner_fcst)
 
         # log final model
         self.save_model(cf.num_epochs)
@@ -550,6 +551,7 @@ class Trainer(TrainerBase):
         loss = torch.nn.MSELoss()
         temporal_tokens = []
         indexes = []
+        i_step = 0
         for bidx, batch in enumerate(dataset_iter):
             idx=batch[-1]
             forecast_steps = batch[-2]
@@ -580,9 +582,9 @@ class Trainer(TrainerBase):
                                 preds[:-1],
                                 temporal_tokens[1:,split_cells])
                     # backward pass
-                    if bidx % log_interval == 0:
+                    if (i_step+1) % log_interval == 0:
                         logger.info(f"indexes are {indexes}")
-                        logger.info(f"train loss at {bidx} is {loss_values/len(split_cells_index)}")
+                        logger.info(f"train loss at {bidx} is {loss_values/len(split_cell_index)}")
                     self.grad_scaler.scale(loss_values).backward()
 
                     # gradient clipping
@@ -610,6 +612,7 @@ class Trainer(TrainerBase):
                         self.save_model(-1)
 
                     self.cf.istep += cf.batch_size_per_gpu
+                    i_step +=1
                     temporal_tokens = []
                     indexes = []
 
