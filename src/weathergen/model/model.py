@@ -866,7 +866,6 @@ class Model(torch.nn.Module):
         """
         
         aux_info = self.fe_aux_info(torch.tensor([fstep],device=tokens.device))
-        print("aux_info",aux_info)
         tokens = self.forecast_engine(tokens, aux_info) 
         return tokens
 

@@ -386,12 +386,11 @@ class ForecastingEngine(torch.nn.Module):
             block.apply(init_weights_final)
 
     def forward(self, tokens, fstep):
-        aux_info = None
         for b_idx, block in enumerate(self.fe_blocks):
             if isinstance(block, torch.nn.modules.normalization.LayerNorm):
                 tokens = block(tokens)
             else:
-                tokens = checkpoint(block, tokens, aux_info, use_reentrant=False)
+                tokens = checkpoint(block, tokens, fstep, use_reentrant=False)
         return tokens
 
 
