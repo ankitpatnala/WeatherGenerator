@@ -23,6 +23,12 @@ from astropy_healpix import healpy
 from torch.utils.checkpoint import checkpoint
 
 from weathergen.common.config import Config
+
+from weathergen.model.positional_encoding import(
+        FourierEmbedding,
+        PositionalEmbedding,
+        LearnableEmbedding
+)
 from weathergen.model.engines import (
     EmbeddingEngine,
     EnsPredictionHead,
@@ -321,7 +327,29 @@ class Model(torch.nn.Module):
                 "Empty forecast engine (fe_num_blocks = 0), but forecast_steps[i] > 0 for some i"
             )
 
-        self.forecast_engine = ForecastingEngine(cf, self.num_healpix_cells)
+
+        fe_aux_encoding_type = cf.get("fe_aux_encoding_type", "identity")
+        if fe_aux_encoding_type == "identity":
+            self.fe_aux_info = nn.Identity()
+            fe_aux_channels = 1
+        elif fe_aux_encoding_type == "Zero":
+            self.fe_aux_info = nn.Identity()
+            fe_aux_channels = None
+        elif fe_aux_encoding_type == "positional":
+            fe_aux_channels = cf.get("fe_aux_channels", 64)
+            self.fe_aux_info = PositionalEmbedding(fe_aux_channels)
+        elif fe_aux_encoding_type == "fourier":
+            fe_aux_channels = cf.get("fe_aux_channels", 64)
+            self.fe_aux_info = FourierEmbedding(fe_aux_channels)
+        elif fe_aux_encoding_type == "learnable":
+            fe_aux_channels = cf.get("fe_aux_channels", 64)
+            self.fe_aux_info = LearnableEmbedding(fe_aux_channels)
+        else:
+            raise NotImplemented(
+                f"{fe_aux_encoding_type} is not known, options are identity, positional, or fourier"
+            )
+
+        self.forecast_engine = ForecastingEngine(cf, self.num_healpix_cells, fe_aux_channels)
 
         ###############
         # embed coordinates yielding one query token for each target token
@@ -330,7 +358,6 @@ class Model(torch.nn.Module):
         self.target_token_engines = torch.nn.ModuleList()
         self.pred_adapter_kv = torch.nn.ModuleList()
         self.pred_heads = torch.nn.ModuleList()
-
         for i_obs, si in enumerate(cf.streams):
             stream_name = si.get("name", i_obs)
 
@@ -837,9 +864,10 @@ class Model(torch.nn.Module):
         Raises:
             ValueError: For unexpected arguments in checkpoint method
         """
-
-        tokens = self.forecast_engine(tokens, fstep)
-
+        
+        aux_info = self.fe_aux_info(torch.tensor([fstep],device=tokens.device))
+        print("aux_info",aux_info)
+        tokens = self.forecast_engine(tokens, aux_info) 
         return tokens
 
     #########################################

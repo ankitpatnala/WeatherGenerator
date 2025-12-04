@@ -80,6 +80,8 @@ class AdaLayerNorm(torch.nn.Module):
         self.norm = torch.nn.LayerNorm(dim_embed_x, norm_eps, norm_elementwise_affine)
 
     def forward(self, x: torch.Tensor, aux: torch.Tensor | None = None) -> torch.Tensor:
+        
+        print("ada_ln_aux",aux.shape)
         for block in self.embed_aux:
             aux = block(aux)
         scale, shift = aux.split(aux.shape[-1] // 2, dim=-1)

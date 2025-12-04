@@ -530,6 +530,7 @@ class MultiSelfAttentionHead(torch.nn.Module):
     def forward(self, x, ada_ln_aux=None):
         if self.with_residual:
             x_in = x
+        
         x = self.lnorm(x) if ada_ln_aux is None else self.lnorm(x, ada_ln_aux)
 
         # project onto heads and q,k,v and

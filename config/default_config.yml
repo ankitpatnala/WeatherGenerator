@@ -49,6 +49,7 @@ forecast_steps: 4
 forecast_policy: "fixed"
 forecast_freeze_model: False
 forecast_att_dense_rate: 1.0
+fe_aux_encoding_type: Zero
 fe_num_blocks: 8
 fe_num_heads: 16
 fe_dropout_rate: 0.1
