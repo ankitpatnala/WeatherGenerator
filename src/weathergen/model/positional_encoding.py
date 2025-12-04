@@ -47,10 +47,9 @@ class FourierEmbedding(torch.nn.Module):
 class LearnableEmbedding(torch.nn.Module):
     def __init__(self, num_channels):
         super().__init__()
-        self.embedding = torch.nn.Embedding(1,num_channels)
+        self.embedding = torch.nn.Embedding(10000,num_channels)
 
     def forward(self, x):
-        print("x shape", x.shape)
         x = self.embedding(x)
         return x
 
