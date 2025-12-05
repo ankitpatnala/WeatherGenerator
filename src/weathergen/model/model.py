@@ -655,6 +655,8 @@ class Model(torch.nn.Module):
         # roll-out in latent space
         preds_all = []
         
+        tokens_mean = torch.zeros_like(tokens).squeeze()
+        tokens_std = torch.ones_like(tokens).squeeze()
         if self.num_proxy_blocks > 0:
             _,  num_healpix_cells, global_dim = tokens.shape
             proxy_vals = torch.randn(
@@ -665,7 +667,6 @@ class Model(torch.nn.Module):
         
         for fstep in range(forecast_offset, forecast_offset + forecast_steps):
             # prediction
-            normalized_tokens = to
             preds_all += [
                 self.predict(
                     model_params,
@@ -688,9 +689,6 @@ class Model(torch.nn.Module):
                     proxy_vals = self.forecast(model_params, proxy_vals,fstep)
                     tokens_mean = proxy_vals.mean(dim=0)
                     tokens_std = proxy_vals.std(dim=0)
-                else:
-                    tokens_mean = torch.zeros_like(tokens).squeeze()
-                    tokens_std = torch.ones_like(tokens).squeeze()
               
             tokens = self.forecast(model_params, tokens, fstep)
 
