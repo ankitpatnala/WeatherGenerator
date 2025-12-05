@@ -55,6 +55,7 @@ fe_dropout_rate: 0.1
 fe_with_qk_lnorm: True
 fe_layer_norm_after_blocks: []  # Index starts at 0. Thus, [3] adds a LayerNorm after the fourth layer
 impute_latent_noise_std: 0.0  # 1e-4
+num_proxy_blocks: 10
 
 healpix_level: 4
 

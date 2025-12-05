@@ -322,6 +322,7 @@ class Model(torch.nn.Module):
             )
 
         self.forecast_engine = ForecastingEngine(cf, self.num_healpix_cells)
+        self.num_proxy_blocks = cf.num_proxy_blocks
 
         ###############
         # embed coordinates yielding one query token for each target token
@@ -653,13 +654,23 @@ class Model(torch.nn.Module):
 
         # roll-out in latent space
         preds_all = []
+        
+        if self.num_proxy_blocks > 0:
+            _,  num_healpix_cells, global_dim = tokens.shape
+            proxy_vals = torch.randn(
+                    self.num_proxy_blocks,
+                    num_healpix_cells,
+                    global_dim, 
+                    device=tokens.device)
+        
         for fstep in range(forecast_offset, forecast_offset + forecast_steps):
             # prediction
+            normalized_tokens = to
             preds_all += [
                 self.predict(
                     model_params,
                     fstep,
-                    tokens,
+                    (tokens-tokens_mean)/tokens_std,
                     streams_data,
                     target_coords_idxs,
                 )
@@ -670,7 +681,17 @@ class Model(torch.nn.Module):
                 noise_std = self.cf.get("impute_latent_noise_std", 0.0)
                 if noise_std > 0.0:
                     tokens = tokens + torch.randn_like(tokens) * torch.norm(tokens) * noise_std
+            
 
+            with torch.no_grad():
+                if self.num_proxy_blocks > 0:
+                    proxy_vals = self.forecast(model_params, proxy_vals,fstep)
+                    tokens_mean = proxy_vals.mean(dim=0)
+                    tokens_std = proxy_vals.std(dim=0)
+                else:
+                    tokens_mean = torch.zeros_like(tokens).squeeze()
+                    tokens_std = torch.ones_like(tokens).squeeze()
+              
             tokens = self.forecast(model_params, tokens, fstep)
 
             if not self.training:
@@ -681,7 +702,7 @@ class Model(torch.nn.Module):
             self.predict(
                 model_params,
                 forecast_offset + forecast_steps,
-                tokens,
+                (tokens-tokens_mean)/tokens_std,
                 streams_data,
                 target_coords_idxs,
             )
