@@ -495,9 +495,9 @@ class ForecastingEngine(torch.nn.Module):
                 tokens = tokens + torch.randn_like(tokens) * torch.norm(tokens) * noise_std
         for _b_idx, block in enumerate(self.fe_blocks):
             if isinstance(block, torch.nn.modules.normalization.LayerNorm):
-                tokens = block(tokens)
+                tokens = checkpoint(block,tokens, use_reentrant=False)
             else:
-                tokens = block(tokens, fstep_embed)
+                tokens = checkpoint(block, tokens, fstep_embed, use_reentrant=False)
         return tokens
 
 
