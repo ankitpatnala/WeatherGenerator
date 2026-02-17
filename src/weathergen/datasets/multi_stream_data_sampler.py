@@ -31,6 +31,7 @@ from weathergen.datasets.utils import (
     compute_idxs_predict,
     compute_offsets_scatter_embed,
     compute_source_cell_lens,
+    indices_sampler
 )
 from weathergen.readers_extra.registry import get_extra_reader
 from weathergen.utils.distributed import is_root
@@ -89,6 +90,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         samples_per_mini_epoch,
         stage: Stage,
         shuffle=True,
+        random_sampler="full"
     ):
         super(MultiStreamDataSampler, self).__init__()
 
@@ -195,8 +197,13 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                 self.streams_datasets[-1] += [ds]
 
         index_range = self.time_window_handler.get_index_range()
-        self.len = int(index_range.end - index_range.start)
-        self.len = min(self.len, samples_per_mini_epoch if samples_per_mini_epoch else self.len)
+        if pathlib.Path(f"sampled_indices_{self._stage}.npy").exists():
+            self.sampled_indices = np.load(pathlib.Path(f"sampled_indices_{self._stage}.npy"))
+        else:
+            self.sampled_indices = indices_sampler(index_range,random_sampler)
+            np.save(f"sampled_indices_{self._stage}.npy",self.sampled_indices)
+        #self.len = int(index_range.end - index_range.start)
+        self.len = min(len(self.sampled_indices), samples_per_mini_epoch if samples_per_mini_epoch else len(self.sampled_indices))
         # adjust len to split loading across all workers and ensure it is multiple of batch_size
         len_chunk = ((self.len // cf.world_size) // batch_size) * batch_size
         self.len = min(self.len, len_chunk)
@@ -297,7 +304,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         forecast_len = (self.len_hrs * (fsm + 1)) // self.step_hrs
         idx_end -= forecast_len + self.forecast_offset
         assert idx_end > 0, "dataset size too small for forecast range"
-        self.perms = np.arange(index_range.start, idx_end)
+        self.perms = self.sampled_indices[self.sampled_indices <= idx_end] # np.arange(index_range.start, idx_end)
         if self.shuffle:
             self.perms = self.rng.permutation(self.perms)
 
@@ -453,7 +460,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             target_coords_idx = compute_idxs_predict(self.forecast_offset + forecast_dt, batch)
 
             assert len(batch) == self.batch_size
-            yield (batch, source_cell_lens, target_coords_idx, forecast_dt)
+            yield (batch, source_cell_lens, target_coords_idx, forecast_dt, idx)
 
     ###################################################
     def __len__(self):

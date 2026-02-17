@@ -753,3 +753,17 @@ def compute_source_cell_lens(batch: StreamData) -> torch.tensor:
     source_cell_lens = torch.cat([torch.zeros(1, dtype=torch.int32), source_cell_lens])
 
     return source_cell_lens
+
+
+def indices_sampler(index_range, random_sampler):
+    if random_sampler == "full":
+        return np.arange(index_range.start, index_range.end)
+    if type(random_sampler) is float:
+        assert random_sampler < 1.0, "It should be less than 1.0"
+        return np.random.choice( 
+                np.arange(index_range.start,index_range.end),
+                size=int(random_sampler*(index_range.end-index_range.start)))
+
+        
+        
+

@@ -346,7 +346,7 @@ def _load_private_conf(private_home: Path | None = None) -> DictConfig:
         # TODO: eventually, put all this wrapper code in a separate function
         try:
             result_hpc = subprocess.run(
-                [str(env_script_path), "hpc"], capture_output=True, text=True, check=True
+                [str(env_script_path), "hpc"], capture_output=True, text=True
             )
         except subprocess.CalledProcessError as e:
             _logger.error(

@@ -20,6 +20,7 @@ import omegaconf
 import torch
 import torch.nn as nn
 import tqdm
+import json
 from numpy.typing import NDArray
 from omegaconf import OmegaConf
 from torch import Tensor
@@ -289,6 +290,7 @@ class Trainer(TrainerBase):
             cf.samples_per_mini_epoch,
             stage=TRAIN,
             shuffle=cf.shuffle,
+            random_sampler=cf.random_sampler
         )
         self.dataset_val = MultiStreamDataSampler(
             cf,
@@ -312,6 +314,11 @@ class Trainer(TrainerBase):
             self.dataset_val, **loader_params, sampler=None
         )
 
+        self.frequency_counter = {}
+        idx_range = self.dataset.time_window_handler.get_index_range()
+        for i in range(idx_range.start, idx_range.end):
+            self.frequency_counter[i] = 0
+        
         self.model, self.model_params = self.init_model_and_shard(
             cf, run_id_contd, mini_epoch_contd, devices
         )
@@ -597,7 +604,9 @@ class Trainer(TrainerBase):
         # training loop
         self.t_start = time.time()
         for bidx, batch in enumerate(dataset_iter):
-            forecast_steps = batch[-1]
+            forecast_steps = batch[-2]
+            idx = batch[-1]
+            self.frequency_counter[idx.item()] += 1
             batch = self.batch_to_device(batch)
 
             # evaluate model
@@ -665,6 +674,7 @@ class Trainer(TrainerBase):
             # save model checkpoint (with designation _latest)
             if bidx % self.train_log_freq.checkpoint == 0 and bidx > 0:
                 self.save_model(-1)
+                json.dump(self.frequency_counter, open(f"counter_dict_{cf.rank}.json","w"))
 
             self.cf.istep += 1
 
@@ -683,7 +693,7 @@ class Trainer(TrainerBase):
                 total=len(self.data_loader_validation), disable=self.cf.with_ddp
             ) as pbar:
                 for bidx, batch in enumerate(dataset_val_iter):
-                    forecast_steps = batch[-1]
+                    forecast_steps = batch[-2]
                     batch = self.batch_to_device(batch)
 
                     # evaluate model
@@ -840,7 +850,11 @@ class Trainer(TrainerBase):
             logger.warning(f"Missing keys when loading model: {mkeys}")
         if len(ukeys) > 0:
             logger.warning(f"Unused keys when loading model: {mkeys}")
+        
+        import json
 
+        with open(f"counter_dict_{self.cf.rank}.json", "r") as f:
+            self.frequency_counter = {int(k): v for k, v in json.load(f).items()}
         return model
 
     def _get_full_model_state_dict(self):
