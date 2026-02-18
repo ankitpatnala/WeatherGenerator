@@ -31,7 +31,8 @@ from weathergen.datasets.utils import (
     compute_idxs_predict,
     compute_offsets_scatter_embed,
     compute_source_cell_lens,
-    indices_sampler
+    indices_sampler,
+    sampler_cache_key,
 )
 from weathergen.readers_extra.registry import get_extra_reader
 from weathergen.utils.distributed import is_root
@@ -197,13 +198,21 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                 self.streams_datasets[-1] += [ds]
 
         index_range = self.time_window_handler.get_index_range()
-        if pathlib.Path(f"sampled_indices_{self._stage}.npy").exists():
-            self.sampled_indices = np.load(pathlib.Path(f"sampled_indices_{self._stage}.npy"))
+        sampler_key = sampler_cache_key(random_sampler)
+        sampler_seed = int(cf.data_loader_rng_seed)
+        sampled_indices_path = pathlib.Path(
+            "sampled_indices_"
+            f"{self._stage}_{sampler_key}_seed{sampler_seed}_{index_range.start}_{index_range.end}.npy"
+        )
+        if sampled_indices_path.exists():
+            self.sampled_indices = np.load(sampled_indices_path)
         else:
-            self.sampled_indices = indices_sampler(index_range,random_sampler)
-            np.save(f"sampled_indices_{self._stage}.npy",self.sampled_indices)
-        #self.len = int(index_range.end - index_range.start)
-        self.len = min(len(self.sampled_indices), samples_per_mini_epoch if samples_per_mini_epoch else len(self.sampled_indices))
+            self.sampled_indices = indices_sampler(index_range, random_sampler, seed=sampler_seed)
+            np.save(sampled_indices_path, self.sampled_indices)
+        self.len = min(
+            len(self.sampled_indices),
+            samples_per_mini_epoch if samples_per_mini_epoch else len(self.sampled_indices),
+        )
         # adjust len to split loading across all workers and ensure it is multiple of batch_size
         len_chunk = ((self.len // cf.world_size) // batch_size) * batch_size
         self.len = min(self.len, len_chunk)
@@ -304,7 +313,12 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         forecast_len = (self.len_hrs * (fsm + 1)) // self.step_hrs
         idx_end -= forecast_len + self.forecast_offset
         assert idx_end > 0, "dataset size too small for forecast range"
-        self.perms = self.sampled_indices[self.sampled_indices <= idx_end] # np.arange(index_range.start, idx_end)
+        self.perms = self.sampled_indices[self.sampled_indices < idx_end]
+        if self.perms.size == 0:
+            raise ValueError(
+                "No usable sampled indices after applying forecast horizon filter. "
+                f"idx_end={idx_end}, forecast_len={forecast_len}, forecast_offset={self.forecast_offset}."
+            )
         if self.shuffle:
             self.perms = self.rng.permutation(self.perms)
 

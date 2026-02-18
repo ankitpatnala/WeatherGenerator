@@ -63,6 +63,7 @@ class Trainer(TrainerBase):
         TrainerBase.__init__(self)
 
         self.train_log_freq = train_log_freq
+        self.is_inference_run = False
 
     def init(self, cf: Config, devices):
         self.cf = OmegaConf.merge(
@@ -225,6 +226,7 @@ class Trainer(TrainerBase):
     def inference(self, cf, devices, run_id_contd, mini_epoch_contd):
         # general initalization
         self.init(cf, devices)
+        self.is_inference_run = True
 
         cf = self.cf
         self.device_type = torch.accelerator.current_accelerator()
@@ -275,6 +277,7 @@ class Trainer(TrainerBase):
     def run(self, cf, devices, run_id_contd=None, mini_epoch_contd=None):
         # general initalization
         self.init(cf, devices)
+        self.is_inference_run = False
         cf = self.cf
 
         # TODO: do not define new members outside of the init!!
@@ -686,6 +689,22 @@ class Trainer(TrainerBase):
 
         dataset_val_iter = iter(self.data_loader_validation)
         self.loss_unweighted_hist, self.loss_model_hist, self.stdev_unweighted_hist = [], [], []
+        export_features = self.is_inference_run and bool(cf.get("tarot_export_features", False))
+        feature_poolings = [str(p) for p in cf.get("tarot_feature_poolings", [])] if export_features else []
+        feature_poolings = list(dict.fromkeys(feature_poolings))
+        export_features = export_features and len(feature_poolings) > 0
+        export_features_only = export_features and bool(cf.get("tarot_export_features_only", False))
+        valid_poolings = {"mean", "mean_std"}
+        invalid_poolings = [p for p in feature_poolings if p not in valid_poolings]
+        if len(invalid_poolings) > 0:
+            raise ValueError(
+                f"Invalid tarot_feature_poolings={invalid_poolings}. Supported values: {sorted(valid_poolings)}."
+            )
+        feature_records: dict[str, list[np.ndarray]] = {}
+        if export_features:
+            feature_records["idx"] = []
+            for pooling in feature_poolings:
+                feature_records[f"feat_{pooling}"] = []
 
         with torch.no_grad():
             # print progress bar but only in interactive mode, i.e. when without ddp
@@ -707,13 +726,41 @@ class Trainer(TrainerBase):
                             if self.ema_model is None
                             else self.ema_model.forward_eval
                         )
-                        preds, _ = model_forward(
-                            self.model_params, batch, cf.forecast_offset, forecast_steps
-                        )
+                        if export_features:
+                            preds, _, global_tokens = model_forward(
+                                self.model_params,
+                                batch,
+                                cf.forecast_offset,
+                                forecast_steps,
+                                return_global_tokens=True,
+                            )
+                        else:
+                            preds, _ = model_forward(
+                                self.model_params, batch, cf.forecast_offset, forecast_steps
+                            )
 
                     streams_data: list[list[StreamData]] = batch[0]
+                    if export_features:
+                        sample_idxs = np.asarray(
+                            [int(item.sample_idx) for item in streams_data[0]], dtype=np.int64
+                        )
+                        features_mean = global_tokens.mean(dim=1).to(torch.float32).cpu().numpy()
+                        feature_records["idx"].append(sample_idxs)
+                        if "mean" in feature_poolings:
+                            feature_records["feat_mean"].append(features_mean)
+                        if "mean_std" in feature_poolings:
+                            features_std = (
+                                global_tokens.std(dim=1, unbiased=False)
+                                .to(torch.float32)
+                                .cpu()
+                                .numpy()
+                            )
+                            feature_records["feat_mean_std"].append(
+                                np.concatenate([features_mean, features_std], axis=-1)
+                            )
+
                     # compute loss and log output
-                    if bidx < cf.log_validation:
+                    if bidx < cf.log_validation and not export_features_only:
                         loss_values = self.loss_calculator_val.compute_loss(
                             preds=preds,
                             streams_data=streams_data,
@@ -765,6 +812,19 @@ class Trainer(TrainerBase):
 
         # avoid that there is a systematic bias in the validation subset
         self.dataset_val.advance()
+        if export_features and len(feature_records["idx"]) > 0:
+            feature_export = {k: np.concatenate(v, axis=0) for k, v in feature_records.items()}
+            out_file = (
+                config.get_path_run(cf)
+                / f"tarot_features_chkpt{mini_epoch:05d}_rank{cf.rank:04d}.npz"
+            )
+            np.savez(out_file, **feature_export)
+            logger.info(
+                "Saved TAROT features to %s with %d samples and poolings=%s",
+                out_file,
+                feature_export["idx"].shape[0],
+                feature_poolings,
+            )
 
     def batch_to_device(self, batch):
         # TODO: do not define new members outside of the init!!
