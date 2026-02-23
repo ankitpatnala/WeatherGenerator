@@ -58,7 +58,7 @@ healpix_level: 5
 with_mixed_precision: True
 with_flash_attention: True
 compile_model: False
-with_fsdp: True
+with_fsdp: False
 attention_dtype: bf16
 mlp_norm_eps: 1e-5
 norm_eps: 1e-4
@@ -127,9 +127,20 @@ random_sampler: 0.2
 # Supported values: [] | [mean] | [mean_std] | [mean,mean_std]
 tarot_feature_poolings: []
 # Export TAROT features only during `inference` when explicitly enabled.
-tarot_export_features: False
+tarot_export_features: True
 # If True with tarot_export_features, skip zarr sample output and only write npz features.
-tarot_export_features_only: False
+tarot_export_features_only: True
+# Feature representation mode for TAROT.
+#   "latent"   – pool hidden states from assimilate_global (fast, approximate)
+#   "gradient" – per-sample projected gradient via JL transform (closer to TAROT paper)
+tarot_feature_mode: "gradient"
+# Random projection dimension for gradient features (used when tarot_feature_mode="gradient").
+tarot_grad_proj_dim: 512
+# Regex to filter model parameters for gradient collection (empty = all parameters).
+# Example: ".*assimilate_global.*" selects only global assimilation layers.
+tarot_grad_wrt: ""
+# Random seed for the JL projection matrix.
+tarot_grad_proj_seed: 0
 
 lr_scaling_policy: "sqrt"
 lr_start: 1e-6

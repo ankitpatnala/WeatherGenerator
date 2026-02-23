@@ -136,8 +136,8 @@ def main():
     parser.add_argument(
         "--feature",
         default="mean_std",
-        choices=["mean", "mean_std"],
-        help="Feature pooling to use from exported files.",
+        choices=["mean", "mean_std", "grad_projected"],
+        help="Feature key to use from exported npz files.",
     )
     parser.add_argument("--ratio", type=float, default=0.2, help="Selection ratio in (0,1].")
     parser.add_argument("--output", required=True, help="Output .npy path for selected idx.")

@@ -8,9 +8,11 @@
 # In applying this licence, ECMWF does not waive the privileges and immunities
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
+import contextlib
 import itertools
 import logging
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -683,30 +685,182 @@ class Trainer(TrainerBase):
 
         self.dataset.advance()
 
+    def _init_tarot_gradient_projector(self, grad_dim, proj_dim, proj_seed, device):
+        tarot_root = str(Path(__file__).resolve().parents[3] / "TAROT")
+        if tarot_root not in sys.path:
+            sys.path.insert(0, tarot_root)
+
+        class _LocalRademacherProjector:
+            def __init__(self, grad_dim_, proj_dim_, seed_, device_, block_size_):
+                self.grad_dim = int(grad_dim_)
+                self.proj_dim = int(proj_dim_)
+                self.seed = int(seed_)
+                self.device = torch.device(device_)
+                self.block_size = int(max(1, min(block_size_, self.proj_dim)))
+
+            def _make_block(self, width: int, block_id: int, model_id: int, dtype: torch.dtype):
+                gen = torch.Generator(device=self.device)
+                gen.manual_seed(self.seed + 1000 * block_id + 100000 * model_id)
+                mat = torch.empty((self.grad_dim, width), device=self.device, dtype=dtype)
+                mat.bernoulli_(p=0.5, generator=gen)
+                mat.mul_(2.0).sub_(1.0)
+                return mat
+
+            def project(self, grads: torch.Tensor, model_id: int = 0):
+                if grads.ndim != 2:
+                    raise ValueError(f"Expected grads to be 2D, got shape {tuple(grads.shape)}.")
+                if grads.shape[1] != self.grad_dim:
+                    raise ValueError(
+                        f"Gradient width mismatch for local projector: got {grads.shape[1]}, "
+                        f"expected {self.grad_dim}."
+                    )
+
+                grads = grads.to(device=self.device, dtype=torch.float32)
+                out = torch.zeros((grads.shape[0], self.proj_dim), device=self.device, dtype=grads.dtype)
+                start = 0
+                block_id = 0
+                while start < self.proj_dim:
+                    end = min(start + self.block_size, self.proj_dim)
+                    width = end - start
+                    proj_block = self._make_block(width, block_id, model_id, grads.dtype)
+                    out[:, start:end] = grads @ proj_block
+                    start = end
+                    block_id += 1
+                return out
+
+        try:
+            from tarot.projectors import CudaProjector, ProjectionType
+
+            projector = CudaProjector(
+                grad_dim=grad_dim,
+                proj_dim=proj_dim,
+                seed=proj_seed,
+                proj_type=ProjectionType.rademacher,
+                device=device,
+                max_batch_size=8,
+            )
+            logger.info("TAROT gradient projection: using CudaProjector")
+            return projector
+        except Exception as cuda_err:
+            try:
+                from tarot.projectors import BasicProjector, ProjectionType
+
+                max_proj_bytes = 2 * 1024**3
+                safe_block = max(1, int(max_proj_bytes / (grad_dim * 4)))
+                block_size = min(safe_block, proj_dim)
+                projector = BasicProjector(
+                    grad_dim=grad_dim,
+                    proj_dim=proj_dim,
+                    seed=proj_seed,
+                    proj_type=ProjectionType.rademacher,
+                    device=torch.device(device),
+                    block_size=block_size,
+                    dtype=torch.float32,
+                )
+                logger.info("TAROT gradient projection: using BasicProjector (block_size=%d)", block_size)
+                return projector
+            except Exception as basic_err:
+                max_proj_bytes = 2 * 1024**3
+                safe_block = max(1, int(max_proj_bytes / (grad_dim * 4)))
+                block_size = min(safe_block, proj_dim)
+                logger.warning(
+                    "Falling back to local JL projector because TAROT projectors are unavailable "
+                    "(cuda_error=%s, basic_error=%s).",
+                    cuda_err,
+                    basic_err,
+                )
+                return _LocalRademacherProjector(
+                    grad_dim_=grad_dim,
+                    proj_dim_=proj_dim,
+                    seed_=proj_seed,
+                    device_=device,
+                    block_size_=block_size,
+                )
+
     def validate(self, mini_epoch):
         cf = self.cf
         self.model.eval()
 
         dataset_val_iter = iter(self.data_loader_validation)
         self.loss_unweighted_hist, self.loss_model_hist, self.stdev_unweighted_hist = [], [], []
+
+        # ---- TAROT feature export setup ----
         export_features = self.is_inference_run and bool(cf.get("tarot_export_features", False))
-        feature_poolings = [str(p) for p in cf.get("tarot_feature_poolings", [])] if export_features else []
-        feature_poolings = list(dict.fromkeys(feature_poolings))
-        export_features = export_features and len(feature_poolings) > 0
+        feature_mode = str(cf.get("tarot_feature_mode", "latent")).lower() if export_features else "latent"
+        export_latent = export_features and feature_mode == "latent"
+        export_gradients = export_features and feature_mode == "gradient"
         export_features_only = export_features and bool(cf.get("tarot_export_features_only", False))
-        valid_poolings = {"mean", "mean_std"}
-        invalid_poolings = [p for p in feature_poolings if p not in valid_poolings]
-        if len(invalid_poolings) > 0:
-            raise ValueError(
-                f"Invalid tarot_feature_poolings={invalid_poolings}. Supported values: {sorted(valid_poolings)}."
+
+        # Latent mode setup
+        feature_poolings: list[str] = []
+        if export_latent:
+            feature_poolings = list(dict.fromkeys(str(p) for p in cf.get("tarot_feature_poolings", [])))
+            if not feature_poolings:
+                export_latent = False
+            valid_poolings = {"mean", "mean_std"}
+            invalid = [p for p in feature_poolings if p not in valid_poolings]
+            if invalid:
+                raise ValueError(
+                    f"Invalid tarot_feature_poolings={invalid}. Supported: {sorted(valid_poolings)}."
+                )
+
+        export_features = export_latent or export_gradients
+
+        # Gradient mode setup
+        projector = None
+        grad_param_names: set[str] = set()
+        if export_gradients:
+            if cf.get("with_fsdp", False) and cf.get("with_ddp", False):
+                raise RuntimeError(
+                    "Gradient feature export requires FSDP to be disabled. "
+                    "Set with_fsdp=False for the gradient collection inference run."
+                )
+            if self.ema_model is not None:
+                raise RuntimeError(
+                    "Gradient feature export is incompatible with EMA forward_eval "
+                    "(decorated with @torch.no_grad). Run inference without EMA."
+                )
+            grad_wrt_pattern = str(cf.get("tarot_grad_wrt", ""))
+            if not grad_wrt_pattern:
+                grad_param_names = {n for n, _ in self.model.named_parameters()}
+            else:
+                grad_wrt_re = re.compile(grad_wrt_pattern)
+                grad_param_names = {
+                    n for n, _ in self.model.named_parameters() if grad_wrt_re.search(n)
+                }
+            grad_dim = sum(
+                p.numel() for n, p in self.model.named_parameters() if n in grad_param_names
             )
+            if grad_dim == 0:
+                raise ValueError(
+                    f"No parameters matched tarot_grad_wrt='{grad_wrt_pattern}'. "
+                    f"Model has {sum(1 for _ in self.model.parameters())} parameter groups."
+                )
+            proj_dim = int(cf.get("tarot_grad_proj_dim", 2048))
+            proj_seed = int(cf.get("tarot_grad_proj_seed", 0))
+            device_str = f"cuda:{cf.local_rank}"
+            projector = self._init_tarot_gradient_projector(grad_dim, proj_dim, proj_seed, device_str)
+            logger.info(
+                "TAROT gradient export: grad_dim=%d, proj_dim=%d, matched_params=%d/%d",
+                grad_dim,
+                proj_dim,
+                len(grad_param_names),
+                sum(1 for _ in self.model.parameters()),
+            )
+
+        # Accumulation buffers
         feature_records: dict[str, list[np.ndarray]] = {}
         if export_features:
             feature_records["idx"] = []
+        if export_latent:
             for pooling in feature_poolings:
                 feature_records[f"feat_{pooling}"] = []
+        if export_gradients:
+            feature_records["feat_grad_projected"] = []
 
-        with torch.no_grad():
+        grad_ctx = contextlib.nullcontext() if export_gradients else torch.no_grad()
+
+        with grad_ctx:
             # print progress bar but only in interactive mode, i.e. when without ddp
             with tqdm.tqdm(
                 total=len(self.data_loader_validation), disable=self.cf.with_ddp
@@ -714,6 +868,10 @@ class Trainer(TrainerBase):
                 for bidx, batch in enumerate(dataset_val_iter):
                     forecast_steps = batch[-2]
                     batch = self.batch_to_device(batch)
+
+                    if export_gradients:
+                        self.model.zero_grad(set_to_none=True)
+                        self.model_params.zero_grad(set_to_none=True)
 
                     # evaluate model
                     with torch.autocast(
@@ -726,7 +884,7 @@ class Trainer(TrainerBase):
                             if self.ema_model is None
                             else self.ema_model.forward_eval
                         )
-                        if export_features:
+                        if export_latent:
                             preds, _, global_tokens = model_forward(
                                 self.model_params,
                                 batch,
@@ -740,7 +898,9 @@ class Trainer(TrainerBase):
                             )
 
                     streams_data: list[list[StreamData]] = batch[0]
-                    if export_features:
+
+                    # ---- Latent feature collection ----
+                    if export_latent:
                         sample_idxs = np.asarray(
                             [int(item.sample_idx) for item in streams_data[0]], dtype=np.int64
                         )
@@ -759,12 +919,46 @@ class Trainer(TrainerBase):
                                 np.concatenate([features_mean, features_std], axis=-1)
                             )
 
-                    # compute loss and log output
-                    if bidx < cf.log_validation and not export_features_only:
-                        loss_values = self.loss_calculator_val.compute_loss(
-                            preds=preds,
-                            streams_data=streams_data,
+                    # ---- Gradient feature collection ----
+                    loss_already_computed = False
+                    if export_gradients:
+                        sample_idxs = np.asarray(
+                            [int(item.sample_idx) for item in streams_data[0]], dtype=np.int64
                         )
+                        loss_values = self.loss_calculator_val.compute_loss(
+                            preds=preds, streams_data=streams_data,
+                        )
+                        loss_values.loss.backward()
+                        loss_already_computed = True
+                        grad_parts = []
+                        for n, p in self.model.named_parameters():
+                            if n not in grad_param_names:
+                                continue
+                            if p.grad is None:
+                                grad_parts.append(torch.zeros_like(p, device=p.device).flatten())
+                            else:
+                                grad_parts.append(p.grad.detach().flatten())
+                        grad_vec = torch.cat(grad_parts)
+                        if grad_vec.numel() != grad_dim:
+                            raise RuntimeError(
+                                f"Gradient vector size mismatch: got {grad_vec.numel()}, expected {grad_dim}."
+                            )
+                        with torch.no_grad():
+                            projected = projector.project(grad_vec.unsqueeze(0), model_id=0)
+                        feature_records["idx"].append(sample_idxs)
+                        feature_records["feat_grad_projected"].append(
+                            projected.to(torch.float32).cpu().numpy()
+                        )
+                        self.model.zero_grad(set_to_none=True)
+                        self.model_params.zero_grad(set_to_none=True)
+
+                    # ---- Loss computation and optional zarr output ----
+                    if bidx < cf.log_validation and not export_features_only:
+                        if not loss_already_computed:
+                            loss_values = self.loss_calculator_val.compute_loss(
+                                preds=preds,
+                                streams_data=streams_data,
+                            )
 
                         # TODO: Move _prepare_logging into write_validation by passing streams_data
                         (
@@ -796,10 +990,11 @@ class Trainer(TrainerBase):
                         )
 
                     else:
-                        loss_values = self.loss_calculator_val.compute_loss(
-                            preds=preds,
-                            streams_data=streams_data,
-                        )
+                        if not loss_already_computed:
+                            loss_values = self.loss_calculator_val.compute_loss(
+                                preds=preds,
+                                streams_data=streams_data,
+                            )
 
                     self.loss_unweighted_hist += [loss_values.losses_all]
                     self.loss_model_hist += [loss_values.loss.item()]
@@ -812,18 +1007,19 @@ class Trainer(TrainerBase):
 
         # avoid that there is a systematic bias in the validation subset
         self.dataset_val.advance()
-        if export_features and len(feature_records["idx"]) > 0:
+        if export_features and len(feature_records.get("idx", [])) > 0:
             feature_export = {k: np.concatenate(v, axis=0) for k, v in feature_records.items()}
             out_file = (
                 config.get_path_run(cf)
                 / f"tarot_features_chkpt{mini_epoch:05d}_rank{cf.rank:04d}.npz"
             )
             np.savez(out_file, **feature_export)
+            exported_keys = [k for k in feature_export if k.startswith("feat_")]
             logger.info(
-                "Saved TAROT features to %s with %d samples and poolings=%s",
+                "Saved TAROT features to %s with %d samples, keys=%s",
                 out_file,
                 feature_export["idx"].shape[0],
-                feature_poolings,
+                exported_keys,
             )
 
     def batch_to_device(self, batch):
@@ -911,10 +1107,14 @@ class Trainer(TrainerBase):
         if len(ukeys) > 0:
             logger.warning(f"Unused keys when loading model: {mkeys}")
         
-        import json
-
-        with open(f"counter_dict_{self.cf.rank}.json", "r") as f:
-            self.frequency_counter = {int(k): v for k, v in json.load(f).items()}
+        counter_path = Path(f"counter_dict_{self.cf.rank}.json")
+        if counter_path.exists():
+            with counter_path.open("r") as f:
+                self.frequency_counter = {int(k): v for k, v in json.load(f).items()}
+        else:
+            # Older checkpoints or inference-only runs may not have a counter file.
+            self.frequency_counter = getattr(self, "frequency_counter", {})
+            logger.info("Counter file not found at %s, skipping restore.", counter_path)
         return model
 
     def _get_full_model_state_dict(self):
