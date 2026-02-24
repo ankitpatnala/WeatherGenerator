@@ -23,10 +23,12 @@ module load Stages/2025
 
 module load GCC/13.3.0
 module load GCCcore/.13.3.0
+module load CUDA/12
 
 ml git/2.45.1
 ml Python/3.12.3
 
+ml uv/0.7.4
 
 # set some environment variables to ensure that GPU-devices are used properly
 export UCX_TLS="^cma"
@@ -64,6 +66,14 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 source .venv/bin/activate
 
+# Optional: make torch shared libraries visible for custom CUDA extensions.
+export TORCH_LIB=$(python -c "import torch, pathlib; print(pathlib.Path(torch.__file__).parent / 'lib')")
+export LD_LIBRARY_PATH="$TORCH_LIB:$LD_LIBRARY_PATH"
+
+export UV_CACHE_DIR=/p/project1/weatherai/uv_cache_shared
+
 #srun uv --offline run train_continue --from_run_id hsbwt96m
 
-srun uv --offline run train
+# srun uv --offline run train
+
+srun uv run --offline --no-sync train --config config/tarot_20pct.yml

@@ -141,6 +141,12 @@ tarot_grad_proj_dim: 512
 tarot_grad_wrt: ""
 # Random seed for the JL projection matrix.
 tarot_grad_proj_seed: 0
+# Optional global index origin for TAROT exports and downstream selection.
+# When set, feature export writes `idx_global` in addition to `idx_time_ns`.
+# Example: "1979-01-01"
+tarot_global_index_origin: ""
+# Step size (hours) used to convert time -> global index when tarot_global_index_origin is set.
+tarot_global_index_step_hours: 6
 
 lr_scaling_policy: "sqrt"
 lr_start: 1e-6

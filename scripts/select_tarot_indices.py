@@ -6,58 +6,180 @@ import os
 import pathlib
 import sys
 import tempfile
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 
 
-def _load_rank_files(pattern: str, feature_key: str):
+@dataclass
+class LoadedFeatures:
+    ids: np.ndarray
+    feat: np.ndarray
+    idx_local: np.ndarray
+    idx_time_ns: np.ndarray
+    idx_global: np.ndarray
+    file_id: np.ndarray
+    row_in_file: np.ndarray
+    paths: list[str]
+    id_mode: str
+
+
+def _choose_id_mode(requested_mode: str, paths: list[str], has_global: bool, has_time: bool) -> str:
+    if requested_mode != "auto":
+        if requested_mode == "idx_global" and not has_global:
+            raise KeyError("Requested --id-mode idx_global but some files are missing 'idx_global'.")
+        if requested_mode == "idx_time_ns" and not has_time:
+            raise KeyError("Requested --id-mode idx_time_ns but some files are missing 'idx_time_ns'.")
+        return requested_mode
+
+    if has_global:
+        return "idx_global"
+    if has_time:
+        return "idx_time_ns"
+
+    parent_dirs = {str(pathlib.Path(p).parent) for p in paths}
+    # Single run (possibly multi-rank): local idx is usually sufficient.
+    if len(parent_dirs) == 1:
+        return "idx"
+    # Multiple run shards: local idx collides across shards, so include file identity.
+    return "shard_local"
+
+
+def _make_ids(id_mode: str, idx_local: np.ndarray, idx_time_ns: np.ndarray, idx_global: np.ndarray, file_id: np.ndarray) -> np.ndarray:
+    if id_mode == "idx":
+        return idx_local.astype(np.int64, copy=False)
+    if id_mode == "idx_global":
+        return idx_global.astype(np.int64, copy=False)
+    if id_mode == "idx_time_ns":
+        return idx_time_ns.astype(np.int64, copy=False)
+    if id_mode == "shard_local":
+        return (file_id.astype(np.int64) << np.int64(32)) | (
+            idx_local.astype(np.int64) & np.int64(0xFFFFFFFF)
+        )
+    raise ValueError(f"Unknown id_mode: {id_mode}")
+
+
+def _load_rank_files(pattern: str, feature_key: str, id_mode: str) -> LoadedFeatures:
     paths = sorted(glob.glob(pattern))
     if len(paths) == 0:
         raise FileNotFoundError(f"No feature files matched pattern: {pattern}")
 
-    idx_all = []
+    idx_local_all = []
+    idx_time_ns_all = []
+    idx_global_all = []
     feat_all = []
-    for path in paths:
-        data = np.load(path)
-        if "idx" not in data:
-            raise KeyError(f"Missing 'idx' in feature file: {path}")
-        if feature_key not in data:
-            raise KeyError(f"Missing '{feature_key}' in feature file: {path}")
-        idx_all.append(np.asarray(data["idx"], dtype=np.int64).reshape(-1))
-        feat_all.append(np.asarray(data[feature_key], dtype=np.float32))
+    file_id_all = []
+    row_in_file_all = []
+    has_global_all = True
+    has_time_all = True
 
-    idx = np.concatenate(idx_all, axis=0)
+    for fid, path in enumerate(paths):
+        with np.load(path) as data:
+            if "idx" not in data:
+                raise KeyError(f"Missing 'idx' in feature file: {path}")
+            if feature_key not in data:
+                raise KeyError(f"Missing '{feature_key}' in feature file: {path}")
+            idx_local = np.asarray(data["idx"], dtype=np.int64).reshape(-1)
+            feat = np.asarray(data[feature_key], dtype=np.float32)
+            if feat.shape[0] != idx_local.shape[0]:
+                raise ValueError(
+                    f"Feature/sample length mismatch in {path}: idx={idx_local.shape[0]} feat={feat.shape[0]}"
+                )
+            has_time = "idx_time_ns" in data
+            has_global = "idx_global" in data
+            has_time_all = has_time_all and has_time
+            has_global_all = has_global_all and has_global
+            if has_time:
+                idx_time_ns = np.asarray(data["idx_time_ns"], dtype=np.int64).reshape(-1)
+            else:
+                idx_time_ns = np.full(idx_local.shape[0], -1, dtype=np.int64)
+            if has_global:
+                idx_global = np.asarray(data["idx_global"], dtype=np.int64).reshape(-1)
+            else:
+                idx_global = np.full(idx_local.shape[0], -1, dtype=np.int64)
+
+        idx_local_all.append(idx_local)
+        idx_time_ns_all.append(idx_time_ns)
+        idx_global_all.append(idx_global)
+        feat_all.append(feat)
+        file_id_all.append(np.full(idx_local.shape[0], fid, dtype=np.int64))
+        row_in_file_all.append(np.arange(idx_local.shape[0], dtype=np.int64))
+
+    idx_local = np.concatenate(idx_local_all, axis=0)
+    idx_time_ns = np.concatenate(idx_time_ns_all, axis=0)
+    idx_global = np.concatenate(idx_global_all, axis=0)
     feat = np.concatenate(feat_all, axis=0)
-    return idx, feat
+    file_id = np.concatenate(file_id_all, axis=0)
+    row_in_file = np.concatenate(row_in_file_all, axis=0)
+    id_mode_used = _choose_id_mode(id_mode, paths, has_global_all, has_time_all)
+    ids = _make_ids(id_mode_used, idx_local, idx_time_ns, idx_global, file_id)
+    return LoadedFeatures(
+        ids=ids,
+        feat=feat,
+        idx_local=idx_local,
+        idx_time_ns=idx_time_ns,
+        idx_global=idx_global,
+        file_id=file_id,
+        row_in_file=row_in_file,
+        paths=paths,
+        id_mode=id_mode_used,
+    )
 
 
-def _deduplicate_by_idx(idx: np.ndarray, feat: np.ndarray, policy: str):
-    unique_idx, inverse, counts = np.unique(idx, return_inverse=True, return_counts=True)
+def _deduplicate_by_id(loaded: LoadedFeatures, policy: str) -> tuple[LoadedFeatures, int]:
+    unique_ids, inverse, counts = np.unique(loaded.ids, return_inverse=True, return_counts=True)
     dup_count = int(np.sum(counts > 1))
     if dup_count == 0:
         # Preserve original ordering when there are no duplicates.
-        return idx, feat, 0
+        return loaded, 0
 
     if policy == "error":
         raise ValueError(
-            f"Found {dup_count} duplicated idx values across feature files. "
+            f"Found {dup_count} duplicated IDs across feature files. "
             "Use --dedup-policy mean/first to resolve explicitly."
         )
 
+    first_positions = np.full(unique_ids.shape[0], -1, dtype=np.int64)
+    for i, uid in enumerate(inverse):
+        if first_positions[uid] == -1:
+            first_positions[uid] = i
+
     if policy == "first":
-        first_positions = np.full(unique_idx.shape[0], -1, dtype=np.int64)
-        for i, uidx in enumerate(inverse):
-            if first_positions[uidx] == -1:
-                first_positions[uidx] = i
-        return unique_idx, feat[first_positions], dup_count
+        return (
+            LoadedFeatures(
+                ids=unique_ids,
+                feat=loaded.feat[first_positions],
+                idx_local=loaded.idx_local[first_positions],
+                idx_time_ns=loaded.idx_time_ns[first_positions],
+                idx_global=loaded.idx_global[first_positions],
+                file_id=loaded.file_id[first_positions],
+                row_in_file=loaded.row_in_file[first_positions],
+                paths=loaded.paths,
+                id_mode=loaded.id_mode,
+            ),
+            dup_count,
+        )
 
     if policy == "mean":
-        d = feat.shape[1]
-        feat_sum = np.zeros((unique_idx.shape[0], d), dtype=np.float64)
-        np.add.at(feat_sum, inverse, feat.astype(np.float64))
+        d = loaded.feat.shape[1]
+        feat_sum = np.zeros((unique_ids.shape[0], d), dtype=np.float64)
+        np.add.at(feat_sum, inverse, loaded.feat.astype(np.float64))
         feat_mean = feat_sum / counts[:, None]
-        return unique_idx, feat_mean.astype(np.float32), dup_count
+        return (
+            LoadedFeatures(
+                ids=unique_ids,
+                feat=feat_mean.astype(np.float32),
+                idx_local=loaded.idx_local[first_positions],
+                idx_time_ns=loaded.idx_time_ns[first_positions],
+                idx_global=loaded.idx_global[first_positions],
+                file_id=loaded.file_id[first_positions],
+                row_in_file=loaded.row_in_file[first_positions],
+                paths=loaded.paths,
+                id_mode=loaded.id_mode,
+            ),
+            dup_count,
+        )
 
     raise ValueError(f"Unknown dedup policy: {policy}")
 
@@ -94,14 +216,60 @@ def _whiten_features(
     return all_feat[:n_cand], all_feat[n_cand:]
 
 
-def _subsample_target(
-    tgt_idx: np.ndarray, tgt_feat: np.ndarray, max_samples: int, seed: int
-) -> tuple[np.ndarray, np.ndarray]:
-    if max_samples <= 0 or tgt_idx.shape[0] <= max_samples:
-        return tgt_idx, tgt_feat
+def _subsample_loaded(loaded: LoadedFeatures, max_samples: int, seed: int) -> LoadedFeatures:
+    if max_samples <= 0 or loaded.ids.shape[0] <= max_samples:
+        return loaded
     rng = np.random.default_rng(seed)
-    sel = np.sort(rng.choice(tgt_idx.shape[0], size=max_samples, replace=False))
-    return tgt_idx[sel], tgt_feat[sel]
+    sel = np.sort(rng.choice(loaded.ids.shape[0], size=max_samples, replace=False))
+    return LoadedFeatures(
+        ids=loaded.ids[sel],
+        feat=loaded.feat[sel],
+        idx_local=loaded.idx_local[sel],
+        idx_time_ns=loaded.idx_time_ns[sel],
+        idx_global=loaded.idx_global[sel],
+        file_id=loaded.file_id[sel],
+        row_in_file=loaded.row_in_file[sel],
+        paths=loaded.paths,
+        id_mode=loaded.id_mode,
+    )
+
+
+def _time_ns_to_global_idx(time_ns: np.ndarray, origin: str, step_hours: int) -> np.ndarray:
+    if step_hours <= 0:
+        raise ValueError("--global-index-step-hours must be > 0")
+    origin_ns = np.datetime64(origin).astype("datetime64[ns]").astype(np.int64)
+    step_ns = np.int64(step_hours) * np.int64(3600 * 10**9)
+    delta = time_ns.astype(np.int64) - origin_ns
+    if np.any(delta < 0):
+        raise ValueError("Some selected samples are earlier than --global-index-origin.")
+    if np.any(delta % step_ns != 0):
+        raise ValueError(
+            "Some selected samples are not aligned to --global-index-step-hours; "
+            "cannot convert to integer global indices."
+        )
+    return (delta // step_ns).astype(np.int64)
+
+
+def _shard_local_to_global_idx(
+    idx_local: np.ndarray,
+    file_id: np.ndarray,
+    shard_start_dates: str,
+    origin: str,
+    step_hours: int,
+    num_candidate_files: int,
+) -> np.ndarray:
+    starts = [s.strip() for s in shard_start_dates.split(",") if s.strip()]
+    if len(starts) != num_candidate_files:
+        raise ValueError(
+            "Length mismatch: --candidate-shard-start-dates must provide one datetime per "
+            f"matched candidate file. got={len(starts)} expected={num_candidate_files}"
+        )
+    offsets = _time_ns_to_global_idx(
+        np.asarray(starts, dtype="datetime64[ns]").astype(np.int64),
+        origin=origin,
+        step_hours=step_hours,
+    )
+    return offsets[file_id.astype(np.int64)] + idx_local.astype(np.int64)
 
 
 def _cosine_score_matrix(
@@ -140,7 +308,7 @@ def main():
         help="Feature key to use from exported npz files.",
     )
     parser.add_argument("--ratio", type=float, default=0.2, help="Selection ratio in (0,1].")
-    parser.add_argument("--output", required=True, help="Output .npy path for selected idx.")
+    parser.add_argument("--output", required=True, help="Output .npy path for selected IDs.")
     parser.add_argument(
         "--method",
         default="fixed_size",
@@ -151,7 +319,40 @@ def main():
         "--dedup-policy",
         default="mean",
         choices=["mean", "first", "error"],
-        help="How to handle duplicated idx across matched feature files.",
+        help="How to handle duplicated IDs across matched feature files.",
+    )
+    parser.add_argument(
+        "--id-mode",
+        default="auto",
+        choices=["auto", "idx", "idx_global", "idx_time_ns", "shard_local"],
+        help=(
+            "Identity key used for dedup/output. "
+            "auto: idx_global -> idx_time_ns -> idx(single-run) -> shard_local(multi-run)."
+        ),
+    )
+    parser.add_argument(
+        "--output-global-idx",
+        default=None,
+        help="Optional output .npy path for training-ready global indices.",
+    )
+    parser.add_argument(
+        "--global-index-origin",
+        default=None,
+        help="Datetime origin (e.g. 1979-01-01) for time->global index conversion.",
+    )
+    parser.add_argument(
+        "--global-index-step-hours",
+        type=int,
+        default=6,
+        help="Step size in hours for time->global index conversion.",
+    )
+    parser.add_argument(
+        "--candidate-shard-start-dates",
+        default=None,
+        help=(
+            "Comma-separated shard start datetimes aligned with sorted candidate files. "
+            "Used to convert shard_local IDs to global indices for legacy exports."
+        ),
     )
     parser.add_argument(
         "--target-max-samples",
@@ -191,27 +392,42 @@ def main():
     from tarot.data_selector import DataSelector
 
     feature_key = f"feat_{args.feature}"
-    cand_idx, cand_feat = _load_rank_files(args.candidate, feature_key)
-    tgt_idx, tgt_feat = _load_rank_files(args.target, feature_key)
-    cand_idx, cand_feat, cand_dups = _deduplicate_by_idx(cand_idx, cand_feat, args.dedup_policy)
-    tgt_idx, tgt_feat, tgt_dups = _deduplicate_by_idx(tgt_idx, tgt_feat, args.dedup_policy)
+    cand_loaded = _load_rank_files(args.candidate, feature_key, args.id_mode)
+    tgt_loaded = _load_rank_files(args.target, feature_key, args.id_mode)
+    print(
+        f"ID mode: candidate={cand_loaded.id_mode} target={tgt_loaded.id_mode} "
+        f"(requested={args.id_mode})"
+    )
+    if args.id_mode == "auto" and cand_loaded.id_mode != tgt_loaded.id_mode:
+        print(
+            "WARNING: candidate and target resolved different ID modes under auto mode. "
+            "Selection remains valid, but selected IDs are in candidate ID space."
+        )
+    if cand_loaded.id_mode not in {"idx", "idx_global"} and args.output_global_idx is None:
+        raise ValueError(
+            "--output stores IDs (not directly training indices) for id_mode "
+            f"'{cand_loaded.id_mode}'. Please also pass --output-global-idx."
+        )
+    cand_loaded, cand_dups = _deduplicate_by_id(cand_loaded, args.dedup_policy)
+    tgt_loaded, tgt_dups = _deduplicate_by_id(tgt_loaded, args.dedup_policy)
     if cand_dups > 0 or tgt_dups > 0:
         print(
-            f"Deduplicated repeated idx values with policy={args.dedup_policy}: "
+            f"Deduplicated repeated IDs with policy={args.dedup_policy}: "
             f"candidate_duplicates={cand_dups}, target_duplicates={tgt_dups}"
         )
-    tgt_idx, tgt_feat = _subsample_target(
-        tgt_idx, tgt_feat, args.target_max_samples, args.target_subsample_seed
-    )
+    tgt_loaded = _subsample_loaded(tgt_loaded, args.target_max_samples, args.target_subsample_seed)
     if args.target_max_samples > 0:
-        print(f"Target subsampling active: using {tgt_idx.shape[0]} target samples.")
+        print(f"Target subsampling active: using {tgt_loaded.ids.shape[0]} target samples.")
 
     # Joint Cholesky whitening (mirrors WFDEstimator.get_wfd).
     # After whitening, apply per-row L2 normalization so that the score matrix
     # equals the cosine similarity in the whitened space, and the OT distance
     # in DataSelector's cosine_L2 is the correct sqrt(2 - 2·cos) metric.
-    print(f"Whitening features: candidate={cand_feat.shape}, target={tgt_feat.shape}")
-    cand_feat, tgt_feat = _whiten_features(cand_feat, tgt_feat)
+    print(
+        "Whitening features: "
+        f"candidate={cand_loaded.feat.shape}, target={tgt_loaded.feat.shape}"
+    )
+    cand_feat, tgt_feat = _whiten_features(cand_loaded.feat, tgt_loaded.feat)
     cand_feat_norm = _normalize_features(cand_feat)
     tgt_feat_norm = _normalize_features(tgt_feat)
     print("Whitening done.")
@@ -251,7 +467,15 @@ def main():
         selected_pos, _ = selector.select_data(
             score, torch.from_numpy(cand_feat_norm), torch.from_numpy(tgt_feat_norm)
         )
-        selected_idx = np.unique(cand_idx[np.asarray(selected_pos, dtype=np.int64)])
+        selected_pos = np.asarray(selected_pos, dtype=np.int64)
+        selected_ids_raw = cand_loaded.ids[selected_pos]
+        selected_ids, unique_pos = np.unique(selected_ids_raw, return_index=True)
+        selected_pos_unique = selected_pos[unique_pos]
+        selected_idx_local = cand_loaded.idx_local[selected_pos_unique]
+        selected_idx_time_ns = cand_loaded.idx_time_ns[selected_pos_unique]
+        selected_idx_global = cand_loaded.idx_global[selected_pos_unique]
+        selected_file_id = cand_loaded.file_id[selected_pos_unique]
+        selected_row_in_file = cand_loaded.row_in_file[selected_pos_unique]
     finally:
         if tmp_memmap is not None:
             if score is not None:
@@ -261,11 +485,60 @@ def main():
 
     out_path = pathlib.Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(out_path, selected_idx)
-    print(
-        f"Saved {len(selected_idx)} selected indices to {out_path}. "
-        f"candidate={len(cand_idx)} target={len(tgt_idx)} feature={args.feature}"
+    np.save(out_path, selected_ids)
+
+    # Always persist sidecar metadata so selected IDs are auditable and mappable.
+    meta_out_path = out_path.with_suffix(".meta.npz")
+    np.savez(
+        meta_out_path,
+        selected_id=selected_ids,
+        selected_idx_local=selected_idx_local,
+        selected_idx_time_ns=selected_idx_time_ns,
+        selected_idx_global=selected_idx_global,
+        selected_file_id=selected_file_id,
+        selected_row_in_file=selected_row_in_file,
+        candidate_paths=np.asarray(cand_loaded.paths, dtype=str),
+        id_mode=np.asarray([cand_loaded.id_mode]),
     )
+
+    # Optional: produce training-ready global indices.
+    if args.output_global_idx is not None:
+        if np.all(selected_idx_global >= 0):
+            output_global_idx = selected_idx_global.astype(np.int64, copy=False)
+        elif np.all(selected_idx_time_ns >= 0) and args.global_index_origin is not None:
+            output_global_idx = _time_ns_to_global_idx(
+                selected_idx_time_ns, args.global_index_origin, args.global_index_step_hours
+            )
+        elif (
+            cand_loaded.id_mode == "shard_local"
+            and args.global_index_origin is not None
+            and args.candidate_shard_start_dates is not None
+        ):
+            output_global_idx = _shard_local_to_global_idx(
+                idx_local=selected_idx_local,
+                file_id=selected_file_id,
+                shard_start_dates=args.candidate_shard_start_dates,
+                origin=args.global_index_origin,
+                step_hours=args.global_index_step_hours,
+                num_candidate_files=len(cand_loaded.paths),
+            )
+        else:
+            raise ValueError(
+                "Cannot generate global indices. Need either exported idx_global, or "
+                "idx_time_ns plus --global-index-origin, or shard_local plus "
+                "--candidate-shard-start-dates and --global-index-origin."
+            )
+        output_global_idx = np.unique(output_global_idx)
+        out_global = pathlib.Path(args.output_global_idx)
+        out_global.parent.mkdir(parents=True, exist_ok=True)
+        np.save(out_global, output_global_idx)
+        print(f"Saved {len(output_global_idx)} global indices to {out_global}.")
+
+    print(
+        f"Saved {len(selected_ids)} selected IDs to {out_path}. "
+        f"candidate={len(cand_loaded.ids)} target={len(tgt_loaded.ids)} feature={args.feature}"
+    )
+    print(f"Saved selection metadata to {meta_out_path}.")
 
 
 if __name__ == "__main__":

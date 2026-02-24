@@ -790,6 +790,36 @@ class Trainer(TrainerBase):
         export_latent = export_features and feature_mode == "latent"
         export_gradients = export_features and feature_mode == "gradient"
         export_features_only = export_features and bool(cf.get("tarot_export_features_only", False))
+        global_idx_origin = str(cf.get("tarot_global_index_origin", "")).strip()
+        global_idx_step_hours = int(cf.get("tarot_global_index_step_hours", cf.step_hrs))
+        export_global_idx = bool(global_idx_origin)
+        global_idx_origin_ns = None
+        global_idx_step_ns = None
+        if export_features and export_global_idx:
+            if global_idx_step_hours <= 0:
+                raise ValueError(
+                    f"tarot_global_index_step_hours must be > 0, got {global_idx_step_hours}."
+                )
+            global_idx_origin_ns = (
+                np.datetime64(global_idx_origin).astype("datetime64[ns]").astype(np.int64)
+            )
+            global_idx_step_ns = np.int64(global_idx_step_hours) * np.int64(3600 * 10**9)
+
+        def _time_ns_to_global_idx_checked(sample_time_ns: np.ndarray) -> np.ndarray:
+            if global_idx_origin_ns is None or global_idx_step_ns is None:
+                raise RuntimeError("Global TAROT index conversion was not initialized.")
+            delta = sample_time_ns.astype(np.int64) - np.int64(global_idx_origin_ns)
+            if np.any(delta < 0):
+                raise ValueError(
+                    "Encountered sample time earlier than tarot_global_index_origin; "
+                    "cannot export idx_global."
+                )
+            if np.any(delta % np.int64(global_idx_step_ns) != 0):
+                raise ValueError(
+                    "Sample times are not aligned with tarot_global_index_step_hours; "
+                    "cannot export idx_global."
+                )
+            return (delta // np.int64(global_idx_step_ns)).astype(np.int64)
 
         # Latent mode setup
         feature_poolings: list[str] = []
@@ -852,6 +882,9 @@ class Trainer(TrainerBase):
         feature_records: dict[str, list[np.ndarray]] = {}
         if export_features:
             feature_records["idx"] = []
+            feature_records["idx_time_ns"] = []
+            if export_global_idx:
+                feature_records["idx_global"] = []
         if export_latent:
             for pooling in feature_poolings:
                 feature_records[f"feat_{pooling}"] = []
@@ -904,8 +937,20 @@ class Trainer(TrainerBase):
                         sample_idxs = np.asarray(
                             [int(item.sample_idx) for item in streams_data[0]], dtype=np.int64
                         )
+                        sample_time_ns = np.asarray(
+                            [
+                                self.dataset_val.time_window_handler.window(np.int64(idx_)).start
+                                for idx_ in sample_idxs
+                            ],
+                            dtype="datetime64[ns]",
+                        ).astype(np.int64)
                         features_mean = global_tokens.mean(dim=1).to(torch.float32).cpu().numpy()
                         feature_records["idx"].append(sample_idxs)
+                        feature_records["idx_time_ns"].append(sample_time_ns)
+                        if export_global_idx:
+                            feature_records["idx_global"].append(
+                                _time_ns_to_global_idx_checked(sample_time_ns)
+                            )
                         if "mean" in feature_poolings:
                             feature_records["feat_mean"].append(features_mean)
                         if "mean_std" in feature_poolings:
@@ -925,6 +970,13 @@ class Trainer(TrainerBase):
                         sample_idxs = np.asarray(
                             [int(item.sample_idx) for item in streams_data[0]], dtype=np.int64
                         )
+                        sample_time_ns = np.asarray(
+                            [
+                                self.dataset_val.time_window_handler.window(np.int64(idx_)).start
+                                for idx_ in sample_idxs
+                            ],
+                            dtype="datetime64[ns]",
+                        ).astype(np.int64)
                         loss_values = self.loss_calculator_val.compute_loss(
                             preds=preds, streams_data=streams_data,
                         )
@@ -946,6 +998,11 @@ class Trainer(TrainerBase):
                         with torch.no_grad():
                             projected = projector.project(grad_vec.unsqueeze(0), model_id=0)
                         feature_records["idx"].append(sample_idxs)
+                        feature_records["idx_time_ns"].append(sample_time_ns)
+                        if export_global_idx:
+                            feature_records["idx_global"].append(
+                                _time_ns_to_global_idx_checked(sample_time_ns)
+                            )
                         feature_records["feat_grad_projected"].append(
                             projected.to(torch.float32).cpu().numpy()
                         )
