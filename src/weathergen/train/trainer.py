@@ -679,7 +679,7 @@ class Trainer(TrainerBase):
             # save model checkpoint (with designation _latest)
             if bidx % self.train_log_freq.checkpoint == 0 and bidx > 0:
                 self.save_model(-1)
-                json.dump(self.frequency_counter, open(f"counter_dict_{cf.rank}.json","w"))
+                json.dump(self.frequency_counter, open(f"counter_dict_{cf.rank}_{cf.run_id}.json","w"))
 
             self.cf.istep += 1
 
@@ -1164,7 +1164,7 @@ class Trainer(TrainerBase):
         if len(ukeys) > 0:
             logger.warning(f"Unused keys when loading model: {mkeys}")
         
-        counter_path = Path(f"counter_dict_{self.cf.rank}.json")
+        counter_path = Path(f"counter_dict_{self.cf.rank}_{run_id}.json")
         if counter_path.exists():
             with counter_path.open("r") as f:
                 self.frequency_counter = {int(k): v for k, v in json.load(f).items()}
