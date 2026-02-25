@@ -58,7 +58,7 @@ healpix_level: 5
 with_mixed_precision: True
 with_flash_attention: True
 compile_model: False
-with_fsdp: False
+with_fsdp: True
 attention_dtype: bf16
 mlp_norm_eps: 1e-5
 norm_eps: 1e-4
@@ -127,9 +127,9 @@ random_sampler: 0.2
 # Supported values: [] | [mean] | [mean_std] | [mean,mean_std]
 tarot_feature_poolings: []
 # Export TAROT features only during `inference` when explicitly enabled.
-tarot_export_features: True
+tarot_export_features: False
 # If True with tarot_export_features, skip zarr sample output and only write npz features.
-tarot_export_features_only: True
+tarot_export_features_only: False
 # Feature representation mode for TAROT.
 #   "latent"   – pool hidden states from assimilate_global (fast, approximate)
 #   "gradient" – per-sample projected gradient via JL transform (closer to TAROT paper)
