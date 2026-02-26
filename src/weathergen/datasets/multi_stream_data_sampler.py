@@ -200,7 +200,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         if pathlib.Path(f"sampled_indices_{self._stage}.npy").exists():
             self.sampled_indices = np.load(pathlib.Path(f"sampled_indices_{self._stage}.npy"))
         else:
-            self.sampled_indices = indices_sampler(index_range,random_sampler)
+            self.sampled_indices = indices_sampler(self.time_window_handler, random_sampler)
             np.save(f"sampled_indices_{self._stage}.npy",self.sampled_indices)
         #self.len = int(index_range.end - index_range.start)
         self.len = min(len(self.sampled_indices), samples_per_mini_epoch if samples_per_mini_epoch else len(self.sampled_indices))

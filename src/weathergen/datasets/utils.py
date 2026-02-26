@@ -13,6 +13,7 @@ import astropy_healpix as hp
 import numpy as np
 import torch
 from astropy_healpix.healpy import ang2pix
+from collections import defaultdict
 
 from weathergen.datasets.stream_data import StreamData
 
@@ -754,15 +755,60 @@ def compute_source_cell_lens(batch: StreamData) -> torch.tensor:
 
     return source_cell_lens
 
-
-def indices_sampler(index_range, random_sampler):
+def indices_sampler(time_window_handler, random_sampler):
+    index_range = time_window_handler.get_index_range()
+    rng = np.random.default_rng(index_range.end)
     if random_sampler == "full":
         return np.arange(index_range.start, index_range.end)
     if type(random_sampler) is float:
         assert random_sampler < 1.0, "It should be less than 1.0"
-        return np.random.choice( 
+        indices = rng.choice( 
                 np.arange(index_range.start,index_range.end),
-                size=int(random_sampler*(index_range.end-index_range.start)))
+                size=int(random_sampler*(index_range.end-index_range.start)),
+                replace=False)
+        print("----------------------------------------------------")
+        print(indices)
+        print("-----------------------------------------------------")
+        return indices
+    if "monthly_random" in random_sampler:
+        month_wise_index_dict = split_indices_by_months(time_window_handler, index_range)
+        indices_list = []
+        num_months = len(month_wise_index_dict)
+        ratio_per_month = 0.2 / num_months
+        for month in month_wise_index_dict.keys():
+            indices_list.append(
+                    rng.choice(
+                        month_wise_index_dict[month],
+                        size=int(ratio_per_month*(index_range.end - index_range.start)),
+                        replace=False))
+        indices_list = np.concatenate(indices_list)
+        print("-------------------------------------------------------")
+        print(indices_list)
+        print("---------------------------------------------------------")
+        print(indices_list.shape)
+        print("--------------------------------------------------------")
+        return indices_list
+
+def split_indices_by_months(time_window_handler, index_range):
+    t_start = time_window_handler.t_start
+    t_end = time_window_handler.t_end
+    t_window_step = time_window_handler.t_window_step
+
+    monthly_indices = np.arange(t_start, t_end, t_window_step, dtype='datetime64[ns]')
+    real_indices = np.arange(index_range.start, index_range.end)
+    
+    # Extract year-month as a comparable array (e.g., '02')
+    months = monthly_indices.astype('datetime64[M]').astype(int) % 12 + 1
+
+    # Group indices by month
+    month_groups = defaultdict(list)
+    for (month, idx) in zip(months, real_indices):
+        month_groups[month].append(idx)
+    
+    # Convert lists to sorted NumPy arrays for easier use
+    return {month: np.sort(np.array(idxs)) for month, idxs in month_groups.items()}
+
+
 
         
         
