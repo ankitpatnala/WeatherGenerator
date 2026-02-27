@@ -548,7 +548,14 @@ class Model(torch.nn.Module):
         return new_params
 
     #########################################
-    def forward(self, model_params: ModelParams, batch, forecast_offset: int, forecast_steps: int):
+    def forward(
+        self,
+        model_params: ModelParams,
+        batch,
+        forecast_offset: int,
+        forecast_steps: int,
+        return_global_tokens: bool = False,
+    ):
         """Performs the forward pass of the model to generate forecasts
 
         Tokens are processed through the model components, which were defined in the create method.
@@ -575,6 +582,7 @@ class Model(torch.nn.Module):
         tokens, posteriors = self.assimilate_local(model_params, tokens, source_cell_lens)
 
         tokens = self.assimilate_global(model_params, tokens)
+        tokens_after_assimilate_global = tokens
 
         # roll-out in latent space
         preds_all = []
@@ -609,6 +617,8 @@ class Model(torch.nn.Module):
             )
         ]
 
+        if return_global_tokens:
+            return preds_all, posteriors, tokens_after_assimilate_global
         return preds_all, posteriors
 
     #########################################
