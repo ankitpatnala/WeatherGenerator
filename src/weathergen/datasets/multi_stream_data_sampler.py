@@ -632,7 +632,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         # remove duplicates
         source_select, target_select = list(set(source_select)), list(set(target_select))
         if len(source_select) == 0 or len(target_select) == 0:
-            raise NotImplementedError(f"Unsupported training mode {mode}.")
+            raise NotImplementError(f"Unsupported training mode {mode}.")
 
         num_output_steps = self._get_output_length(num_forecast_steps)
         batch = ModelBatch(

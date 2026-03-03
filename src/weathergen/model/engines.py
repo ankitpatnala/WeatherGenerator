@@ -32,6 +32,7 @@ from weathergen.model.positional_encoding import (
     FourierEmbedding,
     LearnableEmbedding,
     PositionalEmbedding,
+    AbsoluteDayEmbedding
 )
 from weathergen.model.utils import ActivationFactory
 from weathergen.utils.utils import get_dtype
@@ -425,6 +426,9 @@ class ForecastingEngine(torch.nn.Module):
         elif fe_aux_encoding_type == "learnable":
             dim_aux = cf.get("fe_aux_channels", 64)
             self.fstep_embedder = LearnableEmbedding(dim_aux)
+        elif fe_aux_encoding_type == "absolute_day":
+            dim_aux = cf.get("fe_aux_channels", 64)
+            self.fstep_embedder = AbsoluteDayEmbedding(dim_aux)
         else:
             raise NotImplementedError(
                 f"{fe_aux_encoding_type} is not known, options are ",

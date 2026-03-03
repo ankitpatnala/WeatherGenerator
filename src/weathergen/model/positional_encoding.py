@@ -51,6 +51,14 @@ class LearnableEmbedding(torch.nn.Module):
         x = self.embedding(x.int())
         return x
 
+class AbsoluteDayEmbedding(torch.nn.Module):
+    def __init__(self, num_channels):
+        super().__init__()
+        
+
+    def forward(self, x):
+        x = 
+        
 
 ####################################################################################################
 def positional_encoding_harmonic(x):
