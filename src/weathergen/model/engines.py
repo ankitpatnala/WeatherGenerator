@@ -422,6 +422,11 @@ class ForecastingEngine(torch.nn.Module):
                     )
                 )
 
+                if i in self.cf.get("fe_layer_norm_after_blocks", []):
+                    self.fe_blocks.append(
+                        torch.nn.LayerNorm(self.cf.ae_global_dim_embed, elementwise_affine=False)
+                    )
+
         def init_weights_final(m):
             """Initialize the weights of the forecasting engine."""
             if isinstance(m, torch.nn.Linear):
