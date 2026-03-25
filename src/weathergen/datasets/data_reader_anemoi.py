@@ -28,6 +28,12 @@ from weathergen.datasets.data_reader_base import (
 
 _logger = logging.getLogger(__name__)
 
+season_to_months = {
+        "summer" = [6,7,8],
+        "autumn" = [9,10,11],
+        "winter" = [12,1,2],
+        "spring" = [3,4,5]
+}
 
 class DataReaderAnemoi(DataReaderTimestep):
     "Wrapper for Anemoi datasets"
@@ -98,6 +104,9 @@ class DataReaderAnemoi(DataReaderTimestep):
         else:
             self.ds = ds
             self.len = len(ds)
+
+        season = stream_info.get("season", None)
+        seasonal_indices_mask = get_seasonal_indices(ds0, season)
 
         # caches lats and lons
         self.latitudes = _clip_lat(ds.latitudes)
@@ -296,6 +305,8 @@ class DataReaderAnemoi(DataReaderTimestep):
 
         return np.array(chs_idx, dtype=np.int64)
 
+def get_seasonal_indices(ds0, season):
+    pass
 
 def _clip_lat(lats: NDArray) -> NDArray[np.float32]:
     """
