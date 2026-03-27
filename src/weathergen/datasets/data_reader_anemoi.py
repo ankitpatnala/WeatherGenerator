@@ -13,6 +13,7 @@ from typing import override
 
 import anemoi.datasets as anemoi_datasets
 import numpy as np
+import pandas as pd
 from anemoi.datasets.data import MissingDateError
 from anemoi.datasets.data.dataset import Dataset
 from numpy.typing import NDArray
@@ -29,10 +30,10 @@ from weathergen.datasets.data_reader_base import (
 _logger = logging.getLogger(__name__)
 
 season_to_months = {
-        "summer" = [6,7,8],
-        "autumn" = [9,10,11],
-        "winter" = [12,1,2],
-        "spring" = [3,4,5]
+        "summer" : [6,7,8],
+        "autumn" : [9,10,11],
+        "winter" : [12,1,2],
+        "spring" : [3,4,5]
 }
 
 class DataReaderAnemoi(DataReaderTimestep):
@@ -106,7 +107,7 @@ class DataReaderAnemoi(DataReaderTimestep):
             self.len = len(ds)
 
         season = stream_info.get("season", None)
-        seasonal_indices_mask = get_seasonal_indices(ds0, season)
+        self.seasonal_indices_mask = get_seasonal_indices(ds0, season)
 
         # caches lats and lons
         self.latitudes = _clip_lat(ds.latitudes)
@@ -172,7 +173,9 @@ class DataReaderAnemoi(DataReaderTimestep):
         ReaderData providing coords, geoinfos, data, datetimes
         """
 
-        (t_idxs, dtr) = self._get_dataset_idxs(idx)
+        (t_idxs, dtr) = ( self._get_dataset_idxs(idx)
+                          if self.seasonal_indices_mask[idx]
+                          else ([],None) )
 
         if self.ds is None or self.len == 0 or len(t_idxs) == 0:
             return ReaderData.empty(
@@ -306,7 +309,16 @@ class DataReaderAnemoi(DataReaderTimestep):
         return np.array(chs_idx, dtype=np.int64)
 
 def get_seasonal_indices(ds0, season):
-    pass
+    
+    dates = ds0.dates
+
+    if season is not None:
+        df = pd.to_datetime(dates)
+        months = df.month  # Series of month numbers
+        mask = months.isin(season_to_months[season])
+        return mask
+    else:
+        return np.full(len(dates), True)
 
 def _clip_lat(lats: NDArray) -> NDArray[np.float32]:
     """

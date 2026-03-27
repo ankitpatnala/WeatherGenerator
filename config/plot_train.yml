@@ -1,0 +1,6 @@
+train : 
+  plot :
+    vsva8fey : 
+      slurm_id: 0
+      description: "ERA5 with season wise stream"
+      eval: vgbndhco
