@@ -18,6 +18,7 @@ ERA5_autumn :
   masking_rate : 0.6
   masking_rate_none : 0.05
   season: autumn
+  diagnostic : True
   token_size : 8
   tokenize_spacetime : True
   max_num_targets: 20000
