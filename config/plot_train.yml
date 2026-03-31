@@ -1,6 +1,6 @@
 train : 
   plot :
-    vsva8fey : 
+    bvrpnuhz : 
       slurm_id: 0
-      description: "ERA5 with season wise stream"
+      description: "ERA5 with condition (start_day, start_time, end_day, end_time"
       eval: vgbndhco
