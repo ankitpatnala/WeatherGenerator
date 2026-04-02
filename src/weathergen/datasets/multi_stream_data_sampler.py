@@ -11,6 +11,7 @@ import logging
 import pathlib
 
 import numpy as np
+import pandas as pd
 import torch
 
 from weathergen.common.config import Config
@@ -631,6 +632,9 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         if "student_teacher" in mode or "latent_loss" in mode:
             source_select += ["network_input"]
             target_select += ["network_input"]
+        if  self.mode_cfg.get("forecast", False).get("condition",False) :
+            source_select += ["condition_forecasting_engine"]
+            target_select += ["condition_forecasting_engine"]
         # remove duplicates
         source_select, target_select = list(set(source_select)), list(set(target_select))
         if len(source_select) == 0 or len(target_select) == 0:
@@ -644,6 +648,21 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             self.output_offset,
             num_output_steps,
         )
+        
+        for timestep_idx in range(self.output_offset, num_output_steps):
+            step_forecast_dt = idx + (self.time_step * timestep_idx) // self.step_timedelta
+            time_win_target = self.time_window_handler.window(step_forecast_dt)
+
+            py_start = pd.to_datetime(time_win_target.start).to_pydatetime()
+            py_end = pd.to_datetime(time_win_target.end).to_pydatetime()
+
+            start_hour = int(py_start.hour)
+            start_day = int(py_start.day)
+            end_hour = int(py_end.hour)
+            end_day = int(py_end.day)
+
+            forecast_conditions = [start_hour, start_day, end_hour, end_day]
+            batch.get_source_samples().forecast_conditions[timestep_idx] += forecast_conditions
 
         # for all streams
         for stream_info, (stream_name, stream_ds) in zip(
