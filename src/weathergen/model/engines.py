@@ -475,6 +475,7 @@ class ForecastingEngine(torch.nn.Module):
                 tokens = tokens + torch.randn_like(tokens) * torch.norm(tokens) * noise_std
 
         aux_info = torch.Tensor(fstep).to(tokens.device)
+        aux_info = torch.cat([torch.sin(aux_info), torch.cos(aux_info)], dim=-1)
         for _b_idx, block in enumerate(self.fe_blocks):
             if isinstance(block, torch.nn.modules.normalization.LayerNorm):
                 tokens = block(tokens)
