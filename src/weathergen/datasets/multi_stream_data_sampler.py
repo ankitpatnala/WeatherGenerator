@@ -661,7 +661,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             end_hour = int(py_end.hour)
             end_day = int(py_end.day)
 
-            forecast_conditions = [start_hour, start_day, end_hour, end_day]
+            forecast_conditions = [start_day, end_day]
             batch.get_source_samples().forecast_conditions[timestep_idx] += forecast_conditions
 
         # for all streams

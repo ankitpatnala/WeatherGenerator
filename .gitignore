@@ -202,6 +202,7 @@ bar
 test.py
 cutout.png
 *.out
+*.png
 
 _build/
 ?
@@ -228,3 +229,4 @@ output
 models
 results
 reports
+bias_maps_sample_parallel
