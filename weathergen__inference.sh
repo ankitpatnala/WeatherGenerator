@@ -12,8 +12,4 @@
 
 source .venv/bin/activate
 
-<<<<<<< HEAD
-srun  uv --offline run inference --from-run-id $1 --samples 1 --start-date 202301010000 --end-date 202312310000 --options training_config.forecast.num_steps=1440 model_path="/e/scratch/weatherai/shared_work/models" training_config.forecast.forecast_chunk_size=100 zarr_store=zip streams_directory="./config/streams/era5_1deg_forecasting/"
-=======
-srun  uv --offline run inference --from-run-id lef4pxir --samples 1 --start-date 202204010000 --end-date 202312010000 --options training_config.forecast.num_steps=1000 model_path="/e/scratch/weatherai/shared_work/models" training_config.forecast.forecast_chunk_size=100 zarr_store=zarr streams_directory="./config/streams/era5_1deg_forecasting/"
->>>>>>> 26b9dc2d (added scripts)
+srun  uv --offline run inference --from-run-id $1 --samples 1 --start-date 202210010000 --end-date 202312310000 --options training_config.forecast.num_steps=1440 model_path="/e/scratch/weatherai/shared_work/models" training_config.forecast.forecast_chunk_size=100 zarr_store=zip streams_directory="./config/streams/era5_1deg_forecasting/"
