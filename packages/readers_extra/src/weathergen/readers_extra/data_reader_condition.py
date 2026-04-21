@@ -67,19 +67,21 @@ class DataReaderCondition(DataReaderTimestep):
         self.source_idx = []
 
         self.filetype = stream_info.get("filetype", None)
-        self.per_cell_order = self.get_healpix_cell_indices(
-            self.ds["latitude"].values,
-            self.ds["longitude"].values,
-            self.healpix_order,
-        ) if self.filetype is not None
-
+        
         self.ds = None
-
+        print(f"Initializing condition data reader with filetype {self.filetype!r}")
         match self.filetype:
             case "anemoi":
                 from anemoi import datasets as datasets
-                filepath = filename
-                self.ds = datasets.open_dataset(filepath)
+                print(f"Opening dataset from {filename}")
+                self.ds = datasets.open_dataset(filename)
+                print(f"Dataset opened with variables: {self.ds.variables}")
+                self.per_cell_order = self.get_healpix_cell_indices(
+                                    self.ds.latitudes.values,
+                                    self.ds.longitudes.values,
+                                    self.healpix_order,
+                                    nest=True
+                                )
         
         super().__init__(
             tw_handler,
@@ -98,36 +100,39 @@ class DataReaderCondition(DataReaderTimestep):
                 self.source_idx.append(source_idx)
                 self.source_channels.append(variables.index(source))
             
-    
+    def obtain_time_indices(self, dtr) -> np.ndarray:
+        dates = self.ds.dates.astype("datetime64[s]")
+        return np.where((dates >= dtr.start) & (dates <= dtr.end))[0]
+
     def get_healpix_cell_indices(
     latitudes: np.ndarray,
     longitudes: np.ndarray,
     healpix_order: int,
     nest: bool = True,
 ) -> np.ndarray:
-    """
-    Map lat/lon coordinates to HEALPix cell indices.
+        """
+        Map lat/lon coordinates to HEALPix cell indices.
 
-    Parameters
-    ----------
-    latitudes  : (S,) geographic latitude  in degrees, range [-90, 90]
-    longitudes : (S,) geographic longitude in degrees, range [0, 360]
-    healpix_order : HEALPix order k, where nside = 2^k
-    nest       : True = NESTED scheme (default), False = RING
+        Parameters
+        ----------
+        latitudes  : (S,) geographic latitude  in degrees, range [-90, 90]
+        longitudes : (S,) geographic longitude in degrees, range [0, 360]
+        healpix_order : HEALPix order k, where nside = 2^k
+        nest       : True = NESTED scheme (default), False = RING
 
-    Returns
-    -------
-    pixel_indices : (S,) int array of HEALPix cell indices
-    """
-    import healpy as hp
-    import numpy as np
+        Returns
+        -------
+        pixel_indices : (S,) int array of HEALPix cell indices
+        """
+        import healpy as hp
+        import numpy as np
 
-    nside = 2 ** healpix_order
+        nside = 2 ** healpix_order
 
-    theta = np.radians(90.0 - latitudes)   # co-latitude [0, π]
-    phi   = np.radians(longitudes)          # longitude   [0, 2π]
+        theta = np.radians(90.0 - latitudes)   # co-latitude [0, π]
+        phi   = np.radians(longitudes)          # longitude   [0, 2π]
 
-    return hp.ang2pix(nside, theta, phi, nest=nest)
+        return hp.ang2pix(nside, theta, phi, nest=nest)
     
     
     def accumulate_per_cell(self) -> None:
@@ -144,7 +149,7 @@ class DataReaderCondition(DataReaderTimestep):
         boundaries = np.searchsorted(sorted_cells, np.arange(npix))      # (npix,)
         boundaries_end = np.searchsorted(sorted_cells, np.arange(npix), side='right')  # (npix,)
 
-    return [order[boundaries[c]:boundaries_end[c]] for c in range(npix)]
+        return [order[boundaries[c]:boundaries_end[c]] for c in range(npix)]
         
 
     def _compute_num_channels(self, stream_info: dict) -> int:
@@ -168,7 +173,12 @@ class DataReaderCondition(DataReaderTimestep):
         return self.len
 
     @override
-    def _get(self, idx: TIndex, channels_idx: list[int]) -> ReaderData:
+    def _get(self, idx: TIndex) -> ReaderData:
+        scalar_data = self._get_scalar(idx, self.target_channels)
+        source_data = self._get_source(idx)
+        return scalar_data, source_data
+
+    def _get_scalar(self, idx: TIndex, channels_idx: list[int]) -> ReaderData:
         """
         Compute condition variables for a given time window.
 
@@ -187,7 +197,7 @@ class DataReaderCondition(DataReaderTimestep):
         dtr = self.time_window_handler.window(idx)
         encoded_conditions = self._encode(dtr, self.variables)
         return encoded_conditions
-
+    
     def _get_source(self, idx: TIndex) -> np.ndarray:
         """
         Get source data for a given time window.
@@ -201,9 +211,13 @@ class DataReaderCondition(DataReaderTimestep):
         -------
         np.ndarray of shape (num_source_channels, num_cells)
         """
+        if self.ds is None:
+            return np.empty((0, len(self.per_cell_order)), dtype=np.float32)
+        dtr = self.time_window_handler.window(idx)
+        time_indices = self.obtain_time_indices(dtr)
         souce_per_cell_values = np.empty((len(self.source_idx), len(self.per_cell_order)), dtype=np.float32)
         for _, order in enumerate(self.per_cell_order):
-            souce_per_cell_values[:, order] = np.mean(self.ds.data[idx, self.source_channels, :, order], axis=-1)
+            souce_per_cell_values[:, order] = np.mean(self.ds.data[time_indices, self.source_channels, :, order], axis=-1)
         return souce_per_cell_values 
 
     def _encode(self, dtr: DTRange, variables: list[str]) -> np.ndarray:

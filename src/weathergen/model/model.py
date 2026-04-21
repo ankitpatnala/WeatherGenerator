@@ -313,7 +313,6 @@ class Model(torch.nn.Module):
         self.sources_size = sources_size
         self.targets_num_channels = targets_num_channels
         self.targets_coords_size = targets_coords_size
-        self.aux_info = condition_num_channels
         self.embed_target_coords = None
         self.encoder: EncoderModule | None = None
         self.forecast_engine: ForecastingEngine | None = None
@@ -321,7 +320,7 @@ class Model(torch.nn.Module):
         self.q_cells: torch.Tensor | None = None
         self.stream_names: list[str] = None
         self.target_token_engines = None
-        self.forecast_aux_infos = condition_num_channels
+        self.forecast_scalar_infos, self.spatial_scalar_infos = condition_num_channels
 
         assert cf.get("forecast", {}).get("att_dense_rate", 1.0) == 1.0, (
             "Local attention not adapted for register tokens"
@@ -374,7 +373,7 @@ class Model(torch.nn.Module):
         self.forecast_engine = None
         if cf.fe_num_blocks > 0:
             self.forecast_engine = ForecastingEngine(
-                cf, mode_cfg, self.num_healpix_cells, self.forecast_aux_infos if self.forecast_aux_infos > 0 else None
+                cf, mode_cfg, self.num_healpix_cells, self.forecast_scalar_infos if self.forecast_scalar_infos > 0 else None
             )
 
         # embed coordinates yielding one query token for each target token
@@ -705,7 +704,8 @@ class Model(torch.nn.Module):
         for step in batch.get_output_idxs():
             # apply forecasting engine (if present)
             if self.forecast_engine:
-                tokens = self.forecast_engine(tokens, batch.conditions[step], coords=model_params.rope_coords)
+                tokens = self.forecast_engine(tokens, batch.scalar_conditions[step], coords=model_params.rope_coords)
+                tokens = tokens + batch.spatial_conditions[step] if len(batch.spatial_conditions) > 0 else tokens
 
             # decoder predictions
             output = self.predict_decoders(model_params, step, tokens, batch, output)
