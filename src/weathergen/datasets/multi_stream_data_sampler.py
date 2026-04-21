@@ -339,7 +339,10 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             + self.tokenizer.get_size_time_embedding()
             for _, ds in self.streams_datasets.items()
         ]
+<<<<<<< HEAD
     
+=======
+>>>>>>> 69314d89 (added changes to incorporate data condition streams)
     def get_condition_num_channels(self):
         return sum([ds[0].num_channels for _, ds in self.condition_datasets.items()])
 
@@ -533,6 +536,39 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
         return stream_data
 
+<<<<<<< HEAD
+=======
+    def _build_condition_data(
+        self,
+        batch: ModelBatch,
+        condition_ds: AnyDataReader,
+        base_idx: TIndex,
+        num_output_steps: int,
+    ) -> np.ndarray:
+        """
+        Collect encoded condition values for every forecast step.
+
+        Parameters
+        ----------
+        condition_ds :
+            The condition reader (DataReaderCondition instance).
+        base_idx :
+            Base time index for this sample.
+        num_output_steps :
+            Total number of output/forecast steps.
+
+        Returns
+        -------
+        np.ndarray of shape (num_output_steps - output_offset, num_channels)
+        """
+
+
+        for i in range(num_output_steps):    
+            batch.conditions[i] += self.get_condition(
+                condition_ds, base_idx + (self.time_step * i) // self.step_timedelta)
+    
+
+>>>>>>> 69314d89 (added changes to incorporate data condition streams)
     def _get_data_windows(self, base_idx, num_forecast_steps, num_steps_input_max, stream_ds):
         """
         Collect all data needed for current stream to potentially amortize costs by
