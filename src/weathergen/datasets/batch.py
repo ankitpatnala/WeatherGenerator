@@ -152,7 +152,8 @@ class BatchSamples:
         self.output_steps = output_steps
         self.output_idxs = output_idxs
         self.device = None
-        self.conditions = [[] for i in range(output_steps)]
+        self.scalar_conditions = [[] for i in range(output_steps)]
+        self.spatial_conditions = [[] for i in range(output_steps)]
 
     def __len__(self) -> int:
         return len(self.samples)

@@ -57,6 +57,7 @@ class DataReaderCondition(DataReaderTimestep):
         self.geoinfo_idx = []
         self.target_channel_weights = []
         self.condition_idx = []
+        self.healpix_order = stream_info.get("healpix_order", None) 
 
         self.transform: str = stream_info.get("transform", "absolute")
         self.variables: list[str] = list(
@@ -65,6 +66,21 @@ class DataReaderCondition(DataReaderTimestep):
         self.num_channels: int = self._compute_num_channels(stream_info)
         self.source_idx = []
 
+        self.filetype = stream_info.get("filetype", None)
+        self.per_cell_order = self.get_healpix_cell_indices(
+            self.ds["latitude"].values,
+            self.ds["longitude"].values,
+            self.healpix_order,
+        ) if self.filetype is not None
+
+        self.ds = None
+
+        match self.filetype:
+            case "anemoi":
+                from anemoi import datasets as datasets
+                filepath = filename
+                self.ds = datasets.open_dataset(filepath)
+        
         super().__init__(
             tw_handler,
             stream_info,
@@ -74,6 +90,62 @@ class DataReaderCondition(DataReaderTimestep):
         )
 
         self.len = int((tw_handler.t_end - tw_handler.t_start) // tw_handler.t_window_step)
+
+    def _select_channels(self, stream_info: dict) -> list[int]:
+        variables = self.ds.variables
+        for source_idx, source in enumerate(stream_info.get("source", [])):
+            if source in variables:
+                self.source_idx.append(source_idx)
+                self.source_channels.append(variables.index(source))
+            
+    
+    def get_healpix_cell_indices(
+    latitudes: np.ndarray,
+    longitudes: np.ndarray,
+    healpix_order: int,
+    nest: bool = True,
+) -> np.ndarray:
+    """
+    Map lat/lon coordinates to HEALPix cell indices.
+
+    Parameters
+    ----------
+    latitudes  : (S,) geographic latitude  in degrees, range [-90, 90]
+    longitudes : (S,) geographic longitude in degrees, range [0, 360]
+    healpix_order : HEALPix order k, where nside = 2^k
+    nest       : True = NESTED scheme (default), False = RING
+
+    Returns
+    -------
+    pixel_indices : (S,) int array of HEALPix cell indices
+    """
+    import healpy as hp
+    import numpy as np
+
+    nside = 2 ** healpix_order
+
+    theta = np.radians(90.0 - latitudes)   # co-latitude [0, π]
+    phi   = np.radians(longitudes)          # longitude   [0, 2π]
+
+    return hp.ang2pix(nside, theta, phi, nest=nest)
+    
+    
+    def accumulate_per_cell(self) -> None:
+        import healpy as hp
+
+        latitudes = self.ds["latitude"].values
+        longitudes = self.ds["longitude"].values
+
+        pixel_indices = self.get_healpix_cell_indices(latitudes, longitudes, self.healpix_order)
+        order = np.argsort(pixel_indices, stable=True)          # (S,) sorted by cell
+        sorted_cells = pixel_indices[order]                      # (S,)
+
+        # Find where each new cell starts in the sorted array
+        boundaries = np.searchsorted(sorted_cells, np.arange(npix))      # (npix,)
+        boundaries_end = np.searchsorted(sorted_cells, np.arange(npix), side='right')  # (npix,)
+
+    return [order[boundaries[c]:boundaries_end[c]] for c in range(npix)]
+        
 
     def _compute_num_channels(self, stream_info: dict) -> int:
         if self.transform == "absolute":
@@ -113,8 +185,26 @@ class DataReaderCondition(DataReaderTimestep):
         """
 
         dtr = self.time_window_handler.window(idx)
-        encoded_condtions = self._encode(dtr, self.variables)
-        return encoded_condtions 
+        encoded_conditions = self._encode(dtr, self.variables)
+        return encoded_conditions
+
+    def _get_source(self, idx: TIndex) -> np.ndarray:
+        """
+        Get source data for a given time window.
+
+        Parameters
+        ----------
+        idx : TIndex
+            Index of temporal window
+
+        Returns
+        -------
+        np.ndarray of shape (num_source_channels, num_cells)
+        """
+        souce_per_cell_values = np.empty((len(self.source_idx), len(self.per_cell_order)), dtype=np.float32)
+        for _, order in enumerate(self.per_cell_order):
+            souce_per_cell_values[:, order] = np.mean(self.ds.data[idx, self.source_channels, :, order], axis=-1)
+        return souce_per_cell_values 
 
     def _encode(self, dtr: DTRange, variables: list[str]) -> np.ndarray:
         """
