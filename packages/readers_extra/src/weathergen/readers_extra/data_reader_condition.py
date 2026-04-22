@@ -8,6 +8,7 @@
 # nor does it submit to any jurisdiction.
 
 import logging
+import warnings
 from pathlib import Path
 from typing import override
 
@@ -58,12 +59,13 @@ class DataReaderCondition(DataReaderTimestep):
         self.geoinfo_idx = []
         self.target_channel_weights = []
         self.condition_idx = []
-        healpix_order = stream_info.get("healpix_order", 5) 
-        self.num_healpix_cells = npix = hp.nside_to_npix(hp.level_to_nside(healpix_order))
+        self.healpix_order = stream_info.get("healpix_order", 5) 
+        self.num_healpix_cells = hp.nside_to_npix(hp.level_to_nside(self.healpix_order))
         self.transform: str = stream_info.get("transform", "absolute")
         self.variables: list[str] = list(
             stream_info.get("variables", ["start_day", "start_time", "end_day", "end_time"])
         )
+        self.normalize = stream_info.get("normalize", False)
         self.num_channels: int = self._compute_num_channels(stream_info)
         self.source_idx = []
 
@@ -78,12 +80,7 @@ class DataReaderCondition(DataReaderTimestep):
                 self.ds = datasets.open_dataset(filename)
                 self._select_channels(stream_info)
                 print(f"Dataset opened with variables: {self.ds.variables}")
-                self.per_cell_order = self.get_healpix_cell_indices(
-                                    self.ds.latitudes,
-                                    self.ds.longitudes,
-                                    healpix_order,
-                                    True
-                                )
+                self.per_cell_order = self.accumulate_per_cell()
         
         super().__init__(
             tw_handler,
@@ -139,20 +136,23 @@ class DataReaderCondition(DataReaderTimestep):
     
     
     def accumulate_per_cell(self) -> None:
-
-
-        latitudes = self.ds["latitude"].values
-        longitudes = self.ds["longitude"].values
+        latitudes = self.ds.latitudes
+        longitudes = self.ds.longitudes
 
         pixel_indices = self.get_healpix_cell_indices(latitudes, longitudes, self.healpix_order)
-        order = np.argsort(pixel_indices, stable=True)          # (S,) sorted by cell
-        sorted_cells = pixel_indices[order]                      # (S,)
+        order = np.argsort(pixel_indices, stable=True)
+        sorted_cells = pixel_indices[order]
 
-        # Find where each new cell starts in the sorted array
-        boundaries = np.searchsorted(sorted_cells, np.arange(npix))      # (npix,)
-        boundaries_end = np.searchsorted(sorted_cells, np.arange(npix), side='right')  # (npix,)
+        boundaries = np.searchsorted(sorted_cells, np.arange(self.num_healpix_cells))
+        boundaries_end = np.searchsorted(sorted_cells, np.arange(self.num_healpix_cells), side='right')
 
-        return [order[boundaries[c]:boundaries_end[c]] for c in range(npix)]
+        # precomputed for vectorized _get_source: one read of all stations then bincount
+        self.sorted_order = order
+        self.cell_labels = np.repeat(
+            np.arange(self.num_healpix_cells), boundaries_end - boundaries
+        )
+
+        return [order[boundaries[c]:boundaries_end[c]].tolist() for c in range(self.num_healpix_cells)]
         
 
     def _compute_num_channels(self, stream_info: dict) -> int:
@@ -212,20 +212,45 @@ class DataReaderCondition(DataReaderTimestep):
 
         Returns
         -------
-        np.ndarray of shape (num_source_channels, num_cells)
+        np.ndarray of shape (num_cells, num_source_channels)
         """
         if self.ds is None:
-            return np.empty((0, self.num_healpix_cells), dtype=np.float32)
+            return np.empty((self.num_healpix_cells, 0), dtype=np.float32)
+
         dtr = self.time_window_handler.window(idx)
         time_indices = self.obtain_time_indices(dtr)
-        souce_per_cell_values = np.empty((len(self.source_idx), self.num_healpix_cells), dtype=np.float32)
-        for _, order in enumerate(self.per_cell_order):
-            _logger.info(f" time indices are {time_indices}")
-            _logger.info(f" source channels are {self.source_channels}")
-            _logger.info(f" order is {order}")
-            _logger.info(f" per_cell_order is {self.per_cell_order}")
-            souce_per_cell_values[:, order] = np.mean(self.ds.data[time_indices, self.source_channels, :, order], axis=-1)
-        return souce_per_cell_values 
+
+        # single read for all stations pre-sorted by healpix cell (vs one oindex per cell)
+        all_data = self.ds.data.oindex[time_indices, self.source_channels, :, self.sorted_order]
+
+        if self.normalize:
+            mean = self.ds.statistics['mean'][self.source_channels]
+            stdev = self.ds.statistics['stdev'][self.source_channels]
+            all_data = (all_data - mean) / stdev
+
+        # collapse to (num_channels, num_stations) — average over time/ensemble dims if present
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            while all_data.ndim > 2:
+                all_data = np.nanmean(all_data, axis=0)
+
+        # vectorized per-cell nanmean via bincount — one pass per channel (C is small)
+        num_channels = all_data.shape[0]
+        result = np.empty((self.num_healpix_cells, num_channels), dtype=np.float32)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            for c in range(num_channels):
+                ch = all_data[c]
+                nan_mask = np.isnan(ch)
+                cell_sums = np.bincount(
+                    self.cell_labels, weights=np.where(nan_mask, 0.0, ch), minlength=self.num_healpix_cells
+                )
+                cell_counts = np.bincount(
+                    self.cell_labels, weights=(~nan_mask).astype(np.float32), minlength=self.num_healpix_cells
+                )
+                result[:, c] = np.where(cell_counts > 0, cell_sums / cell_counts, 0.0)
+
+        return result
 
     def _encode(self, dtr: DTRange, variables: list[str]) -> np.ndarray:
         """

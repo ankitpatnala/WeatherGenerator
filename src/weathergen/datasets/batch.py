@@ -153,7 +153,7 @@ class BatchSamples:
         self.output_idxs = output_idxs
         self.device = None
         self.scalar_conditions = [[] for i in range(output_steps)]
-        self.spatial_conditions = [np.empty((0, 12288)) for i in range(output_steps)]
+        self.spatial_conditions = [np.empty((12288,0)) for i in range(output_steps)]
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -165,6 +165,21 @@ class BatchSamples:
         self.tokens_lens = (
             self.tokens_lens.to(device, non_blocking=True) if self.tokens_lens is not None else None
         )
+
+        self.spatial_conditions = [
+            torch.as_tensor(sc).to(device, non_blocking=True)
+            if (sc.size > 0 if isinstance(sc, np.ndarray) else sc.numel() > 0)
+            else sc
+            for sc in self.spatial_conditions
+        ]
+
+        self.scalar_conditions = [
+            (sc.to(device, non_blocking=True) if isinstance(sc, torch.Tensor)
+             else torch.as_tensor(sc).to(device, non_blocking=True))
+            if len(sc) > 0
+            else sc
+            for sc in self.scalar_conditions
+        ]
 
         self.device = device
 

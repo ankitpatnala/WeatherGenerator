@@ -581,7 +581,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             batch.get_source_samples().scalar_conditions[i] += scalar_condition
             batch.get_source_samples().spatial_conditions[i] = np.concatenate(
                                     [batch.get_source_samples().spatial_conditions[i], spatial_condition],
-                                    axis=0
+                                    axis=-1
                                     )
     
 
@@ -650,6 +650,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                 stream_info,
             )
             # identical for all streams
+            num_target_samples = len(masks[stream_info["name"]][0])
             num_target_samples = len(masks[stream_info["name"]][0])
             num_source_samples = len(masks[stream_info["name"]][1])
 
@@ -822,7 +823,6 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
 
                 batch = self._get_batch(idx, num_forecast_steps)
 
-                # ensure the batch is valid, i.e. not completely empty and no NaN values
                 # student teacher has no classical targets
                 mode = self.mode_cfg.get("training_mode")
                 not_valid = batch.sources_empty() or batch.is_nan()

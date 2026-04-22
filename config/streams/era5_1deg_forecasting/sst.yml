@@ -15,6 +15,7 @@ SST_conditions :
   source : ['sea_surface_temperature']
   transform : "absolute"  # absolute, cos_sin, fourier
   entry_point : "forecast_engine"
+  normalize : True
   healpix_order:  5
   forcing: True  
   diagnostic: True

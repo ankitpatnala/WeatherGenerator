@@ -119,7 +119,7 @@ general:
 
 # logging frequency in the training loop (in number of batches)
 train_logging:
-  terminal: 10
+  terminal: 1
   metrics: 20
   checkpoint: 250
 

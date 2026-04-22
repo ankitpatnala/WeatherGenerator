@@ -700,12 +700,14 @@ class Model(torch.nn.Module):
         # collapse along input step dimension
         tokens = tokens.reshape(shape).sum(axis=1)
 
+        spatial_conditon_num = batch.spatial_conditions[0].shape[-1] 
         # roll-out in latent space, iterate and generate output over requested output steps
         for step in batch.get_output_idxs():
             # apply forecasting engine (if present)
             if self.forecast_engine:
                 tokens = self.forecast_engine(tokens, batch.scalar_conditions[step], coords=model_params.rope_coords)
-                tokens = tokens + batch.spatial_conditions[step] if len(batch.spatial_conditions) > 0 else tokens
+
+                tokens[:,:,-spatial_conditon_num:] += batch.spatial_conditions[step].to(dtype=tokens.dtype)
 
             # decoder predictions
             output = self.predict_decoders(model_params, step, tokens, batch, output)
