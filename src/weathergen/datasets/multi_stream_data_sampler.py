@@ -579,7 +579,10 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             scalar_condition, spatial_condition = condition_ds.get_condition(
                     base_idx + (self.time_step * i) // self.step_timedelta)
             batch.get_source_samples().scalar_conditions[i] += scalar_condition
-            batch.get_source_samples().spatial_conditions[i] += spatial_condition
+            batch.get_source_samples().spatial_conditions[i] = np.concatenate(
+                                    [batch.get_source_samples().spatial_conditions[i], spatial_condition],
+                                    axis=0
+                                    )
     
 
     def _get_data_windows(self, base_idx, num_forecast_steps, num_steps_input_max, stream_ds):

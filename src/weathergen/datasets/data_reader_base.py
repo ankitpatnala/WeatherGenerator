@@ -386,7 +386,7 @@ class DataReaderBase(metaclass=ABCMeta):
         condition data (data for aux info )
         """
 
-        rdata = self._get(idx, self.condition_idx)
+        rdata = self._get(idx)
 
         return rdata
     

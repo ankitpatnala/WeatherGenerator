@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import override
 
 import numpy as np
+import astropy_healpix as hp
 
 from weathergen.datasets.data_reader_base import (
     DataReaderTimestep,
@@ -57,8 +58,8 @@ class DataReaderCondition(DataReaderTimestep):
         self.geoinfo_idx = []
         self.target_channel_weights = []
         self.condition_idx = []
-        self.healpix_order = stream_info.get("healpix_order", None) 
-
+        healpix_order = stream_info.get("healpix_order", 5) 
+        self.num_healpix_cells = npix = hp.nside_to_npix(hp.level_to_nside(healpix_order))
         self.transform: str = stream_info.get("transform", "absolute")
         self.variables: list[str] = list(
             stream_info.get("variables", ["start_day", "start_time", "end_day", "end_time"])
@@ -75,12 +76,13 @@ class DataReaderCondition(DataReaderTimestep):
                 from anemoi import datasets as datasets
                 print(f"Opening dataset from {filename}")
                 self.ds = datasets.open_dataset(filename)
+                self._select_channels(stream_info)
                 print(f"Dataset opened with variables: {self.ds.variables}")
                 self.per_cell_order = self.get_healpix_cell_indices(
-                                    self.ds.latitudes.values,
-                                    self.ds.longitudes.values,
-                                    self.healpix_order,
-                                    nest=True
+                                    self.ds.latitudes,
+                                    self.ds.longitudes,
+                                    healpix_order,
+                                    True
                                 )
         
         super().__init__(
@@ -102,9 +104,10 @@ class DataReaderCondition(DataReaderTimestep):
             
     def obtain_time_indices(self, dtr) -> np.ndarray:
         dates = self.ds.dates.astype("datetime64[s]")
-        return np.where((dates >= dtr.start) & (dates <= dtr.end))[0]
+        return np.where((dates >= dtr.start) & (dates < dtr.end))[0]
 
     def get_healpix_cell_indices(
+    self,
     latitudes: np.ndarray,
     longitudes: np.ndarray,
     healpix_order: int,
@@ -124,7 +127,7 @@ class DataReaderCondition(DataReaderTimestep):
         -------
         pixel_indices : (S,) int array of HEALPix cell indices
         """
-        import healpy as hp
+        import astropy_healpix as hp
         import numpy as np
 
         nside = 2 ** healpix_order
@@ -132,11 +135,11 @@ class DataReaderCondition(DataReaderTimestep):
         theta = np.radians(90.0 - latitudes)   # co-latitude [0, π]
         phi   = np.radians(longitudes)          # longitude   [0, 2π]
 
-        return hp.ang2pix(nside, theta, phi, nest=nest)
+        return hp.healpy.ang2pix(nside, theta, phi, nest=nest)
     
     
     def accumulate_per_cell(self) -> None:
-        import healpy as hp
+
 
         latitudes = self.ds["latitude"].values
         longitudes = self.ds["longitude"].values
@@ -212,11 +215,15 @@ class DataReaderCondition(DataReaderTimestep):
         np.ndarray of shape (num_source_channels, num_cells)
         """
         if self.ds is None:
-            return np.empty((0, len(self.per_cell_order)), dtype=np.float32)
+            return np.empty((0, self.num_healpix_cells), dtype=np.float32)
         dtr = self.time_window_handler.window(idx)
         time_indices = self.obtain_time_indices(dtr)
-        souce_per_cell_values = np.empty((len(self.source_idx), len(self.per_cell_order)), dtype=np.float32)
+        souce_per_cell_values = np.empty((len(self.source_idx), self.num_healpix_cells), dtype=np.float32)
         for _, order in enumerate(self.per_cell_order):
+            _logger.info(f" time indices are {time_indices}")
+            _logger.info(f" source channels are {self.source_channels}")
+            _logger.info(f" order is {order}")
+            _logger.info(f" per_cell_order is {self.per_cell_order}")
             souce_per_cell_values[:, order] = np.mean(self.ds.data[time_indices, self.source_channels, :, order], axis=-1)
         return souce_per_cell_values 
 
