@@ -465,6 +465,63 @@ class GlobalAssimilationEngine(torch.nn.Module):
         return tokens
 
 
+class LatentGate(torch.nn.Module):
+    """xLSTM-style exponential gating for autoregressive latent updates.
+
+    Treats the ForecastingEngine output as a candidate cell update and
+    controls how much of the previous state vs. the candidate survives,
+    preventing explosion (via log-sum-exp stabilizer) and collapse (via
+    normalizer that keeps the cell magnitude bounded below by 1).
+
+    When track_normalizer=True the normalizer state n_t is accumulated across
+    autoregressive steps: n_t = max(f_t * n_{t-1} + i_t, 1). This gives hard
+    bounds even for infinite rollouts. When False a per-step clamp is used
+    instead (cheaper but no infinite-step guarantee).
+    """
+
+    def __init__(self, dim: int, track_normalizer: bool = True) -> None:
+        super().__init__()
+        self.forget_proj = nn.Linear(dim, dim)
+        self.input_proj = nn.Linear(dim, dim)
+        self.output_proj = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
+        self.track_normalizer = track_normalizer
+
+    def forward(
+        self,
+        c_prev: torch.Tensor,
+        candidate: torch.Tensor,
+        n_prev: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # log-space gates (xLSTM style)
+        log_f = torch.nn.functional.logsigmoid(self.forget_proj(c_prev))  # forget: bounded ≤ 0
+        log_i = self.input_proj(c_prev)                                    # input: unbounded (exp gate)
+
+        # stabilizer: subtract max so neither gate overflows
+        m = torch.max(log_f, log_i)
+        f = torch.exp(log_f - m)
+        i = torch.exp(log_i - m)
+
+        # cell update
+        c = f * c_prev + i * candidate
+
+        if self.track_normalizer:
+            # running normalizer: n_t = max(f_t * n_{t-1} + i_t, 1)
+            # bounds c across infinite steps relative to accumulated history
+            if n_prev is None:
+                n_prev = torch.ones_like(f)
+            n = torch.clamp(f * n_prev + i, min=1.0)
+            n_next: torch.Tensor | None = n
+        else:
+            # per-step clamp: cheaper but no infinite-step guarantee
+            n = torch.clamp(f + i, min=1.0)
+            n_next = None
+
+        # output gate
+        o = torch.sigmoid(self.output_proj(c))
+        return o * self.norm(c / n), n_next
+
+
 class ForecastingEngine(torch.nn.Module):
     name: "ForecastingEngine"
 
@@ -552,7 +609,12 @@ class ForecastingEngine(torch.nn.Module):
             if noise_std > 0.0:
                 tokens = tokens + torch.randn_like(tokens) * torch.norm(tokens) * noise_std
 
-        aux_info = None if len(fstep) == 0 else torch.tensor(fstep, dtype=tokens.dtype, device=tokens.device)
+        if len(fstep) == 0:
+            aux_info = None
+        elif isinstance(fstep, torch.Tensor):
+            aux_info = fstep.to(dtype=tokens.dtype, non_blocking=True)
+        else:
+            aux_info = torch.tensor(fstep, dtype=tokens.dtype, device=tokens.device)
         for _b_idx, block in enumerate(self.fe_blocks):
             if isinstance(block, torch.nn.modules.normalization.LayerNorm):
                 tokens = checkpoint(block, tokens, use_reentrant=False)

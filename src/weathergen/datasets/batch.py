@@ -165,6 +165,11 @@ class BatchSamples:
             self.tokens_lens.to(device, non_blocking=True) if self.tokens_lens is not None else None
         )
 
+        self.conditions = [
+            torch.as_tensor(c).to(device, non_blocking=True) if len(c) > 0 else c
+            for c in self.conditions
+        ]
+
         self.device = device
 
         return self

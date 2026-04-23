@@ -28,6 +28,7 @@ from weathergen.model.engines import (
     BilinearDecoder,
     EnsPredictionHead,
     ForecastingEngine,
+    LatentGate,
     LatentPredictionHeadIdentity,
     LatentPredictionHeadMLP,
     LatentPredictionHeadTransformer,
@@ -317,6 +318,7 @@ class Model(torch.nn.Module):
         self.embed_target_coords = None
         self.encoder: EncoderModule | None = None
         self.forecast_engine: ForecastingEngine | None = None
+        self.latent_gate: LatentGate | None = None
         self.pred_heads = None
         self.q_cells: torch.Tensor | None = None
         self.stream_names: list[str] = None
@@ -372,9 +374,14 @@ class Model(torch.nn.Module):
 
         mode_cfg = cf.training_config
         self.forecast_engine = None
+        self.latent_gate = None
         if cf.fe_num_blocks > 0:
             self.forecast_engine = ForecastingEngine(
                 cf, mode_cfg, self.num_healpix_cells, self.forecast_aux_infos if self.forecast_aux_infos > 0 else None
+            )
+            self.latent_gate = LatentGate(
+                cf.ae_global_dim_embed,
+                track_normalizer=cf.get("latent_gate_track_normalizer", True),
             )
 
         # embed coordinates yielding one query token for each target token
@@ -702,10 +709,12 @@ class Model(torch.nn.Module):
         tokens = tokens.reshape(shape).sum(axis=1)
 
         # roll-out in latent space, iterate and generate output over requested output steps
+        n_state: torch.Tensor | None = None  # running normalizer state for LatentGate
         for step in batch.get_output_idxs():
             # apply forecasting engine (if present)
             if self.forecast_engine:
-                tokens = self.forecast_engine(tokens, batch.conditions[step], coords=model_params.rope_coords)
+                candidate = self.forecast_engine(tokens, batch.conditions[step], coords=model_params.rope_coords)
+                tokens, n_state = self.latent_gate(tokens, candidate, n_state)
 
             # decoder predictions
             output = self.predict_decoders(model_params, step, tokens, batch, output)

@@ -62,6 +62,9 @@ fe_dropout_rate: 0.1
 fe_with_qk_lnorm: True
 fe_layer_norm_after_blocks: [7]  # Index starts at 0. Thus, [3] adds a LayerNorm after the fourth layer
 fe_impute_latent_noise_std: 1e-4
+# xLSTM-style latent gate: track running normalizer across autoregressive steps
+# (true = infinite-step collapse guarantee; false = cheaper per-step clamp)
+latent_gate_track_normalizer: true
 # currently fixed to 1.0 (due to limitations with flex_attention and triton)
 forecast_att_dense_rate: 1.0
 
