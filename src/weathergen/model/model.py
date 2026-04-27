@@ -28,6 +28,7 @@ from weathergen.model.engines import (
     BilinearDecoder,
     EnsPredictionHead,
     ForecastingEngine,
+    HamiltonianForecastingEngine,
     LatentGate,
     LatentPredictionHeadIdentity,
     LatentPredictionHeadMLP,
@@ -318,6 +319,7 @@ class Model(torch.nn.Module):
         self.embed_target_coords = None
         self.encoder: EncoderModule | None = None
         self.forecast_engine: ForecastingEngine | None = None
+        self.hamiltonian_fe: HamiltonianForecastingEngine | None = None
         self.latent_gate: LatentGate | None = None
         self.pred_heads = None
         self.q_cells: torch.Tensor | None = None
@@ -374,15 +376,21 @@ class Model(torch.nn.Module):
 
         mode_cfg = cf.training_config
         self.forecast_engine = None
+        self.hamiltonian_fe = None
         self.latent_gate = None
         if cf.fe_num_blocks > 0:
-            self.forecast_engine = ForecastingEngine(
-                cf, mode_cfg, self.num_healpix_cells, self.forecast_aux_infos if self.forecast_aux_infos > 0 else None
-            )
-            self.latent_gate = LatentGate(
-                cf.ae_global_dim_embed,
-                track_normalizer=cf.get("latent_gate_track_normalizer", True),
-            )
+            if cf.get("use_hamiltonian_fe", False):
+                self.hamiltonian_fe = HamiltonianForecastingEngine(
+                    cf, mode_cfg, self.num_healpix_cells, self.forecast_aux_infos if self.forecast_aux_infos > 0 else None
+                )
+            else:
+                self.forecast_engine = ForecastingEngine(
+                    cf, mode_cfg, self.num_healpix_cells, self.forecast_aux_infos if self.forecast_aux_infos > 0 else None
+                )
+                self.latent_gate = LatentGate(
+                    cf.ae_global_dim_embed,
+                    track_normalizer=cf.get("latent_gate_track_normalizer", True),
+                )
 
         # embed coordinates yielding one query token for each target token
         dropout_rate = cf.embed_dropout_rate
@@ -627,7 +635,9 @@ class Model(torch.nn.Module):
         num_params_latent_heads += get_num_parameters(self.latent_pre_norm)
 
         num_params_fe = (
-            get_num_parameters(self.forecast_engine.fe_blocks) if self.forecast_engine else 0
+            get_num_parameters(self.forecast_engine.fe_blocks) if self.forecast_engine
+            else get_num_parameters(self.hamiltonian_fe.fe_blocks) if self.hamiltonian_fe
+            else 0
         )
 
         mdict = self.embed_target_coords
@@ -709,10 +719,16 @@ class Model(torch.nn.Module):
         tokens = tokens.reshape(shape).sum(axis=1)
 
         # roll-out in latent space, iterate and generate output over requested output steps
-        n_state: torch.Tensor | None = None  # running normalizer state for LatentGate
+        n_state: torch.Tensor | None = None   # LatentGate running normalizer
+        p_state: torch.Tensor | None = None   # HamiltonianFE momentum
+        f_state: torch.Tensor | None = None   # HamiltonianFE cached force (Velocity Verlet)
         for step in batch.get_output_idxs():
             # apply forecasting engine (if present)
-            if self.forecast_engine:
+            if self.hamiltonian_fe is not None:
+                tokens, p_state, f_state = self.hamiltonian_fe(
+                    tokens, p_state, f_state, batch.conditions[step], coords=model_params.rope_coords
+                )
+            elif self.forecast_engine:
                 candidate = self.forecast_engine(tokens, batch.conditions[step], coords=model_params.rope_coords)
                 tokens, n_state = self.latent_gate(tokens, candidate, n_state)
 

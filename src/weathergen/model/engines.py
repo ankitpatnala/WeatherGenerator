@@ -623,6 +623,169 @@ class ForecastingEngine(torch.nn.Module):
         return tokens
 
 
+class HamiltonianForecastingEngine(torch.nn.Module):
+    """
+    Symplectic (Hamiltonian) ForecastingEngine.
+
+    The transformer blocks compute F(q, t) — a time-conditioned force field
+    acting on an auxiliary momentum p.  One Velocity-Verlet step per rollout
+    step keeps the (q, p) map exactly volume-preserving (det J = 1) regardless
+    of whether F is a true gradient:
+
+        Velocity Verlet:
+            p_{1/2}  =  p  +  (ε/2) · F(q,  t)     # half-kick (reuses cached f)
+            q_new    =  q  +   ε    · p_{1/2}        # drift
+            f_new    =  F(q_new, t)                   # force at new position
+            p_new    =  p_{1/2}  +  (ε/2) · f_new   # half-kick
+
+    The force f_new is cached and passed back as f_prev at the next rollout
+    step, so only ONE transformer forward pass is needed per step.
+
+    Time conditioning enters through AdaLN inside the attention/MLP blocks
+    (same dim_aux mechanism as ForecastingEngine), so the force F(q, t) is
+    naturally time-varying without a separate pathway.
+    """
+
+    name: str = "HamiltonianForecastingEngine"
+
+    def __init__(self, cf: Config, mode_cfg, num_healpix_cells: int, dim_aux: int = None) -> None:
+        super().__init__()
+        self.cf = cf
+        self.num_healpix_cells = num_healpix_cells
+        self.fe_blocks = torch.nn.ModuleList()
+
+        global_rate = int(1 / self.cf.forecast_att_dense_rate)
+        if mode_cfg.get("forecast", {}).get("policy") is not None:
+            for i in range(self.cf.fe_num_blocks):
+                if (i % global_rate == 0) or i + 1 == self.cf.fe_num_blocks:
+                    self.fe_blocks.append(
+                        MultiSelfAttentionHead(
+                            self.cf.ae_global_dim_embed,
+                            num_heads=self.cf.fe_num_heads,
+                            dropout_rate=self.cf.fe_dropout_rate,
+                            with_qk_lnorm=self.cf.fe_with_qk_lnorm,
+                            with_flash=self.cf.with_flash_attention,
+                            norm_type=self.cf.norm_type,
+                            qk_norm_type=self.cf.qk_norm_type,
+                            dim_aux=dim_aux,
+                            norm_eps=self.cf.norm_eps,
+                            attention_dtype=get_dtype(self.cf.attention_dtype),
+                            with_2d_rope=self.cf.get("rope_2D", False),
+                        )
+                    )
+                else:
+                    self.fe_blocks.append(
+                        MultiSelfAttentionHeadLocal(
+                            self.cf.ae_global_dim_embed,
+                            num_heads=self.cf.fe_num_heads,
+                            qkv_len=self.num_healpix_cells * self.cf.ae_local_num_queries,
+                            block_factor=self.cf.ae_global_block_factor,
+                            dropout_rate=self.cf.fe_dropout_rate,
+                            with_qk_lnorm=self.cf.fe_with_qk_lnorm,
+                            with_flash=self.cf.with_flash_attention,
+                            norm_type=self.cf.norm_type,
+                            qk_norm_type=self.cf.qk_norm_type,
+                            dim_aux=dim_aux,
+                            norm_eps=self.cf.norm_eps,
+                            attention_dtype=get_dtype(self.cf.attention_dtype),
+                            with_2d_rope=self.cf.get("rope_2D", False),
+                        )
+                    )
+                self.fe_blocks.append(
+                    MLP(
+                        self.cf.ae_global_dim_embed,
+                        self.cf.ae_global_dim_embed,
+                        with_residual=True,
+                        dropout_rate=self.cf.fe_dropout_rate,
+                        norm_type=self.cf.norm_type,
+                        dim_aux=dim_aux,
+                        norm_eps=self.cf.mlp_norm_eps,
+                    )
+                )
+
+        # log step-size; clamped to (0, 1] at runtime to stay stable
+        # exp(-2) ≈ 0.135 — small enough that initial dynamics are gentle
+        self.log_eps = nn.Parameter(torch.tensor(-2.0))
+
+        def _init_small(m):
+            if isinstance(m, torch.nn.Linear):
+                torch.nn.init.normal_(m.weight, mean=0, std=0.001)
+                if m.bias is not None:
+                    torch.nn.init.normal_(m.bias, mean=0, std=0.001)
+
+        for block in self.fe_blocks:
+            block.apply(_init_small)
+
+    @property
+    def step_size(self) -> torch.Tensor:
+        return torch.exp(self.log_eps).clamp(max=1.0)
+
+    def _resolve_aux(self, fstep, dtype, device) -> torch.Tensor | None:
+        if isinstance(fstep, torch.Tensor) and fstep.numel() > 0:
+            return fstep.to(dtype=dtype, non_blocking=True)
+        if hasattr(fstep, "__len__") and len(fstep) > 0:
+            return torch.tensor(fstep, dtype=dtype, device=device)
+        return None
+
+    def _force(self, q: torch.Tensor, aux_info, coords) -> torch.Tensor:
+        """Run transformer blocks to compute F(q, t)."""
+        x = q
+        for block in self.fe_blocks:
+            if isinstance(block, torch.nn.modules.normalization.LayerNorm):
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = checkpoint(block, x, coords, aux_info, use_reentrant=False)
+        return x
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        p: torch.Tensor | None,
+        f_prev: torch.Tensor | None,
+        fstep,
+        coords=None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        One Velocity-Verlet step.
+
+        Parameters
+        ----------
+        q      : (tokens, d) — current latent (position)
+        p      : (tokens, d) | None — momentum; zeros on first call
+        f_prev : (tokens, d) | None — cached force from previous step; recomputed if None
+        fstep  : time-condition tensor or list (passed to blocks as aux_info)
+        coords : optional RoPE coordinates
+
+        Returns
+        -------
+        q_new, p_new, f_new
+            f_new should be passed back as f_prev at the next rollout step.
+        """
+        if p is None:
+            p = torch.zeros_like(q)
+
+        if self.training:
+            noise_std = self.cf.get("fe_impute_latent_noise_std", 0.0)
+            if noise_std > 0.0:
+                q = q + torch.randn_like(q) * torch.norm(q) * noise_std
+
+        aux_info = self._resolve_aux(fstep, q.dtype, q.device)
+        eps = self.step_size
+
+        # Reuse cached force from previous step (Velocity Verlet efficiency)
+        if f_prev is None:
+            f_prev = self._force(q, aux_info, coords)
+
+        # ── Störmer-Verlet ─────────────────────────────────────────────────
+        p_half = p + (eps / 2) * f_prev          # half-kick with old force
+        q_new = q + eps * p_half                  # drift  (∇_p K = p)
+        f_new = self._force(q_new, aux_info, coords)  # force at new position
+        p_new = p_half + (eps / 2) * f_new        # half-kick with new force
+        # ───────────────────────────────────────────────────────────────────
+
+        return q_new, p_new, f_new
+
+
 class EnsPredictionHead(torch.nn.Module):
     def __init__(
         self,
