@@ -786,6 +786,192 @@ class HamiltonianForecastingEngine(torch.nn.Module):
         return q_new, p_new, f_new
 
 
+class CayleyForecastingEngine(torch.nn.Module):
+    """
+    Volume-preserving ForecastingEngine via composed rank-2 Cayley maps.
+
+    Transformer blocks (same structure as ForecastingEngine) compute a
+    time-conditioned latent direction z.  K low-rank projections extract
+    (u_k, v_k) ∈ R^d pairs from z, and for each k a rank-2 Cayley rotation
+    is applied in-place to the token embeddings:
+
+        W_k  = u_k v_k^T − v_k u_k^T    (rank-2, d×d, skew-symmetric)
+        Q_k  = (I − W_k)(I + W_k)^{−1}  (orthogonal, det = 1)
+        q    ← Q_k @ q
+
+    The (I + W_k)^{−1} solve reduces to a 2×2 Woodbury system solved
+    analytically — no linalg.solve call needed.  Cost per composition:
+    O(rank × d × tokens) for the projection + O(d × tokens) for the rotation.
+
+    Projections are rank-factored:  z → alpha (d→rank), then alpha × basis
+    (rank→d), keeping parameter count and FLOPs proportional to rank, not d².
+    """
+
+    name: str = "CayleyForecastingEngine"
+
+    def __init__(
+        self,
+        cf: Config,
+        mode_cfg,
+        num_healpix_cells: int,
+        dim_aux: int = None,
+    ) -> None:
+        super().__init__()
+        self.cf = cf
+        self.num_healpix_cells = num_healpix_cells
+        d = cf.ae_global_dim_embed
+        rank = cf.get("cayley_rank", 32)
+        K = cf.get("cayley_num_compositions", 4)
+
+        # ── Transformer blocks (identical to ForecastingEngine) ──────────────
+        self.fe_blocks = torch.nn.ModuleList()
+        global_rate = int(1 / self.cf.forecast_att_dense_rate)
+        if mode_cfg.get("forecast", {}).get("policy") is not None:
+            for i in range(self.cf.fe_num_blocks):
+                if (i % global_rate == 0) or i + 1 == self.cf.fe_num_blocks:
+                    self.fe_blocks.append(
+                        MultiSelfAttentionHead(
+                            d,
+                            num_heads=self.cf.fe_num_heads,
+                            dropout_rate=self.cf.fe_dropout_rate,
+                            with_qk_lnorm=self.cf.fe_with_qk_lnorm,
+                            with_flash=self.cf.with_flash_attention,
+                            norm_type=self.cf.norm_type,
+                            qk_norm_type=self.cf.qk_norm_type,
+                            dim_aux=dim_aux,
+                            norm_eps=self.cf.norm_eps,
+                            attention_dtype=get_dtype(self.cf.attention_dtype),
+                            with_2d_rope=self.cf.get("rope_2D", False),
+                        )
+                    )
+                else:
+                    self.fe_blocks.append(
+                        MultiSelfAttentionHeadLocal(
+                            d,
+                            num_heads=self.cf.fe_num_heads,
+                            qkv_len=self.num_healpix_cells * self.cf.ae_local_num_queries,
+                            block_factor=self.cf.ae_global_block_factor,
+                            dropout_rate=self.cf.fe_dropout_rate,
+                            with_qk_lnorm=self.cf.fe_with_qk_lnorm,
+                            with_flash=self.cf.with_flash_attention,
+                            norm_type=self.cf.norm_type,
+                            qk_norm_type=self.cf.qk_norm_type,
+                            dim_aux=dim_aux,
+                            norm_eps=self.cf.norm_eps,
+                            attention_dtype=get_dtype(self.cf.attention_dtype),
+                            with_2d_rope=self.cf.get("rope_2D", False),
+                        )
+                    )
+                self.fe_blocks.append(
+                    MLP(
+                        d, d,
+                        with_residual=True,
+                        dropout_rate=self.cf.fe_dropout_rate,
+                        norm_type=self.cf.norm_type,
+                        dim_aux=dim_aux,
+                        norm_eps=self.cf.mlp_norm_eps,
+                    )
+                )
+
+        # ── Low-rank Cayley projection heads ─────────────────────────────────
+        # K pairs (u_k, v_k): each factored as z --(d→rank)--> alpha --(rank→d)--> uv
+        # Cost: O(rank·d·tokens) instead of O(d²·tokens) for full Linear(d,d).
+        self.alpha_heads = nn.ModuleList([nn.Linear(d, 2 * rank, bias=False) for _ in range(K)])
+        # Shared d×rank bases for u and v (separate sets)
+        self.U_basis = nn.Parameter(torch.randn(rank, d) * 0.01)  # (rank, d)
+        self.V_basis = nn.Parameter(torch.randn(rank, d) * 0.01)  # (rank, d)
+
+        def _init_small(m):
+            if isinstance(m, torch.nn.Linear):
+                torch.nn.init.normal_(m.weight, mean=0, std=0.001)
+                if m.bias is not None:
+                    torch.nn.init.normal_(m.bias, mean=0, std=0.001)
+
+        for block in self.fe_blocks:
+            block.apply(_init_small)
+        for head in self.alpha_heads:
+            nn.init.normal_(head.weight, std=0.001)
+
+    def _resolve_aux(self, fstep, dtype, device) -> torch.Tensor | None:
+        if isinstance(fstep, torch.Tensor) and fstep.numel() > 0:
+            return fstep.to(dtype=dtype, non_blocking=True)
+        if hasattr(fstep, "__len__") and len(fstep) > 0:
+            return torch.tensor(fstep, dtype=dtype, device=device)
+        return None
+
+    @staticmethod
+    def _cayley_rank2(q: torch.Tensor, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """
+        Apply Q = (I − W)(I + W)^{−1} where W = uv^T − vu^T (rank-2) to q.
+
+        Uses the analytic 2×2 Woodbury formula — no linalg.solve needed.
+
+        q, u, v : (tokens, d)
+        Returns  : (tokens, d)
+        """
+        uv = (u * v).sum(-1, keepdim=True)   # (tokens, 1)  u·v per token
+        uu = (u * u).sum(-1, keepdim=True)   # ||u||²
+        vv = (v * v).sum(-1, keepdim=True)   # ||v||²
+        # det(I_2 + Q^T P) = 1 + ||u||²||v||² − (u·v)²  ≥ 1 by Cauchy-Schwarz
+        det_M = 1.0 + uu * vv - uv * uv      # (tokens, 1), always ≥ 1
+
+        # ── Step 1: y = (I + W)^{-1} q via 2×2 Woodbury ─────────────────────
+        q_u = (q * u).sum(-1, keepdim=True)  # q·u
+        q_v = (q * v).sum(-1, keepdim=True)  # q·v
+        # M^{-1} @ [q_v, q_u]^T  (analytic 2×2 inverse)
+        m1 = ((1.0 - uv) * q_v + vv * q_u) / det_M   # (tokens, 1)
+        m2 = (-uu * q_v + (1.0 + uv) * q_u) / det_M  # (tokens, 1)
+        y = q - u * m1 + v * m2                        # (tokens, d)
+
+        # ── Step 2: q_new = (I − W) y = y − W y ─────────────────────────────
+        # Wy = u(v·y) − v(u·y)  →  row-convention: y − (y·v)u + (y·u)v
+        y_u = (y * u).sum(-1, keepdim=True)
+        y_v = (y * v).sum(-1, keepdim=True)
+        return y - u * y_v + v * y_u
+
+    def forward(self, q: torch.Tensor, fstep, coords=None) -> torch.Tensor:
+        """
+        One Cayley step: q → Q_K ∘ … ∘ Q_1 (q).
+
+        Parameters
+        ----------
+        q      : (tokens, d) — current latent
+        fstep  : time-condition tensor or list
+        coords : optional RoPE coordinates
+
+        Returns
+        -------
+        q_new : (tokens, d) — volume-preserving update
+        """
+        if self.training:
+            noise_std = self.cf.get("fe_impute_latent_noise_std", 0.0)
+            if noise_std > 0.0:
+                q = q + torch.randn_like(q) * torch.norm(q) * noise_std
+
+        aux_info = self._resolve_aux(fstep, q.dtype, q.device)
+
+        # ── Transformer blocks → latent direction z ──────────────────────────
+        z = q
+        for block in self.fe_blocks:
+            if isinstance(block, torch.nn.modules.normalization.LayerNorm):
+                z = checkpoint(block, z, use_reentrant=False)
+            else:
+                z = checkpoint(block, z, coords, aux_info, use_reentrant=False)
+
+        # ── K rank-2 Cayley compositions ─────────────────────────────────────
+        for alpha_head in self.alpha_heads:
+            alpha = alpha_head(z)                        # (tokens, 2·rank)
+            rank = self.U_basis.shape[0]
+            alpha_u = alpha[:, :rank]                    # (tokens, rank)
+            alpha_v = alpha[:, rank:]                    # (tokens, rank)
+            # Low-rank expansion: (tokens,rank) × (rank,d) → (tokens,d)
+            u = alpha_u @ self.U_basis                   # (tokens, d)
+            v = alpha_v @ self.V_basis                   # (tokens, d)
+            q = self._cayley_rank2(q, u, v)
+
+        return q
+
+
 class EnsPredictionHead(torch.nn.Module):
     def __init__(
         self,

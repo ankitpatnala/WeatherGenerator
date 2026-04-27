@@ -26,6 +26,7 @@ from weathergen.datasets.utils import healpix_verts_rots, r3tos2
 from weathergen.model.encoder import EncoderModule
 from weathergen.model.engines import (
     BilinearDecoder,
+    CayleyForecastingEngine,
     EnsPredictionHead,
     ForecastingEngine,
     HamiltonianForecastingEngine,
@@ -320,6 +321,7 @@ class Model(torch.nn.Module):
         self.encoder: EncoderModule | None = None
         self.forecast_engine: ForecastingEngine | None = None
         self.hamiltonian_fe: HamiltonianForecastingEngine | None = None
+        self.cayley_fe: CayleyForecastingEngine | None = None
         self.latent_gate: LatentGate | None = None
         self.pred_heads = None
         self.q_cells: torch.Tensor | None = None
@@ -377,15 +379,22 @@ class Model(torch.nn.Module):
         mode_cfg = cf.training_config
         self.forecast_engine = None
         self.hamiltonian_fe = None
+        self.cayley_fe = None
         self.latent_gate = None
+        _fe_mode = cf.get("fe_mode", "latent_gate")  # "latent_gate" | "hamiltonian" | "cayley"
         if cf.fe_num_blocks > 0:
-            if cf.get("use_hamiltonian_fe", False):
+            dim_aux = self.forecast_aux_infos if self.forecast_aux_infos > 0 else None
+            if _fe_mode == "hamiltonian":
                 self.hamiltonian_fe = HamiltonianForecastingEngine(
-                    cf, mode_cfg, self.num_healpix_cells, self.forecast_aux_infos if self.forecast_aux_infos > 0 else None
+                    cf, mode_cfg, self.num_healpix_cells, dim_aux
+                )
+            elif _fe_mode == "cayley":
+                self.cayley_fe = CayleyForecastingEngine(
+                    cf, mode_cfg, self.num_healpix_cells, dim_aux
                 )
             else:
                 self.forecast_engine = ForecastingEngine(
-                    cf, mode_cfg, self.num_healpix_cells, self.forecast_aux_infos if self.forecast_aux_infos > 0 else None
+                    cf, mode_cfg, self.num_healpix_cells, dim_aux
                 )
                 self.latent_gate = LatentGate(
                     cf.ae_global_dim_embed,
@@ -637,6 +646,7 @@ class Model(torch.nn.Module):
         num_params_fe = (
             get_num_parameters(self.forecast_engine.fe_blocks) if self.forecast_engine
             else get_num_parameters(self.hamiltonian_fe.fe_blocks) if self.hamiltonian_fe
+            else get_num_parameters(self.cayley_fe.fe_blocks) if self.cayley_fe
             else 0
         )
 
@@ -727,6 +737,10 @@ class Model(torch.nn.Module):
             if self.hamiltonian_fe is not None:
                 tokens, p_state, f_state = self.hamiltonian_fe(
                     tokens, p_state, f_state, batch.conditions[step], coords=model_params.rope_coords
+                )
+            elif self.cayley_fe is not None:
+                tokens = self.cayley_fe(
+                    tokens, batch.conditions[step], coords=model_params.rope_coords
                 )
             elif self.forecast_engine:
                 candidate = self.forecast_engine(tokens, batch.conditions[step], coords=model_params.rope_coords)
