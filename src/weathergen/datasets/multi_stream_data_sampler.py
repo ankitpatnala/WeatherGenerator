@@ -18,6 +18,7 @@ from weathergen.common.config import Config
 from weathergen.common.io import IOReaderData
 from weathergen.datasets.batch import ModelBatch
 from weathergen.datasets.data_reader_anemoi import DataReaderAnemoi
+from weathergen.readers_extra.data_reader_condition import DataReaderCondition
 from weathergen.datasets.data_reader_base import (
     DataReaderBase,
     TimeWindowHandler,
@@ -32,7 +33,7 @@ from weathergen.datasets.utils import (
     get_tokens_lens,
 )
 from weathergen.readers_extra.registry import get_extra_reader
-from weathergen.train.utils import TRAIN, Stage, get_batch_size_from_config
+from weathergen.train.utils import Stage, get_batch_size_from_config
 from weathergen.utils.distributed import is_root
 
 type AnyDataReader = DataReaderBase | DataReaderAnemoi | DataReaderObs
@@ -89,7 +90,10 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.mask_value = 0.0
         self._stage = stage
 
-        self.streams = cf.streams
+        self.streams, self.condition_streams = (
+            [s for s in cf.streams if s.get("type") != "condition"], 
+            [s for s in cf.streams if s.get("type") == "condition"]
+        )
         self.rank = cf.rank
         self.world_size = cf.world_size
 
@@ -140,66 +144,12 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.repeat_data = cf.data_loading.get("repeat_data_in_mini_epoch", False)
 
         self.streams_datasets: dict[StreamName, list[AnyDataReader]] = {}
+        self.condition_datasets: dict[StreamName, list[AnyDataReader]] = {}
         for _, stream_info in enumerate(cf.streams):
-            # list of sources for current stream
-            self.streams_datasets[stream_info["name"]] = []
-
-            for fname in stream_info["filenames"]:
-                kwargs = {
-                    "tw_handler": self.time_window_handler,
-                    "stream_info": stream_info,
-                }
-                dataset: type[AnyDataReader] | None = None
-                match stream_info["type"]:
-                    case "obs":
-                        dataset = DataReaderObs
-                    case "anemoi":
-                        dataset = DataReaderAnemoi
-                    case "fesom":
-                        dataset = DataReaderFesom
-                    case type_name:
-                        dataset = get_extra_reader(type_name)
-                        if dataset is None:
-                            msg = f"Unsupported stream type {stream_info['type']}"
-                            f"for stream name '{stream_info['name']}'."
-                            raise ValueError(msg)
-
-                fname = pathlib.Path(fname)
-                # dont check if file exists since zarr stores might be directories
-                if fname.exists():
-                    # check if fname is a valid path to allow for simple overwriting
-                    filename = fname
-                else:
-                    filenames = [pathlib.Path(path) / fname for path in cf.data_paths]
-
-                    if not any(filename.exists() for filename in filenames):  # see above
-                        msg = (
-                            f"Did not find input data for {stream_info['type']} "
-                            f"stream '{stream_info['name']}': {filenames}."
-                        )
-                        raise FileNotFoundError(msg)
-
-                    # The same dataset can exist on different locations in the filesystem,
-                    # so we need to choose here.
-                    filename = filenames[0]
-
-                ds_type = stream_info["type"]
-                if is_root():
-                    logger.info(
-                        f"Opening dataset with type: {ds_type}"
-                        + f" from stream config {stream_info['name']}.",
-                    )
-                ds = dataset(filename=filename, **kwargs)
-
-                stream_info[str(self._stage) + "_source_channels"] = ds.source_channels
-                stream_info[str(self._stage) + "_target_channels"] = ds.target_channels
-                stream_info["target_channel_weights"] = (
-                    ds.target_channel_weights
-                    if ds.target_channel_weights is not None
-                    else [1.0 for _ in ds.target_channels]
-                )
-
-                self.streams_datasets[stream_info["name"]] += [ds]
+            if stream_info["type"] == "condition":
+                self._init_condition_stream(stream_info)
+            else:
+                self._init_regular_stream(stream_info, cf.data_paths)
 
         # length of dataset; check the repeat data flag and adjust len accordingly
         self.len = int(index_range.end - index_range.start)
@@ -244,13 +194,79 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             else cf.data_loading.rng_seed * 97
         )
 
-        self.tokenizer = TokenizerMasking(cf.healpix_level, Masker(cf.healpix_level, stage))
+        self.masker = Masker(cf.healpix_level, stage, self.streams, self.mode_cfg)
+        self.tokenizer = TokenizerMasking(cf.healpix_level, self.masker)
 
         self.mini_epoch = 0
 
         self.rng = None
         self.perms = None
         self.perms_num_forecast_steps = None
+
+    def _get_dataset_class(self, stream_info: dict) -> type[AnyDataReader]:
+        """Resolve the reader class for a non-condition stream type."""
+        match stream_info["type"]:
+            case "obs":
+                return DataReaderObs
+            case "anemoi":
+                return DataReaderAnemoi
+            case "fesom":
+                return DataReaderFesom
+            case type_name:
+                dataset = get_extra_reader(type_name)
+                if dataset is None:
+                    raise ValueError(
+                        f"Unsupported stream type {stream_info['type']}"
+                        f" for stream name '{stream_info['name']}'."
+                    )
+                return dataset
+
+    def _register_stream_channels(self, stream_info: dict, ds: AnyDataReader) -> None:
+        """Write source/target channel metadata from an instantiated reader into stream_info."""
+        stream_info[str(self._stage) + "_source_channels"] = ds.source_channels
+        stream_info[str(self._stage) + "_target_channels"] = ds.target_channels
+        stream_info["target_channel_weights"] = (
+            ds.target_channel_weights
+            if ds.target_channel_weights is not None
+            else [1.0 for _ in ds.target_channels]
+        )
+
+    def _init_condition_stream(self, stream_info: dict) -> None:
+        """Instantiate and register a condition stream (no backing files required)."""
+        self.condition_datasets[stream_info["name"]] = []
+        if is_root():
+            logger.info(f"Opening condition dataset from stream config {stream_info['name']}.")
+        ds = DataReaderCondition(
+            tw_handler=self.time_window_handler, stream_info=stream_info, filename=None
+        )
+        self.condition_datasets[stream_info["name"]] += [ds]
+
+    def _init_regular_stream(self, stream_info: dict, data_paths: list) -> None:
+        """Instantiate and register a file-backed stream for each filename in config."""
+        dataset = self._get_dataset_class(stream_info)
+        self.streams_datasets[stream_info["name"]] = []
+        for fname in stream_info["filenames"]:
+            fname = pathlib.Path(fname)
+            if fname.exists():
+                filename = fname
+            else:
+                filenames = [pathlib.Path(path) / fname for path in data_paths]
+                if not any(f.exists() for f in filenames):
+                    raise FileNotFoundError(
+                        f"Did not find input data for {stream_info['type']} "
+                        f"stream '{stream_info['name']}': {filenames}."
+                    )
+                # The same dataset can exist on different locations in the filesystem,
+                # so we need to choose here.
+                filename = filenames[0]
+            if is_root():
+                logger.info(
+                    f"Opening dataset with type: {stream_info['type']}"
+                    + f" from stream config {stream_info['name']}.",
+                )
+            ds = dataset(filename=filename, tw_handler=self.time_window_handler, stream_info=stream_info)
+            self._register_stream_channels(stream_info, ds)
+            self.streams_datasets[stream_info["name"]] += [ds]
 
     def advance(self):
         """
@@ -268,6 +284,8 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             + self.tokenizer.get_size_time_embedding()
             for _, ds in self.streams_datasets.items()
         ]
+    def get_condition_num_channels(self):
+        return sum([ds[0].num_channels for _, ds in self.condition_datasets.items()])
 
     def get_sources_num_channels(self):
         return [ds[0].get_source_num_channels() for _, ds in self.streams_datasets.items()]
@@ -390,8 +408,6 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                 rdata = input_data[-(step + 1)]
                 token_data = input_tokens[-(step + 1)]
 
-                stream_data.source_is_spoof = rdata.is_spoof
-
                 # preprocess data for model input
                 (source_cells, source_cells_lens) = self.tokenizer.get_source(
                     stream_info,
@@ -432,8 +448,6 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             rdata = output_data[step]
             token_data = output_tokens[step]
 
-            stream_data.target_is_spoof = rdata.is_spoof
-
             if "target_coords" in mode:
                 (tc, tc_l) = self.tokenizer.get_target_coords(
                     stream_info,
@@ -442,7 +456,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                     (time_win_target.start, time_win_target.end),
                     target_mask,
                 )
-                stream_data.add_target_coords(timestep_idx, tc, tc_l)
+                stream_data.add_target_coords(timestep_idx, tc, tc_l, rdata.is_spoof)
 
             if "target_values" in mode:
                 (tt_cells, tt_t, tt_c, idxs_inv) = self.tokenizer.get_target_values(
@@ -452,7 +466,9 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                     (time_win_target.start, time_win_target.end),
                     target_mask,
                 )
-                stream_data.add_target_values(timestep_idx, tt_cells, tt_c, tt_t, idxs_inv)
+                stream_data.add_target_values(
+                    timestep_idx, tt_cells, tt_c, tt_t, idxs_inv, rdata.is_spoof
+                )
 
         return stream_data
 
@@ -522,6 +538,39 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
 
         return stream_data
 
+    def _build_condition_data(
+        self,
+        batch: ModelBatch,
+        condition_ds: AnyDataReader,
+        base_idx: TIndex,
+        num_output_steps: int,
+    ) -> np.ndarray:
+        """
+        Collect encoded condition values for every forecast step.
+
+        Parameters
+        ----------
+        condition_ds :
+            The condition reader (DataReaderCondition instance).
+        base_idx :
+            Base time index for this sample.
+        num_output_steps :
+            Total number of output/forecast steps.
+
+        Returns
+        -------
+        np.ndarray of shape (num_output_steps - output_offset, num_channels)
+        """
+
+
+        for i in range(num_output_steps):    
+            
+            condition_data = condition_ds.get_condition(
+                    base_idx + (self.time_step * i) // self.step_timedelta)
+            batch.get_source_samples().forecast_conditions[i] += condition_ds.get_condition(
+                 base_idx + (self.time_step * i) // self.step_timedelta)
+    
+
     def _get_data_windows(self, base_idx, num_forecast_steps, num_steps_input_max, stream_ds):
         """
         Collect all data needed for current stream to potentially amortize costs by
@@ -536,7 +585,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
 
             rdata = collect_datasources(stream_ds, idx, "source", self.rng)
 
-            if rdata.is_empty() and self._stage == TRAIN:
+            if rdata.is_empty():
                 # work around for https://github.com/pytorch/pytorch/issues/158719
                 # create non-empty mean data instead of empty tensor
                 time_win = self.time_window_handler.window(idx)
@@ -544,7 +593,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                     self.healpix_level,
                     time_win.start,
                     stream_ds[0].get_geoinfo_size(),
-                    stream_ds[0].mean[stream_ds[0].source_idx],
+                    len(stream_ds[0].mean[stream_ds[0].source_idx]),
                 )
                 rdata.is_spoof = True
 
@@ -558,15 +607,15 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
 
             rdata = collect_datasources(stream_ds, step_forecast_dt, "target", self.rng)
 
-            if rdata.is_empty() and self._stage == TRAIN:
+            if rdata.is_empty():
                 # work around for https://github.com/pytorch/pytorch/issues/158719
                 # create non-empty mean data instead of empty tensor
-                time_win = self.time_window_handler.window(timestep_idx)
+                time_win = self.time_window_handler.window(step_forecast_dt)
                 rdata = spoof(
                     self.healpix_level,
                     time_win.start,
                     stream_ds[0].get_geoinfo_size(),
-                    stream_ds[0].mean[stream_ds[0].source_idx],
+                    len(stream_ds[0].mean[stream_ds[0].target_idx]),
                 )
                 rdata.is_spoof = True
 
@@ -576,16 +625,14 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
 
     def _get_source_target_masks(self, training_mode):
         """
-        Generate source and target masks for all streams
+        Generate source and target masks for all streams.
         """
-
         masks = {}
         for stream_info in self.streams:
             # Build source and target sample masks
             masks[stream_info["name"]] = self.tokenizer.build_samples_for_stream(
                 training_mode,
                 self.num_healpix_cells,
-                self.mode_cfg,
                 stream_info,
             )
             # identical for all streams
@@ -664,7 +711,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             forecast_conditions = [start_hour, start_day, end_hour, end_day]
             batch.get_source_samples().forecast_conditions[timestep_idx] += forecast_conditions
 
-        # for all streams
+        # --- regular (file-backed) streams ---
         for stream_info, (stream_name, stream_ds) in zip(
             self.streams, self.streams_datasets.items(), strict=True
         ):
@@ -694,7 +741,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                 tidx = source_to_target[sidx].item()
                 sdata = self._build_stream_data(
                     source_select,
-                    tidx,
+                    idx,
                     num_forecast_steps,
                     stream_info,
                     source_masks.metadata[sidx].params.get("num_steps_input", 1),
@@ -714,7 +761,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                 # the inputs. Hence the target mask is also the source mask here.
                 sdata = self._build_stream_data(
                     target_select,
-                    tidx,
+                    idx,
                     num_forecast_steps,
                     stream_info,
                     target_masks.metadata[tidx].params.get("num_steps_input", 1),
@@ -733,6 +780,14 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                     s_idx for s_idx, tid in enumerate(source_to_target) if tid == tidx
                 ]
                 batch.add_target_stream(tidx, student_indices, stream_name, sdata, target_metadata)
+        
+        # for condition streama 
+        for stream_info, (stream_name, condition_ds) in zip(
+            self.condition_streams, self.condition_datasets.items(), strict=True
+        ):
+            self._build_condition_data(
+                batch, condition_ds[0], idx, num_output_steps
+            )
 
         source_in_steps = input_steps.max().item()
         target_in_steps = np.array([tc.get("num_steps_input", 1) for _, tc in target_cfgs.items()])
@@ -771,11 +826,17 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
 
                 batch = self._get_batch(idx, num_forecast_steps)
 
+                # ensure the batch is valid, i.e. not completely empty and no NaN values
+                # student teacher has no classical targets
+                mode = self.mode_cfg.get("training_mode")
+                not_valid = batch.sources_empty() or batch.is_nan()
+                not_valid = not_valid or (batch.targets_empty() if "masking" in mode else False)
+
                 # skip completely empty batch item or when all targets are empty -> no grad
-                if not batch.is_empty():
-                    break
-                else:
+                if not_valid:
                     logger.warning(f"Skipping empty batch with idx={idx}.")
+                else:
+                    break
 
             yield batch
 

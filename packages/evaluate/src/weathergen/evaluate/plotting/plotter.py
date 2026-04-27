@@ -3,6 +3,7 @@ import glob
 import logging
 import os
 import re
+import warnings
 from pathlib import Path
 
 import cartopy
@@ -13,15 +14,19 @@ import numpy as np
 import omegaconf as oc
 import seaborn as sns
 import xarray as xr
+from astropy_healpix import HEALPix as HEALPixGrid
+from cartopy.io import DownloadWarning
+from matplotlib.collections import LineCollection
 from matplotlib.lines import Line2D
 from PIL import Image
 from scipy.stats import wilcoxon
 
 from weathergen.common.config import _load_private_conf
-from weathergen.evaluate.plotting.plot_utils import (
-    DefaultMarkerSize,
-)
+from weathergen.evaluate.plotting.plot_utils import DefaultMarkerSize
 from weathergen.evaluate.utils.regions import RegionBoundingBox
+
+_logger = logging.getLogger(__name__)
+_logger.setLevel(logging.INFO)
 
 work_dir = Path(_load_private_conf(None)["path_shared_working_dir"]) / "assets/cartopy"
 
@@ -29,12 +34,24 @@ cartopy.config["data_dir"] = str(work_dir)
 cartopy.config["pre_existing_data_dir"] = str(work_dir)
 os.environ["CARTOPY_DATA_DIR"] = str(work_dir)
 
+# Route Cartopy DownloadWarnings through the logging system so they are visible in logs.
+logging.captureWarnings(True)
+warnings.filterwarnings("always", category=DownloadWarning)
+
+
+def _download_cartopy_off(enabled: bool) -> None:
+    """Enable/disable blocking Cartopy downloads by elevating DownloadWarning to error."""
+    if enabled:
+        warnings.filterwarnings("error", category=DownloadWarning)
+        _logger.info(
+            "Auto-downloads are blocked for cartopy; only local cartopy data will be used."
+        )
+    else:
+        warnings.filterwarnings("default", category=DownloadWarning)
+
 np.seterr(divide="ignore", invalid="ignore")
 
 logging.getLogger("matplotlib.category").setLevel(logging.ERROR)
-
-_logger = logging.getLogger(__name__)
-_logger.setLevel(logging.INFO)
 
 _logger.debug(f"Taking cartopy paths from {work_dir}")
 
@@ -72,6 +89,7 @@ class Plotter:
         self.fig_size = plotter_cfg.get("fig_size")
         self.fps = plotter_cfg.get("fps")
         self.regions = plotter_cfg.get("regions")
+        _download_cartopy_off(enabled=True)
         self.plot_subtimesteps = plotter_cfg.get(
             "plot_subtimesteps", False
         )  # True if plots are created for each valid time separately
@@ -401,10 +419,7 @@ class Plotter:
                         region,
                         tag=tag,
                         map_kwargs=dict(map_kwargs.get(var, {})) | map_kwargs_global,
-                        title=(
-                            f"{self.stream}, {var} : fstep = {self.fstep:03} "
-                            f"({format_datetime(valid_time)})"
-                        ),
+                        title=self.get_map_title(var, valid_time, da_t),
                     )
                     plot_names.append(name)
 
@@ -457,6 +472,14 @@ class Plotter:
         vmax = map_kwargs_save.pop("vmax", None)
         cmap = plt.get_cmap(map_kwargs_save.pop("colormap", "coolwarm"))
 
+        # Healpix grid configuration
+        add_healpix_grid = map_kwargs_save.pop("add_healpix_grid", False)
+        healpix_nside = map_kwargs_save.pop("healpix_nside", 4)
+        healpix_color = map_kwargs_save.pop("healpix_color", "black")
+        healpix_linewidth = map_kwargs_save.pop("healpix_linewidth", 0.2)
+        healpix_step = map_kwargs_save.pop("healpix_step", 64)
+        healpix_linestyle = map_kwargs_save.pop("healpix_linestyle", "-")
+
         if isinstance(map_kwargs_save.get("levels", False), oc.listconfig.ListConfig):
             norm = mpl.colors.BoundaryNorm(
                 map_kwargs_save.pop("levels", None), cmap.N, extend="both"
@@ -485,7 +508,10 @@ class Plotter:
             proj = ccrs.Robinson()
 
         ax = fig.add_subplot(1, 1, 1, projection=proj)
-        ax.coastlines()
+        try:
+            ax.coastlines()
+        except Exception:
+            _logger.warning("Could not add coastlines to plot; continuing without them.")
 
         assert data["lon"].shape == data["lat"].shape == data.shape, (
             f"Scatter plot:: Data shape do not match. Shapes: "
@@ -505,8 +531,17 @@ class Plotter:
             **map_kwargs_save,
         )
 
+        # Add Healpix grid (optimized with LineCollection)
+        if add_healpix_grid:
+            lc = self.healpixlines(
+                healpix_nside, healpix_color, healpix_linewidth, healpix_step, healpix_linestyle
+            )
+            ax.add_collection(lc)
+        else:
+            ax.gridlines(draw_labels=False, linestyle="--", color="black", linewidth=0.2)
+
         plt.colorbar(scatter_plt, ax=ax, orientation="horizontal", label=f"Variable: {varname}")
-        plt.title(title)
+        plt.title(title, fontsize=9.5)
         if regionname == "global":
             ax.set_global()
         else:
@@ -517,7 +552,6 @@ class Plotter:
                 data["lat"].max().item(),
             ]
             ax.set_extent(region_extent, crs=ccrs.PlateCarree())
-        ax.gridlines(draw_labels=False, linestyle="--", color="black", linewidth=1)
 
         # TODO: make this nicer
         parts = ["map", self.run_id, tag]
@@ -553,6 +587,28 @@ class Plotter:
         plt.close()
 
         return name
+
+    def healpixlines(
+        self, healpix_nside, healpix_color, healpix_linewidth, healpix_step, healpix_linestyle
+    ):
+        hp_grid = HEALPixGrid(nside=healpix_nside, order="ring")
+        lon_all, lat_all = hp_grid.boundaries_lonlat(np.arange(hp_grid.npix), step=healpix_step)
+        # Ensure closure of polygons
+        lon_closed = np.concatenate([lon_all.deg, lon_all.deg[:, 0:1]], axis=1)
+        lat_closed = np.concatenate([lat_all.deg, lat_all.deg[:, 0:1]], axis=1)
+        # Stack as (N_polys, N_points, 2)
+        segments = np.stack([lon_closed, lat_closed], axis=-1)
+        # (cartopy handles transform for LineCollection via set_transform)
+        lc = LineCollection(
+            segments,
+            colors=healpix_color,
+            linewidths=healpix_linewidth,
+            linestyles=healpix_linestyle,
+            alpha=0.5,
+            zorder=10,
+        )
+        lc.set_transform(ccrs.PlateCarree())
+        return lc
 
     def animation(self, samples, fsteps, variables, select, tag) -> list[str]:
         """
@@ -627,6 +683,22 @@ class Plotter:
 
     def get_map_output_dir(self, tag):
         return self.out_plot_basedir / self.stream / "maps" / tag
+
+    def get_map_title(self, var, valid_time, data):
+        title = f"{self.stream}, {var} : fstep = {self.fstep:03}"
+        if valid_time is not None:
+            title += f" ({format_datetime(valid_time)})"
+        elif "valid_time" in data.coords:
+            valid_time_start = data["valid_time"].values.min()
+            valid_time_end = data["valid_time"].values.max()
+            if valid_time_start != valid_time_end:
+                title += (
+                    f" ({format_datetime(valid_time_start)} - {format_datetime(valid_time_end)})"
+                )
+            else:
+                title += f" ({format_datetime(valid_time_start)})"
+
+        return title
 
 
 class LinePlots:
@@ -828,7 +900,6 @@ class LinePlots:
         x_dim: str = "lead_time",
         y_dim: str = "value",
         print_summary: bool = False,
-        plot_ensemble: str | bool = False,
     ) -> None:
         """
         Plot a line graph comparing multiple datasets.
@@ -880,7 +951,11 @@ class LinePlots:
 
         parts = ["compare", tag]
         name = "_".join(filter(None, parts))
-        self._plot_base(fig, name, x_dim, y_dim, print_summary)
+
+        # TODO: generalise this for other x_dims by instroducing a "units"
+        # entry in the function if needed
+        xunits = "hr" if x_dim == "lead_time" else None
+        self._plot_base(fig, name, x_dim, y_dim, print_summary, xunits=xunits)
 
     def _plot_base(
         self,
@@ -892,6 +967,8 @@ class LinePlots:
         line: float | None = None,
         vlines: bool = False,
         title: str | None = None,
+        xunits: str | None = None,
+        yunits: str | None = None,
     ) -> None:
         """
         Apply labels, title, legend, save and optionally print summary.
@@ -913,12 +990,22 @@ class LinePlots:
             If True, draw vertical lines to separate each group of variables.
         title:
             Title for the plot.
+        xunits:
+            Units for the x-axis.
+        yunits:
+            Units for the y-axis.
         Returns
         -------
             None
         """
-        plt.xlabel("".join(c if c.isalnum() else " " for c in x_dim))
-        plt.ylabel("".join(c if c.isalnum() else " " for c in y_dim))
+
+        plt.xlabel(
+            "".join(c if c.isalnum() else " " for c in x_dim) + (f" [{xunits}]" if xunits else "")
+        )
+        plt.ylabel(
+            "".join(c if c.isalnum() else " " for c in y_dim) + (f" [{yunits}]" if yunits else "")
+        )
+
         plt.title(title if title is not None else " ".join(c if c.isalnum() else " " for c in name))
         plt.legend(frameon=False)
 

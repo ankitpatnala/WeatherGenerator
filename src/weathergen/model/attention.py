@@ -35,10 +35,12 @@ class MultiSelfAttentionHeadVarlen(torch.nn.Module):
         with_qk_lnorm=True,
         with_flash=True,
         norm_type="LayerNorm",
+        qk_norm_type=None,
         softcap=0.0,
         dim_aux=None,
         norm_eps=1e-5,
         attention_dtype=torch.bfloat16,
+        with_2d_rope=False,
     ):
         super(MultiSelfAttentionHeadVarlen, self).__init__()
 
@@ -47,6 +49,7 @@ class MultiSelfAttentionHeadVarlen(torch.nn.Module):
         self.with_flash = with_flash
         self.softcap = softcap
         self.with_residual = with_residual
+        self.with_2d_rope = with_2d_rope
 
         assert dim_embed % num_heads == 0
         self.dim_head_proj = dim_embed // num_heads if dim_head_proj is None else dim_head_proj
@@ -68,7 +71,12 @@ class MultiSelfAttentionHeadVarlen(torch.nn.Module):
             torch.nn.Dropout(p=dropout_rate) if dropout_rate > 0.0 else torch.nn.Identity()
         )
 
-        lnorm = norm if with_qk_lnorm else torch.nn.Identity
+        qk_norm_type = qk_norm_type or norm_type
+        if qk_norm_type == "LayerNorm":
+            qk_norm = partial(torch.nn.LayerNorm, elementwise_affine=False, eps=norm_eps)
+        else:
+            qk_norm = RMSNorm
+        lnorm = qk_norm if with_qk_lnorm else torch.nn.Identity
         self.lnorm_q = lnorm(self.dim_head_proj, eps=norm_eps)
         self.lnorm_k = lnorm(self.dim_head_proj, eps=norm_eps)
 
@@ -76,7 +84,7 @@ class MultiSelfAttentionHeadVarlen(torch.nn.Module):
 
         assert with_flash, "Only flash attention supported at the moment"
 
-    def forward(self, x, x_lens, ada_ln_aux=None):
+    def forward(self, x, x_lens, ada_ln_aux=None, coords=None):
         if self.with_residual:
             x_in = x
         x = self.lnorm(x) if ada_ln_aux is None else self.lnorm(x, ada_ln_aux)
@@ -87,6 +95,11 @@ class MultiSelfAttentionHeadVarlen(torch.nn.Module):
         qs = self.lnorm_q(self.proj_heads_q(x).reshape(s)).to(self.dtype)
         ks = self.lnorm_k(self.proj_heads_k(x).reshape(s)).to(self.dtype)
         vs = self.proj_heads_v(x).reshape(s)
+
+        if self.with_2d_rope:
+            if coords is None:
+                raise ValueError("coords must be provided when with_2d_rope=True")
+            qs, ks = rotary_pos_emb_2d(qs, ks, coords, unsqueeze_dim=1)
 
         # set dropout rate according to training/eval mode as required by flash_attn
         dropout_rate = self.dropout_rate if self.training else 0.0
@@ -124,6 +137,7 @@ class MultiSelfAttentionHeadVarlenFlex(torch.nn.Module):
         with_qk_lnorm=True,
         with_flash=True,
         norm_type="LayerNorm",
+        qk_norm_type=None,
         softcap=0.0,
         norm_eps=1e-5,
         attention_dtype=torch.bfloat16,
@@ -152,7 +166,12 @@ class MultiSelfAttentionHeadVarlenFlex(torch.nn.Module):
             torch.nn.Dropout(p=dropout_rate) if dropout_rate > 0.0 else torch.nn.Identity()
         )
 
-        lnorm = norm if with_qk_lnorm else torch.nn.Identity
+        qk_norm_type = qk_norm_type or norm_type
+        if qk_norm_type == "LayerNorm":
+            qk_norm = partial(torch.nn.LayerNorm, elementwise_affine=False, eps=norm_eps)
+        else:
+            qk_norm = RMSNorm
+        lnorm = qk_norm if with_qk_lnorm else torch.nn.Identity
         self.lnorm_q = lnorm(self.dim_head_proj, eps=norm_eps)
         self.lnorm_k = lnorm(self.dim_head_proj, eps=norm_eps)
         self.dtype = attention_dtype
@@ -201,6 +220,7 @@ class MultiSelfAttentionHeadLocal(torch.nn.Module):
         with_qk_lnorm=True,
         with_flash=True,
         norm_type="LayerNorm",
+        qk_norm_type=None,
         softcap=0.0,
         dim_aux=None,
         norm_eps=1e-5,
@@ -235,7 +255,12 @@ class MultiSelfAttentionHeadLocal(torch.nn.Module):
             torch.nn.Dropout(p=dropout_rate) if dropout_rate > 0.0 else torch.nn.Identity()
         )
 
-        lnorm = norm if with_qk_lnorm else torch.nn.Identity
+        qk_norm_type = qk_norm_type or norm_type
+        if qk_norm_type == "LayerNorm":
+            qk_norm = partial(torch.nn.LayerNorm, elementwise_affine=False, eps=norm_eps)
+        else:
+            qk_norm = RMSNorm
+        lnorm = qk_norm if with_qk_lnorm else torch.nn.Identity
         self.lnorm_q = lnorm(self.dim_head_proj, eps=norm_eps)
         self.lnorm_k = lnorm(self.dim_head_proj, eps=norm_eps)
 
@@ -289,6 +314,7 @@ class MultiCrossAttentionHeadVarlen(torch.nn.Module):
         with_qk_lnorm=True,
         with_flash=True,
         norm_type="LayerNorm",
+        qk_norm_type=None,
         softcap=0.0,
         dim_aux=None,
         norm_eps=1e-5,
@@ -328,7 +354,12 @@ class MultiCrossAttentionHeadVarlen(torch.nn.Module):
             torch.nn.Dropout(p=dropout_rate) if dropout_rate > 0.0 else torch.nn.Identity()
         )
 
-        lnorm = norm if with_qk_lnorm else torch.nn.Identity
+        qk_norm_type = qk_norm_type or norm_type
+        if qk_norm_type == "LayerNorm":
+            qk_norm = partial(torch.nn.LayerNorm, elementwise_affine=False, eps=norm_eps)
+        else:
+            qk_norm = RMSNorm
+        lnorm = qk_norm if with_qk_lnorm else torch.nn.Identity
         self.lnorm_q = lnorm(self.dim_head_proj, eps=norm_eps)
         self.lnorm_k = lnorm(self.dim_head_proj, eps=norm_eps)
 
@@ -389,6 +420,7 @@ class MultiCrossAttentionHeadVarlenSlicedQ(torch.nn.Module):
         with_qk_lnorm=True,
         with_flash=True,
         norm_type="LayerNorm",
+        qk_norm_type=None,
         softcap=0.0,
         dim_aux=None,
         norm_eps=1e-5,
@@ -435,7 +467,12 @@ class MultiCrossAttentionHeadVarlenSlicedQ(torch.nn.Module):
             torch.nn.Dropout(p=dropout_rate) if dropout_rate > 0.0 else torch.nn.Identity()
         )
 
-        lnorm = norm if with_qk_lnorm else torch.nn.Identity
+        qk_norm_type = qk_norm_type or norm_type
+        if qk_norm_type == "LayerNorm":
+            qk_norm = partial(torch.nn.LayerNorm, elementwise_affine=False, eps=norm_eps)
+        else:
+            qk_norm = RMSNorm
+        lnorm = qk_norm if with_qk_lnorm else torch.nn.Identity
         self.lnorm_q = lnorm(self.dim_head_proj, eps=norm_eps)
         self.lnorm_k = lnorm(self.dim_head_proj, eps=norm_eps)
 
@@ -499,6 +536,7 @@ class MultiSelfAttentionHead(torch.nn.Module):
         with_flash=True,
         softcap=0.0,
         norm_type="LayerNorm",
+        qk_norm_type=None,
         dim_aux=None,
         norm_eps=1e-5,
         attention_dtype=torch.bfloat16,
@@ -533,7 +571,12 @@ class MultiSelfAttentionHead(torch.nn.Module):
             torch.nn.Dropout(p=dropout_rate) if dropout_rate > 0.0 else torch.nn.Identity()
         )
 
-        lnorm = norm if with_qk_lnorm else torch.nn.Identity
+        qk_norm_type = qk_norm_type or norm_type
+        if qk_norm_type == "LayerNorm":
+            qk_norm = partial(torch.nn.LayerNorm, elementwise_affine=False, eps=norm_eps)
+        else:
+            qk_norm = RMSNorm
+        lnorm = qk_norm if with_qk_lnorm else torch.nn.Identity
         self.lnorm_q = lnorm(self.dim_head_proj, eps=norm_eps)
         self.lnorm_k = lnorm(self.dim_head_proj, eps=norm_eps)
 
@@ -586,6 +629,7 @@ class MultiCrossAttentionHead(torch.nn.Module):
         with_qk_lnorm=True,
         with_flash=True,
         norm_type="LayerNorm",
+        qk_norm_type=None,
         norm_eps=1e-5,
         attention_dtype=torch.bfloat16,
     ):
@@ -619,7 +663,12 @@ class MultiCrossAttentionHead(torch.nn.Module):
             torch.nn.Dropout(p=dropout_rate) if dropout_rate > 0.0 else torch.nn.Identity()
         )
 
-        lnorm = norm if with_qk_lnorm else torch.nn.Identity
+        qk_norm_type = qk_norm_type or norm_type
+        if qk_norm_type == "LayerNorm":
+            qk_norm = partial(torch.nn.LayerNorm, elementwise_affine=False, eps=norm_eps)
+        else:
+            qk_norm = RMSNorm
+        lnorm = qk_norm if with_qk_lnorm else torch.nn.Identity
         self.lnorm_q = lnorm(self.dim_head_proj, eps=norm_eps)
         self.lnorm_k = lnorm(self.dim_head_proj, eps=norm_eps)
 

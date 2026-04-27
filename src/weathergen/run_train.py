@@ -84,16 +84,6 @@ def run_inference(args):
 
     Note: Additional configuration for inference (`test_config`) is set in the function.
     """
-    inference_overwrite = {
-        "test_config": dict(
-            shuffle=False,
-            start_date=args.start_date,
-            end_date=args.end_date,
-            samples_per_mini_epoch=args.samples,
-            output=dict(num_samples=args.samples if args.save_samples else 0),
-            streams_output=args.streams_output,
-        )
-    }
 
     cli_overwrite = config.from_cli_arglist(args.options)
     cf = config.load_merge_configs(
@@ -102,7 +92,7 @@ def run_inference(args):
         args.mini_epoch,
         args.base_config,
         *args.config,
-        inference_overwrite,
+        {},
         cli_overwrite,
     )
     cf = config.set_run_id(cf, args.run_id, args.reuse_run_id)
@@ -116,7 +106,7 @@ def run_inference(args):
 
     cf.general.run_history += [(args.from_run_id, cf.general.istep)]
 
-    trainer = Trainer(cf.train_log_freq)
+    trainer = Trainer(cf.train_logging)
     try:
         trainer.inference(cf, devices, args.from_run_id, args.mini_epoch)
     except Exception:
@@ -154,7 +144,7 @@ def run_continue(args):
     # track history of run to ensure traceability of results
     cf.general.run_history += [(args.from_run_id, cf.general.istep)]
 
-    trainer = Trainer(cf.train_log_freq)
+    trainer = Trainer(cf.train_logging)
 
     try:
         trainer.run(cf, devices, args.from_run_id, args.mini_epoch)
@@ -195,7 +185,7 @@ def run_train(args):
     if cf.with_flash_attention:
         assert cf.with_mixed_precision
 
-    trainer = Trainer(cf.train_log_freq)
+    trainer = Trainer(cf.train_logging)
 
     try:
         trainer.run(cf, devices)

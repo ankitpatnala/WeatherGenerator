@@ -8,10 +8,10 @@ def get_extra_reader(stream_type: str) -> object | None:
             from weathergen.readers_extra.data_reader_iconart import DataReaderIconArt
 
             return DataReaderIconArt
-        case "eobs":
-            from weathergen.readers_extra.data_reader_eobs import DataReaderEObs
+        case "grep":
+            from weathergen.readers_extra.data_reader_grep import DataReaderGREP
 
-            return DataReaderEObs
+            return DataReaderGREP
         case "iconesm":
             from weathergen.readers_extra.data_reader_icon_esm import DataReaderIconEsm
 
@@ -20,5 +20,23 @@ def get_extra_reader(stream_type: str) -> object | None:
             from weathergen.readers_extra.data_reader_cams import DataReaderCams
 
             return DataReaderCams
+        case "mesh":
+            from weathergen.readers_extra.data_reader_mesh import DataReaderMesh
+
+            return DataReaderMesh
+        case _:
+            return None
+
+
+def get_conditio_type(stream_type: str) -> object | None:
+    """Get a condition type by stream_type name."""
+    # Uses lazy imports to avoid circular dependencies and to not load all the readers at start.
+    # There is no sanity check on them, so they may fail at runtime during imports
+
+    match stream_type:
+        case "condtion":
+            from weathergen.readers_extra.data_reader_condtion import Condition
+
+            return Condition
         case _:
             return None

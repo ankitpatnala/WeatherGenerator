@@ -66,9 +66,9 @@ def test_train_multi_stream(setup, test_run_id):
             test_run_id,
         ]
     )
-   
+
     infer_multi_stream(test_run_id)
-    # evaluate_multi_stream_results(test_run_id)
+    evaluate_multi_stream_results(test_run_id)
     assert_metrics_file_exists(test_run_id)
     assert_stream_losses_below_threshold(test_run_id, stage="train")
     assert_stream_losses_below_threshold(test_run_id, stage="val")
@@ -81,22 +81,12 @@ def infer_multi_stream(run_id):
     main(
         [
             "inference",
-            "-start",
-            "2021-10-10",
-            "-end",
-            "2022-10-11",
-            "--samples",
-            "10",
             "--mini-epoch",
             "0",
             "--from-run-id",
             run_id,
             "--run-id",
             run_id,
-            "--streams-output",
-            "ERA5",
-            "SurfaceCombined",
-            "NPPATMS",
             "--config",
             f"{WEATHERGEN_HOME}/integration_tests/small_multi_stream.yaml",
         ]
@@ -114,7 +104,7 @@ def evaluate_multi_stream_results(run_id):
             },
             "evaluation": {
                 "regions": ["global"],
-                "metrics": ["rmse", "l1", "mse"],
+                "metrics": ["rmse", "mae"],
                 "verbose": True,
                 "summary_plots": True,
                 "summary_dir": "./plots/",
@@ -169,7 +159,7 @@ def evaluate_multi_stream_results(run_id):
 
 def load_metrics(run_id):
     """Helper function to load metrics"""
-    file_path = get_train_metrics_path(base_path=WEATHERGEN_HOME / "results", run_id=run_id)
+    file_path = get_train_metrics_path(base_path=WEATHERGEN_HOME / "results" / run_id, run_id=run_id)
     if not file_path.is_file():
         raise FileNotFoundError(f"Metrics file not found for run_id: {run_id}")
     with open(file_path) as f:
@@ -179,7 +169,7 @@ def load_metrics(run_id):
 
 def assert_metrics_file_exists(run_id):
     """Test that the metrics file exists and can be loaded."""
-    file_path = get_train_metrics_path(base_path=WEATHERGEN_HOME / "results", run_id=run_id)
+    file_path = get_train_metrics_path(base_path=WEATHERGEN_HOME / "results" / run_id, run_id=run_id)
     assert file_path.is_file(), f"Metrics file does not exist for run_id: {run_id}"
     metrics = load_metrics(run_id)
     logger.info(f"Loaded metrics for run_id: {run_id}: {metrics}")
