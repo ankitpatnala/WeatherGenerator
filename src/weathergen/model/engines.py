@@ -960,13 +960,12 @@ class CayleyForecastingEngine(torch.nn.Module):
 
         # ── K rank-2 Cayley compositions ─────────────────────────────────────
         for alpha_head in self.alpha_heads:
-            alpha = alpha_head(z)                        # (tokens, 2·rank)
-            rank = self.U_basis.shape[0]
-            alpha_u = alpha[:, :rank]                    # (tokens, rank)
-            alpha_v = alpha[:, rank:]                    # (tokens, rank)
-            # Low-rank expansion: (tokens,rank) × (rank,d) → (tokens,d)
-            u = alpha_u @ self.U_basis                   # (tokens, d)
-            v = alpha_v @ self.V_basis                   # (tokens, d)
+            alpha = alpha_head(z)                  # (tokens, 2*rank)
+            half = alpha.shape[-1] // 2            # = rank
+            alpha_u = alpha[:, :half]              # (tokens, rank)
+            alpha_v = alpha[:, half:]              # (tokens, rank)
+            u = alpha_u @ self.U_basis             # (tokens, rank) @ (rank, d) → (tokens, d)
+            v = alpha_v @ self.V_basis
             q = self._cayley_rank2(q, u, v)
 
         return q
