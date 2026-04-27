@@ -105,9 +105,17 @@ def init_model_and_shard(
             if isinstance(module, modules_to_shard):
                 fully_shard(module, **fsdp_kwargs)
 
-        for module in model.forecast_engine.fe_blocks.modules():
-            if isinstance(module, modules_to_shard):
-                fully_shard(module, **fsdp_kwargs)
+        fe_blocks = None
+        if model.forecast_engine is not None:
+            fe_blocks = model.forecast_engine.fe_blocks
+        elif model.hamiltonian_fe is not None:
+            fe_blocks = model.hamiltonian_fe.fe_blocks
+        elif model.cayley_fe is not None:
+            fe_blocks = model.cayley_fe.fe_blocks
+        if fe_blocks is not None:
+            for module in fe_blocks.modules():
+                if isinstance(module, modules_to_shard):
+                    fully_shard(module, **fsdp_kwargs)
 
         for module in model.latent_heads.modules():
             if isinstance(module, modules_to_shard):
