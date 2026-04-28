@@ -705,7 +705,7 @@ class HamiltonianForecastingEngine(torch.nn.Module):
 
         # log step-size; clamped to (0, 1] at runtime to stay stable
         # exp(-2) ≈ 0.135 — small enough that initial dynamics are gentle
-        self.log_eps = nn.Parameter(torch.tensor(-2.0))
+        self.log_eps = nn.Parameter(torch.tensor([-2.0]))
 
         def _init_small(m):
             if isinstance(m, torch.nn.Linear):
@@ -962,8 +962,8 @@ class CayleyForecastingEngine(torch.nn.Module):
         for alpha_head in self.alpha_heads:
             alpha = alpha_head(z)                  # (tokens, 2*rank)
             half = alpha.shape[-1] // 2            # = rank
-            alpha_u = alpha[:, :half]              # (tokens, rank)
-            alpha_v = alpha[:, half:]              # (tokens, rank)
+            alpha_u = alpha[:, :, :half]              # (tokens, rank)
+            alpha_v = alpha[:, :, half:]              # (tokens, rank)
             u = alpha_u @ self.U_basis             # (tokens, rank) @ (rank, d) → (tokens, d)
             v = alpha_v @ self.V_basis
             q = self._cayley_rank2(q, u, v)
