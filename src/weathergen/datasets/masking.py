@@ -250,8 +250,8 @@ class Masker:
         corrs = []
         for _, loss_term in losses.items():
             for loss_name, loss_fct in loss_term.loss_fcts.items():
-                corr = loss_fct.get("target_source_correspondence", None)
 
+                corr = loss_fct.get("target_source_correspondence", None)
                 # correspondence not specified; falling back to default 1-to-1 correspondence
                 # at the level of the configs
                 if corr is None:

@@ -33,6 +33,57 @@ from weathergen.model.utils import ActivationFactory
 from weathergen.utils.utils import get_dtype
 
 
+def _cayley_rank2(q: torch.Tensor, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Apply rank-2 Cayley map Q=(I-W)(I+W)^{-1}, W=uv^T-vu^T, via analytic Woodbury.
+
+    q, u, v : (tokens, d)
+    Returns  : (tokens, d)  — volume-preserving, det=1
+    """
+    uv = (u * v).sum(-1, keepdim=True)
+    uu = (u * u).sum(-1, keepdim=True)
+    vv = (v * v).sum(-1, keepdim=True)
+    det_M = 1.0 + uu * vv - uv * uv          # always ≥ 1 by Cauchy-Schwarz
+    q_u = (q * u).sum(-1, keepdim=True)
+    q_v = (q * v).sum(-1, keepdim=True)
+    m1 = ((1.0 - uv) * q_v + vv * q_u) / det_M
+    m2 = (-uu * q_v + (1.0 + uv) * q_u) / det_M
+    y = q - u * m1 + v * m2
+    y_u = (y * u).sum(-1, keepdim=True)
+    y_v = (y * v).sum(-1, keepdim=True)
+    return y - u * y_v + v * y_u
+
+
+class RotationalLayerNorm(nn.Module):
+    """LayerNorm followed by a data-dependent low-rank Cayley rotation.
+
+    After normalizing, the rotation axes (u, v) are derived from the
+    normalized token itself via low-rank projections, making the rotation
+    input-dependent — it cannot be absorbed into surrounding linear layers
+    the way a fixed orthogonal matrix can.  Each token therefore steers its
+    own direction after normalization, directly countering directional freeze.
+
+    Initialized with zero projections so the rotation starts as identity and
+    does not disrupt early training.  Parameter count per instance:
+        2 × rank × d  (projections) + 2 × rank × d  (bases) = 4·rank·d
+    """
+
+    def __init__(self, dim: int, rank: int = 4) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False)
+        self.u_proj = nn.Linear(dim, rank, bias=False)
+        self.v_proj = nn.Linear(dim, rank, bias=False)
+        self.U_basis = nn.Parameter(torch.randn(rank, dim) * 0.01)
+        self.V_basis = nn.Parameter(torch.randn(rank, dim) * 0.01)
+        nn.init.zeros_(self.u_proj.weight)  # identity rotation at init
+        nn.init.zeros_(self.v_proj.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.norm(x)
+        u = self.u_proj(x) @ self.U_basis   # (tokens, d)
+        v = self.v_proj(x) @ self.V_basis   # (tokens, d)
+        return _cayley_rank2(x, u, v)
+
+
 class EmbeddingEngine(torch.nn.Module):
     name: "EmbeddingEngine"
 
@@ -587,11 +638,19 @@ class ForecastingEngine(torch.nn.Module):
                         norm_eps=self.cf.mlp_norm_eps,
                     )
                 )
-                # Optionally, add LayerNorm after i-th layer
+                # Optionally, add a norm layer after i-th block.
+                # fe_layer_norm_type: "layernorm" (default) | "rotational"
                 if i in self.cf.get("fe_layer_norm_after_blocks", []):
-                    self.fe_blocks.append(
-                        torch.nn.LayerNorm(self.cf.ae_global_dim_embed, elementwise_affine=False)
-                    )
+                    _ln_type = self.cf.get("fe_layer_norm_type", "layernorm")
+                    if _ln_type == "rotational":
+                        _rank = self.cf.get("fe_rotational_ln_rank", 4)
+                        self.fe_blocks.append(
+                            RotationalLayerNorm(self.cf.ae_global_dim_embed, rank=_rank)
+                        )
+                    else:
+                        self.fe_blocks.append(
+                            torch.nn.LayerNorm(self.cf.ae_global_dim_embed, elementwise_affine=False)
+                        )
 
         def init_weights_final(m):
             if isinstance(m, torch.nn.Linear):
@@ -616,7 +675,7 @@ class ForecastingEngine(torch.nn.Module):
         else:
             aux_info = torch.tensor(fstep, dtype=tokens.dtype, device=tokens.device)
         for _b_idx, block in enumerate(self.fe_blocks):
-            if isinstance(block, torch.nn.modules.normalization.LayerNorm):
+            if isinstance(block, (torch.nn.modules.normalization.LayerNorm, RotationalLayerNorm)):
                 tokens = checkpoint(block, tokens, use_reentrant=False)
             else:
                 tokens = checkpoint(block, tokens, coords, aux_info, use_reentrant=False)
@@ -731,7 +790,7 @@ class HamiltonianForecastingEngine(torch.nn.Module):
         """Run transformer blocks to compute F(q, t)."""
         x = q
         for block in self.fe_blocks:
-            if isinstance(block, torch.nn.modules.normalization.LayerNorm):
+            if isinstance(block, (torch.nn.modules.normalization.LayerNorm, RotationalLayerNorm)):
                 x = checkpoint(block, x, use_reentrant=False)
             else:
                 x = checkpoint(block, x, coords, aux_info, use_reentrant=False)
@@ -953,7 +1012,7 @@ class CayleyForecastingEngine(torch.nn.Module):
         # ── Transformer blocks → latent direction z ──────────────────────────
         z = q
         for block in self.fe_blocks:
-            if isinstance(block, torch.nn.modules.normalization.LayerNorm):
+            if isinstance(block, (torch.nn.modules.normalization.LayerNorm, RotationalLayerNorm)):
                 z = checkpoint(block, z, use_reentrant=False)
             else:
                 z = checkpoint(block, z, coords, aux_info, use_reentrant=False)
@@ -1403,7 +1462,7 @@ class LatentPredictionHeadTransformer(nn.Module):
         patch_class_tokens = torch.cat(patch_class_tokens, dim=1)
 
         for _b_idx, block in enumerate(self.blocks):
-            if isinstance(block, torch.nn.modules.normalization.LayerNorm):
+            if isinstance(block, (torch.nn.modules.normalization.LayerNorm, RotationalLayerNorm)):
                 patch_class_tokens = block(patch_class_tokens)
             else:
                 patch_class_tokens = checkpoint(block, patch_class_tokens, use_reentrant=False)
