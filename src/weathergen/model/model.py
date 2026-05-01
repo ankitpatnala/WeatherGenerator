@@ -38,7 +38,7 @@ from weathergen.model.engines import (
     TargetPredictionEngine,
     TargetPredictionEngineClassic,
 )
-from weathergen.model.layers import MLP, FourierHashCoordEmbedding, NamedLinear
+from weathergen.model.layers import MLP, FourierHashCoordEmbedding, MultiResHashGridEmbedding, NamedLinear
 from weathergen.model.utils import get_num_parameters
 from weathergen.utils.distributed import is_root
 from weathergen.utils.utils import get_dtype, is_stream_forcing
@@ -476,9 +476,20 @@ class Model(torch.nn.Module):
                             dim_embed=dims_embed[0],
                             num_freqs=etc.get("num_freqs", 64),
                             d_model=etc.get("d_model", 64),
-                            num_heads=etc.get("num_heads", 4),
                             num_layers=etc.get("num_layers", 2),
                             sigma=etc.get("sigma", 1.0),
+                        )
+                    elif etc["net"] == "hash_grid":
+                        self.embed_target_coords[stream_name] = MultiResHashGridEmbedding(
+                            dim_coord_in=dim_coord_in,
+                            dim_embed=dims_embed[0],
+                            num_levels=etc.get("num_levels", 8),
+                            feat_dim=etc.get("feat_dim", 4),
+                            hash_size=etc.get("hash_size", 131072),
+                            coarsest_res=etc.get("coarsest_res", 45.0),
+                            finest_res=etc.get("finest_res", 1.0),
+                            mlp_hidden=etc.get("mlp_hidden", 64),
+                            mlp_layers=etc.get("mlp_layers", 2),
                         )
                     else:
                         assert False
