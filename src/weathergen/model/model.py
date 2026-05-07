@@ -754,7 +754,7 @@ class Model(torch.nn.Module):
         n_state: torch.Tensor | None = None   # LatentGate running normalizer
         p_state: torch.Tensor | None = None   # HamiltonianFE momentum
         f_state: torch.Tensor | None = None   # HamiltonianFE cached force (Velocity Verlet)
-        _prev_tokens_detached: torch.Tensor | None = None  # for directional loss
+        _prev_tokens: torch.Tensor | None = None  # for directional loss (no detach — grad flows both ways)
         _num_aux = self.cf.num_register_tokens + self.cf.num_class_tokens
         for step in batch.get_output_idxs():
             # apply forecasting engine (if present)
@@ -770,16 +770,17 @@ class Model(torch.nn.Module):
                 candidate = self.forecast_engine(tokens, batch.conditions[step], coords=model_params.rope_coords)
                 tokens, n_state = self.latent_gate(tokens, candidate, n_state)
 
-            # Compute consecutive-step cosine similarity as a scalar (memory-efficient).
-            # Only the current step's graph is kept; prev is detached so its graph is freed.
-            if _prev_tokens_detached is not None:
-                t0 = _prev_tokens_detached[:, _num_aux:, :] if (_num_aux > 0 and tokens.dim() == 3) else _prev_tokens_detached
+            # Compute consecutive-step cosine similarity as a scalar.
+            # No detach: decoder outputs already keep all step graphs alive, so detaching prev
+            # would save no memory but would cut gradient to the previous step's FE parameters.
+            if _prev_tokens is not None:
+                t0 = _prev_tokens[:, _num_aux:, :] if (_num_aux > 0 and tokens.dim() == 3) else _prev_tokens
                 t1 = tokens[:, _num_aux:, :] if (_num_aux > 0 and tokens.dim() == 3) else tokens
                 cos_sim = F.cosine_similarity(
                     t0.reshape(-1, t0.shape[-1]), t1.reshape(-1, t1.shape[-1]), dim=-1
                 ).mean()
                 output.add_latent_prediction(step, "dir_cos_sim", cos_sim)
-            _prev_tokens_detached = tokens.detach()
+            _prev_tokens = tokens
 
             # decoder predictions
             output = self.predict_decoders(model_params, step, tokens, batch, output)
