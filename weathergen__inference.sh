@@ -1,12 +1,12 @@
 #!/bin/bash -x
 #SBATCH --account=hclimrep
-#SBATCH --time=12:00:00
+#SBATCH --time=02:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=44
+#SBATCH --cpus-per-task=24
 #SBATCH --gres=gpu:1
 #SBATCH --chdir=.
-#SBATCH --partition=booster
+#SBATCH --partition=develbooster
 #SBATCH --output=logs/weathergen-%x.%j.out
 #SBATCH --error=logs/weathergen-%x.%j.err
 

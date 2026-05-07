@@ -667,7 +667,7 @@ class ForecastingEngine(torch.nn.Module):
             noise_std = self.cf.get("fe_impute_latent_noise_std", 0.0)
             if noise_std > 0.0:
                 tokens = tokens + torch.randn_like(tokens) * torch.norm(tokens) * noise_std
-
+        
         if len(fstep) == 0:
             aux_info = None
         elif isinstance(fstep, torch.Tensor):

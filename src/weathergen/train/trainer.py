@@ -587,9 +587,25 @@ class Trainer(TrainerBase):
                         forecast_max = mode_cfg.forecast.offset
 
                         forecast_chunk_size = cf.training_config.forecast.forecast_chunk_size
+                        # roll-out in latent space, iterate and generate output over requested output steps
+                        n_state: torch.Tensor | None = None   # LatentGate running normalizer
+                        p_state: torch.Tensor | None = None   # HamiltonianFE momentum
+                        f_state: torch.Tensor | None = None   # HamiltonianFE cached force (Velocity Verlet)
+                        _prev_tokens: torch.Tensor | None = None  # for directional loss (no detach — grad flows both ways)
+                        _num_aux = self.cf.num_register_tokens + self.cf.num_class_tokens
                         for step in batch.get_source_samples().get_output_idxs():
-                            if self.model.forecast_engine:
-                                tokens = self.model.forecast_engine(tokens, step, coords=self.model_params.rope_coords)
+                            if self.model.hamiltonian_fe is not None:
+                                tokens, p_state, f_state = self.model.hamiltonian_fe(
+                                    tokens, p_state, f_state, batch.get_source_samples().conditions[step], coords=self.model_params.rope_coords
+                                )
+                            elif self.model.cayley_fe is not None:
+                                tokens = self.model.cayley_fe(
+                                    tokens, batch.get_source_samples().conditions[step], coords=self.model_params.rope_coords
+                                )
+                            elif self.model.forecast_engine:
+                                candidate = self.model.forecast_engine(tokens, batch.get_source_samples().conditions[step], coords=self.model_params.rope_coords)
+                                tokens, n_state = self.model.latent_gate(tokens, candidate, n_state)
+
                             output = self.model.predict_decoders(self.model_params, step, tokens, batch.get_source_samples(), output)
                             output = self.model.predict_latent(self.model_params, step, tokens, batch.get_source_samples(), output)
                             forecast_max +=1
