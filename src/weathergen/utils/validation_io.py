@@ -58,7 +58,8 @@ def write_output(
         targets_coords_all += [[]]
         targets_times_all += [[]]
         targets_lens += [[]]
-        for stream_info in cf.streams:
+        self.data_streams = [stream for stream in cf.streams if stream["type"] != "condition"]
+        for stream_info in self.data_streams:
             sname = stream_info["name"]
 
             # handle spoof data: do not write since it might corrupt validation (spoofing invisible
