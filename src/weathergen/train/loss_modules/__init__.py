@@ -8,7 +8,8 @@
 # nor does it submit to any jurisdiction.
 
 from .loss_module_directional import LossDirectionalMatching
+from .loss_module_fe_alignment import LossLatentFEAlignment
 from .loss_module_physical import LossPhysical
 from .loss_module_ssl import LossLatentSSLStudentTeacher
 
-__all__ = [LossPhysical, LossLatentSSLStudentTeacher, LossDirectionalMatching]
+__all__ = [LossPhysical, LossLatentSSLStudentTeacher, LossDirectionalMatching, LossLatentFEAlignment]

@@ -451,7 +451,7 @@ class Trainer(TrainerBase):
                     # apply target-aux calculator
                     targets_and_auxs[loss_name] = target_aux.compute(
                         self.cf.general.istep,
-                        batch.get_target_samples(target_idxs) + 1,
+                        batch.get_target_samples(target_idxs),
                         self.model_params,
                         self.model,
                     )

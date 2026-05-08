@@ -761,6 +761,17 @@ class HamiltonianForecastingEngine(torch.nn.Module):
                         norm_eps=self.cf.mlp_norm_eps,
                     )
                 )
+                if i in self.cf.get("fe_layer_norm_after_blocks", []):
+                    _ln_type = self.cf.get("fe_layer_norm_type", "layernorm")
+                    if _ln_type == "rotational":
+                        _rank = self.cf.get("fe_rotational_ln_rank", 4)
+                        self.fe_blocks.append(
+                            RotationalLayerNorm(self.cf.ae_global_dim_embed, rank=_rank)
+                        )
+                    else:
+                        self.fe_blocks.append(
+                            torch.nn.LayerNorm(self.cf.ae_global_dim_embed, elementwise_affine=False)
+                        )
 
         # log step-size; clamped to (0, 1] at runtime to stay stable
         # exp(-2) ≈ 0.135 — small enough that initial dynamics are gentle
@@ -931,6 +942,17 @@ class CayleyForecastingEngine(torch.nn.Module):
                         norm_eps=self.cf.mlp_norm_eps,
                     )
                 )
+                if i in self.cf.get("fe_layer_norm_after_blocks", []):
+                    _ln_type = self.cf.get("fe_layer_norm_type", "layernorm")
+                    if _ln_type == "rotational":
+                        _rank = self.cf.get("fe_rotational_ln_rank", 4)
+                        self.fe_blocks.append(
+                            RotationalLayerNorm(self.cf.ae_global_dim_embed, rank=_rank)
+                        )
+                    else:
+                        self.fe_blocks.append(
+                            torch.nn.LayerNorm(self.cf.ae_global_dim_embed, elementwise_affine=False)
+                        )
 
         # ── Low-rank Cayley projection heads ─────────────────────────────────
         # K pairs (u_k, v_k): each factored as z --(d→rank)--> alpha --(rank→d)--> uv

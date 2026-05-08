@@ -83,22 +83,26 @@ class LossCalculator:
         preds: ModelOutput,
         targets_and_aux: TargetAuxOutput,
         metadata: dict,
-        forecast_min,
-        forecast_max
+        forecast_min=None,
+        forecast_max=None,
     ):
         losses_all = defaultdict(dict)
         stddev_all = defaultdict(dict)
         loss = torch.tensor(0.0, requires_grad=True)
+        extra_kwargs = {}
+        if forecast_min is not None:
+            extra_kwargs["forecast_min"] = forecast_min
+        if forecast_max is not None:
+            extra_kwargs["forecast_max"] = forecast_max
         for loss_term_name, calc_term in self.loss_calculators.items():
             target = targets_and_aux.get(loss_term_name, None)
             for weight, calculator in calc_term:
                 if weight > 0.0:
                     loss_values = calculator.compute_loss(
-                        preds=preds, 
-                        targets=target, 
+                        preds=preds,
+                        targets=target,
                         metadata=metadata,
-                        forecast_min=forecast_min,
-                        forecast_max=forecast_max
+                        **extra_kwargs,
                     )
                     loss = loss + weight * loss_values.loss
                     losses_all[calculator.name] = loss_values.losses_all

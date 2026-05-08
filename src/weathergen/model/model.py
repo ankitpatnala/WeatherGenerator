@@ -388,10 +388,22 @@ class Model(torch.nn.Module):
         self.hamiltonian_fe = None
         self.cayley_fe = None
         self.latent_gate = None
-        _fe_mode = cf.get("fe_mode", "latent_gate")  # "latent_gate" | "hamiltonian" | "cayley"
+        _fe_mode = cf.get("fe_mode", "latent_gate")  # "latent_gate" | "forecast_only" | "hamiltonian" | "cayley"
         if cf.fe_num_blocks > 0:
             dim_aux = self.forecast_aux_infos if self.forecast_aux_infos > 0 else None
-            if _fe_mode == "hamiltonian":
+            if _fe_mode == "latent_gate":
+                self.forecast_engine = ForecastingEngine(
+                    cf, mode_cfg, self.num_healpix_cells, dim_aux
+                )
+                self.latent_gate = LatentGate(
+                    cf.ae_global_dim_embed,
+                    track_normalizer=cf.get("latent_gate_track_normalizer", True),
+                )
+            elif _fe_mode == "forecast_only":
+                self.forecast_engine = ForecastingEngine(
+                    cf, mode_cfg, self.num_healpix_cells, dim_aux
+                )
+            elif _fe_mode == "hamiltonian":
                 self.hamiltonian_fe = HamiltonianForecastingEngine(
                     cf, mode_cfg, self.num_healpix_cells, dim_aux
                 )
@@ -400,13 +412,7 @@ class Model(torch.nn.Module):
                     cf, mode_cfg, self.num_healpix_cells, dim_aux
                 )
             else:
-                self.forecast_engine = ForecastingEngine(
-                    cf, mode_cfg, self.num_healpix_cells, dim_aux
-                )
-                self.latent_gate = LatentGate(
-                    cf.ae_global_dim_embed,
-                    track_normalizer=cf.get("latent_gate_track_normalizer", True),
-                )
+                raise ValueError(f"Unknown fe_mode '{_fe_mode}'. Expected: 'latent_gate', 'forecast_only', 'hamiltonian', 'cayley'.")
 
         # embed coordinates yielding one query token for each target token
         dropout_rate = cf.embed_dropout_rate
@@ -799,7 +805,10 @@ class Model(torch.nn.Module):
                 )
             elif self.forecast_engine:
                 candidate = self.forecast_engine(tokens, batch.conditions[step], coords=model_params.rope_coords)
-                tokens, n_state = self.latent_gate(tokens, candidate, n_state)
+                if self.latent_gate is not None:
+                    tokens, n_state = self.latent_gate(tokens, candidate, n_state)
+                else:
+                    tokens = candidate
 
             # Compute consecutive-step cosine similarity as a scalar.
             # No detach: decoder outputs already keep all step graphs alive, so detaching prev

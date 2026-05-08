@@ -59,7 +59,7 @@ class LossDirectionalMatching(LossModuleBase):
         self.only_patch_tokens = params.get("only_patch_tokens", True)
         self.num_aux_tokens = cf.num_register_tokens + cf.num_class_tokens
 
-    def compute_loss(self, preds, targets, metadata) -> LossValues:
+    def compute_loss(self, preds, targets, metadata, **kwargs) -> LossValues:
         loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         losses_all: dict = {}
 
@@ -75,9 +75,14 @@ class LossDirectionalMatching(LossModuleBase):
             losses_all["dir_cos_sim"] = 0.0
             return LossValues(loss=loss, losses_all=losses_all, stddev_all={})
 
-        hinge_terms = [F.relu(s - self.threshold) for s in cos_sim_scalars]
-        loss = torch.stack(hinge_terms).mean()
-        losses_all["dir_cos_sim"] = torch.stack([s.detach() for s in cos_sim_scalars]).mean().item()
+        stacked = torch.stack(cos_sim_scalars)
+        if self.threshold > 0.0:
+            # hinge: only penalise above threshold
+            loss = F.relu(stacked - self.threshold).mean()
+        else:
+            # threshold=0: penalise raw cosine similarity directly (gradient everywhere)
+            loss = stacked.mean()
+        losses_all["dir_cos_sim"] = stacked.detach().mean().item()
         losses_all["dir_hinge"] = loss.detach().item()
 
         return LossValues(loss=loss, losses_all=losses_all, stddev_all={})

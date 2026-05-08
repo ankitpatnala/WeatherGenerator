@@ -72,9 +72,10 @@ fe_impute_latent_noise_std: 1e-4
 # (true = infinite-step collapse guarantee; false = cheaper per-step clamp)
 latent_gate_track_normalizer: true
 # fe_mode selects the forecasting engine:
-#   "latent_gate"  — original FE + xLSTM-style LatentGate (default)
-#   "hamiltonian"  — symplectic Velocity-Verlet; maintains momentum p across steps
-#   "cayley"       — volume-preserving Cayley rotations; stateless per step
+#   "latent_gate"    — original FE + xLSTM-style LatentGate (default)
+#   "forecast_only"  — original FE without LatentGate; tokens = FE(tokens) directly
+#   "hamiltonian"    — symplectic Velocity-Verlet; maintains momentum p across steps
+#   "cayley"         — volume-preserving Cayley rotations; stateless per step
 fe_mode: "cayley"
 cayley_rank: 32              # low-rank Cayley basis dimension (cayley mode only)
 cayley_num_compositions: 4   # number of rank-2 Cayley maps composed per step
@@ -203,6 +204,21 @@ training_config:
             },
         },
       },
+    # JEPA-style FE latent alignment: L = ||z_FE - stop_grad(encoder(x_{t+1}))||^2
+    # Forces FE output onto the encoder manifold in both direction and magnitude.
+    # target_and_aux_calc: "ForecastLatentTarget" encodes ground-truth future states.
+    # Set weight > 0 to enable. Recommended starting point: weight=1.0.
+    "fe_alignment": {
+        type: LossLatentFEAlignment,
+        weight: 1.0,
+        target_and_aux_calc: "ForecastLatentTarget",
+        loss_fcts: {
+            "params": {
+                only_patch_tokens: true,  # ignore register/class tokens
+                normalize: false,         # true = cosine alignment, false = MSE in raw space
+            },
+        },
+      },
     }
   
   model_input: {
@@ -215,7 +231,7 @@ training_config:
   forecast :
       time_step: 06:00:00
       offset: 1
-      num_steps: 3
+      num_steps: 1
       policy: "fixed"
 
 
