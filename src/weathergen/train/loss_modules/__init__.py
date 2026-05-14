@@ -8,7 +8,8 @@
 # nor does it submit to any jurisdiction.
 
 from .loss_module_cosine_matching import LossLatentCosineMatching
+from .loss_module_jepa import LossLatentJEPA
 from .loss_module_physical import LossPhysical
 from .loss_module_ssl import LossLatentSSLStudentTeacher
 
-__all__ = [LossPhysical, LossLatentSSLStudentTeacher, LossLatentCosineMatching]
+__all__ = [LossPhysical, LossLatentSSLStudentTeacher, LossLatentCosineMatching, LossLatentJEPA]

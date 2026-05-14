@@ -152,6 +152,10 @@ class BatchSamples:
         self.output_steps = output_steps
         self.output_idxs = output_idxs
         self.device = None
+        self.jepa_source_samples: "BatchSamples | None" = None
+
+    def get_jepa_source_samples(self) -> "BatchSamples | None":
+        return self.jepa_source_samples
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -163,6 +167,9 @@ class BatchSamples:
         self.tokens_lens = (
             self.tokens_lens.to(device, non_blocking=True) if self.tokens_lens is not None else None
         )
+
+        if self.jepa_source_samples is not None:
+            self.jepa_source_samples.to_device(device)
 
         self.device = device
 
@@ -247,6 +254,9 @@ class BatchSamples:
         if isinstance(self.tokens_lens, torch.Tensor):
             self.tokens_lens = self.tokens_lens.pin_memory()
 
+        if self.jepa_source_samples is not None:
+            self.jepa_source_samples.pin_memory()
+
         return self
 
 
@@ -294,6 +304,9 @@ class ModelBatch:
         self.target_samples = BatchSamples(
             streams, num_target_samples, output_steps, self.output_idxs
         )
+        # source-format batch at the last forecast timestep for JEPA alignment loss
+        # populated by the sampler when jepa alignment is enabled; None otherwise
+        self.jepa_source_samples: BatchSamples | None = None
 
         self.source2target_matching_idxs = np.full(num_source_samples, -1, dtype=np.int32)
         self.target2source_matching_idxs = [[] for _ in range(num_target_samples)]
@@ -301,11 +314,10 @@ class ModelBatch:
     def pin_memory(self):
         """Pin all tensors in this batch to CPU pinned memory"""
 
-        # pin source samples
         self.source_samples.pin_memory()
-
-        # pin target samples
         self.target_samples.pin_memory()
+        if self.jepa_source_samples is not None:
+            self.jepa_source_samples.pin_memory()
 
         return self
 
@@ -316,10 +328,26 @@ class ModelBatch:
 
         self.source_samples.to_device(device)
         self.target_samples.to_device(device)
+        if self.jepa_source_samples is not None:
+            self.jepa_source_samples.to_device(device)
 
         self.device = device
 
         return self
+
+    def add_jepa_source_stream(
+        self,
+        source_sample_idx: int,
+        stream_name: str,
+        stream_data,
+        meta_info,
+    ) -> None:
+        """Add source-format data at the last forecast timestep for JEPA alignment."""
+        self.jepa_source_samples.samples[source_sample_idx].add_stream_data(stream_name, stream_data)
+        self.jepa_source_samples.samples[source_sample_idx].add_meta_info(stream_name, meta_info)
+
+    def get_jepa_source_samples(self) -> "BatchSamples | None":
+        return self.jepa_source_samples
 
     def add_source_stream(
         self,
@@ -424,7 +452,9 @@ class ModelBatch:
         """
         Get source samples
         """
-        return self.source_samples.get_subset(subset)
+        result = self.source_samples.get_subset(subset)
+        result.jepa_source_samples = self.jepa_source_samples
+        return result
 
     def get_target_sample(self, idx: int) -> Sample:
         """

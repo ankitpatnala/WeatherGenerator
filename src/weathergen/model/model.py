@@ -380,6 +380,11 @@ class Model(torch.nn.Module):
         mode_cfg = cf.training_config
         if cf.fe_num_blocks > 0:
             self.forecast_engine = ForecastingEngine(cf, mode_cfg, self.num_healpix_cells)
+            # per-channel scale applied to the net FE residual (output - input)
+            # init=1 → identity; training pushes each channel toward encoder variance
+            self.fe_residual_scale = nn.Parameter(
+                torch.ones(self.num_healpix_cells, cf.ae_global_dim_embed)
+            )
         else:
             self.forecast_engine = IdentityEngine()
 
@@ -689,7 +694,8 @@ class Model(torch.nn.Module):
         Tokens are processed through the model components, which were defined in the create method.
         Args:
             model_params : Query and embedding parameters
-            batch
+            batch        : source batch at time t; may carry batch.jepa_source_samples
+                           (source-format data at last forecast timestep t+N) for alignment loss
         Returns:
             A list containing all prediction results
         """
@@ -704,26 +710,48 @@ class Model(torch.nn.Module):
         # collapse along input step dimension
         tokens = tokens.reshape(shape).sum(axis=1)
 
+        # encode last forecast timestep (source format, t+N) as JEPA alignment target
+        jepa_source = batch.get_jepa_source_samples()
+        if jepa_source is not None:
+            with torch.no_grad():
+                jepa_tokens, _ = self.encoder(model_params, jepa_source)
+                jepa_shape = (len(batch), jepa_source.get_num_steps(), *jepa_tokens.shape[1:])
+                jepa_tokens = jepa_tokens.reshape(jepa_shape).sum(axis=1).detach()  # [B, S, D]
+        else:
+            jepa_tokens = None
+
+        last_step = max(batch.get_output_idxs())
+
         # Allow for pushforward trick
         p_fwd = self.cf.training_config.get("forecast", {}).get("pushforward", False)
         # roll-out in latent space, iterate and generate output over requested output steps
         prev_tokens = tokens
         for step in batch.get_output_idxs():
-            without_grad = p_fwd and self.training and step != max(batch.get_output_idxs())
+            without_grad = p_fwd and self.training and step != last_step
             if without_grad:
                 # Pushforward mode: advance tokens without grad; no decoding with torch.no_grad():
                 prev_tokens = tokens
-                tokens = self.forecast_engine(tokens, step, model_params.rope_coords)
+                fe_out = self.forecast_engine(tokens, step, model_params.rope_coords)
+                tokens = tokens + (fe_out - tokens) * self.fe_residual_scale
                 continue
 
             prev_tokens = tokens
-            tokens = self.forecast_engine(tokens, step, model_params.rope_coords)
+            fe_out = self.forecast_engine(tokens, step, model_params.rope_coords)
+            tokens = tokens + (fe_out - tokens) * self.fe_residual_scale
 
             # per-token cosine similarity between current and previous patch tokens
             cur = tokens[:, self.num_aux_tokens:].reshape(-1, tokens.shape[-1])
             prv = prev_tokens[:, self.num_aux_tokens:].reshape(-1, tokens.shape[-1])
             cos_sim_to_prev = torch.nn.functional.cosine_similarity(cur, prv.detach(), dim=-1)
             output.add_latent_prediction(step, "cos_sim_to_prev", cos_sim_to_prev)
+
+            # at last step: compute JEPA alignment loss (MSE between FE patch tokens and
+            # encoder patch tokens at t+N); storing a scalar avoids keeping a [B,12288,D] tensor
+            if jepa_tokens is not None and step == last_step:
+                fe_patch = tokens[:, self.num_aux_tokens :]          # [B, 12288*q, D]
+                enc_patch = jepa_tokens[:, self.num_aux_tokens :]    # already detached
+                alignment_loss = torch.nn.functional.mse_loss(fe_patch, enc_patch)
+                output.add_latent_prediction(step, "latent_alignment_loss", alignment_loss)
 
             # decoder predictions
             output = self.predict_decoders(model_params, step, tokens, batch, output)

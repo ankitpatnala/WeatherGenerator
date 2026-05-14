@@ -1,0 +1,14 @@
+train : 
+  plot :
+    aev85iny:
+      slurm_id: 0
+      description: "Release model finetuning"
+      eval: vgbndhco
+    nc7ygqdk : 
+      slurm_id: 0
+      description: "Cosine distance loss fineutning"
+      eval: vgbndhco
+    hn3v2uk6 : 
+      slurm_id: 0
+      description: "Cosine distance loss pre-training"
+      eval: vgbndhco

@@ -168,6 +168,10 @@ training_config:
       beta2 : 0.9875  # == 0.90 on 2 nodes x 4 gpus
       eps : 2e-08
 
+  # enable JEPA alignment: sampler loads last forecast timestep as source and
+  # model.forward() computes MSE(FE_patch_tokens, stop_grad(encoder_tokens)) in-place
+  jepa_alignment: true
+
   losses : {
     "physical": {
         type: LossPhysical,
@@ -181,6 +185,15 @@ training_config:
             "params": {
                 cosine_low: 0.68,
                 cosine_high: 0.78,
+            },
+        },
+        },
+    "jepa_alignment": {
+        type: LossLatentJEPA,
+        weight: 1.0,
+        loss_fcts: {
+            "params": {
+                weight: 1.0,
             },
         },
         },
