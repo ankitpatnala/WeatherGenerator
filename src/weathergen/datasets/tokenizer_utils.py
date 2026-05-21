@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import pandas as pd
 import torch
@@ -311,6 +313,7 @@ def tokenize_apply_mask_target(
     hpy_verts_local,
     hpy_nctrs,
     enc_time,
+    use_fourier_coords: bool = False,
 ):
     """
     Apply masking to the data.
@@ -367,17 +370,25 @@ def tokenize_apply_mask_target(
 
     # compute encoding of target coordinates used in prediction network
     if torch.tensor(idxs_lens).sum() > 0:
-        coords_local = get_target_coords_local(
-            stream_id,
-            hl,
-            masked_points_per_cell,
-            coords,
-            geoinfos,
-            datetimes_enc,
-            hpy_verts_rots,
-            hpy_verts_local,
-            hpy_nctrs,
-        )
+        if use_fourier_coords:
+            coords_local = get_target_coords_fourier(
+                stream_id,
+                coords,
+                geoinfos,
+                datetimes_enc,
+            )
+        else:
+            coords_local = get_target_coords_local(
+                stream_id,
+                hl,
+                masked_points_per_cell,
+                coords,
+                geoinfos,
+                datetimes_enc,
+                hpy_verts_rots,
+                hpy_verts_local,
+                hpy_nctrs,
+            )
         coords_local.requires_grad = False
     else:
         coords_local = torch.tensor([])
@@ -513,3 +524,48 @@ def get_target_coords_local(
     a[..., (geoinfo_offset + zi) :] = target_coords[..., (geoinfo_offset + 2) :]
 
     return a
+
+
+# number of Fourier frequencies — controls output size: 1 + 5 + geoinfo_size + 6*F
+FOURIER_NUM_FREQUENCIES = 16
+
+
+def get_target_coords_fourier(
+    stream_id: int,
+    coords: torch.Tensor,
+    target_geoinfos: torch.Tensor,
+    target_times: torch.Tensor,
+    num_frequencies: int = FOURIER_NUM_FREQUENCIES,
+) -> torch.Tensor:
+    """
+    Per-point Fourier positional encoding on the unit sphere.
+
+    Drop-in replacement for get_target_coords_local. Every point receives a
+    unique encoding regardless of which HEALPix cell it falls in:
+      1. (lat, lon) → 3D unit vector (x, y, z)  —  no pole/dateline singularity.
+      2. NeRF-style sin/cos at 2^0 … 2^(F-1) frequencies along each axis.
+         At F=16 the highest frequency resolves ~0.003° within a cell.
+
+    Output: [N, 1 + target_times.shape[1] + target_geoinfos.shape[1] + 6*num_frequencies]
+    """
+    N = coords.shape[0]
+    feat_dim = 1 + target_times.shape[1] + target_geoinfos.shape[1] + 6 * num_frequencies
+    if N == 0:
+        return torch.zeros([0, feat_dim])
+
+    # (lat, lon) → unit 3-vector on the sphere
+    thetas, phis = theta_phi_to_standard_coords(coords)
+    sin_t = torch.tensor(np.sin(thetas), dtype=torch.float32)
+    cos_t = torch.tensor(np.cos(thetas), dtype=torch.float32)
+    sin_p = torch.tensor(np.sin(phis),   dtype=torch.float32)
+    cos_p = torch.tensor(np.cos(phis),   dtype=torch.float32)
+    xyz = torch.stack([sin_t * cos_p, sin_t * sin_p, cos_t], dim=-1)  # [N, 3]
+
+    # multi-frequency encoding → [N, 6*F]
+    freqs = torch.pow(2.0, torch.arange(num_frequencies, dtype=torch.float32))  # [F]
+    angles = xyz.unsqueeze(-1) * freqs * math.pi                               # [N, 3, F]
+    fourier = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)        # [N, 3, 2F]
+    fourier = fourier.flatten(1)                                                # [N, 6F]
+
+    stream_ids = torch.full([N, 1], stream_id, dtype=torch.float32)
+    return torch.cat([stream_ids, target_times, target_geoinfos, fourier], dim=1)

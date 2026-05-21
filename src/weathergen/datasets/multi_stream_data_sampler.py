@@ -17,7 +17,7 @@ from omegaconf import OmegaConf
 
 from weathergen.common.config import Config
 from weathergen.common.io import IOReaderData
-from weathergen.datasets.batch import BatchSamples, ModelBatch
+from weathergen.datasets.batch import ModelBatch
 from weathergen.datasets.data_reader_anemoi import DataReaderAnemoi
 from weathergen.datasets.data_reader_base import (
     DataReaderBase,
@@ -29,6 +29,7 @@ from weathergen.datasets.data_reader_obs import DataReaderObs
 from weathergen.datasets.masking import Masker
 from weathergen.datasets.stream_data import StreamData, spoof
 from weathergen.datasets.tokenizer_masking import TokenizerMasking
+from weathergen.datasets.tokenizer_utils import FOURIER_NUM_FREQUENCIES
 from weathergen.datasets.utils import (
     get_tokens_lens,
 )
@@ -111,7 +112,6 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.forecast_policy = forecast_cfg["policy"]
         steps = np.array(forecast_cfg["num_steps"], dtype=np.int32).reshape(-1)
         self.list_num_forecast_steps = np.array(steps, dtype=np.int32)
-        self.jepa_alignment = bool(mode_cfg.get("jepa_alignment", False))
 
         # initialise fsm, but can change for future mini_epochs
         self.batch_size = get_batch_size_from_config(mode_cfg)
@@ -348,11 +348,12 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         return [ds[0].get_target_num_channels() for _, ds in self.streams_datasets.items()]
 
     def get_targets_coords_size(self):
-        # TODO: avoid hard coding magic values
-        # +6 at the end for stream_id and time encoding
+        # +6 = stream_id (1) + time encoding (5)
         return [
-            (ds[0].get_geoinfo_size() + (5 * (3 * 5)) + 3 * 8) + 6
-            for _, ds in self.streams_datasets.items()
+            ds[0].get_geoinfo_size() + 6 + 6 * FOURIER_NUM_FREQUENCIES
+            if stream_info.get("use_fourier_coords", False)
+            else (ds[0].get_geoinfo_size() + (5 * (3 * 5)) + 3 * 8) + 6
+            for stream_info, (_, ds) in zip(self.streams, self.streams_datasets.items())
         ]
 
     def denormalize_source_channels(self, stream_name, data) -> torch.Tensor:
@@ -623,11 +624,6 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         batch.target_samples.tokens_lens = get_tokens_lens(
             self.streams, batch.target_samples, target_input_steps
         )
-        if batch.jepa_source_samples is not None:
-            batch.jepa_source_samples.tokens_lens = get_tokens_lens(
-                self.streams, batch.jepa_source_samples, 1
-            )
-
         return batch
 
     def _get_batch(self, idx: int, num_forecast_steps: int):
@@ -663,11 +659,6 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             num_output_steps,
         )
 
-        if self.jepa_alignment:
-            batch.jepa_source_samples = BatchSamples(
-                self.streams, num_source_samples, num_output_steps, batch.output_idxs
-            )
-
         # for all streams
         for stream_info, (stream_name, stream_ds) in zip(
             self.streams, self.streams_datasets.items(), strict=True
@@ -693,14 +684,6 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             input_tokens = self.tokenizer.get_tokens_windows(stream_info, input_data, True)
             output_tokens = self.tokenizer.get_tokens_windows(stream_info, output_data, False)
 
-            # load and tokenize the last forecast step as source for JEPA alignment
-            if self.jepa_alignment:
-                last_jepa_idx = idx + (self.time_step * (num_output_steps - 1)) // self.step_timedelta
-                jepa_rdata = collect_datasources(stream_ds, last_jepa_idx, "source", self.rng)
-                jepa_input_tokens = self.tokenizer.get_tokens_windows(stream_info, [jepa_rdata], True)
-                # full mask: keep all cells (no spatial masking for the JEPA encoder target)
-                jepa_full_mask = torch.ones(self.num_healpix_cells, dtype=torch.bool)
-
             for sidx, source_mask in enumerate(source_masks.masks):
                 # Map each source to its target
                 tidx = source_to_target[sidx].item()
@@ -719,22 +702,6 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 )
 
                 batch.add_source_stream(sidx, tidx, stream_name, sdata, source_masks.metadata[sidx])
-
-                if self.jepa_alignment:
-                    jepa_sd = StreamData(last_jepa_idx, 1, 1, self.num_healpix_cells)
-                    jepa_sd = self._build_stream_data_input(
-                        source_select,
-                        jepa_sd,
-                        last_jepa_idx,
-                        stream_info,
-                        1,
-                        [jepa_rdata],
-                        jepa_input_tokens,
-                        jepa_full_mask,
-                    )
-                    batch.add_jepa_source_stream(
-                        sidx, stream_name, jepa_sd, source_masks.metadata[sidx]
-                    )
 
             # for t_idx, mask in enumerate(source_masks):
             for tidx, target_mask in enumerate(target_masks.masks):

@@ -1,14 +1,14 @@
 train : 
   plot :
-    aev85iny:
+    dgda56qz:
       slurm_id: 0
-      description: "Release model finetuning"
+      description: "Latent alignment loss (ramp up) + cosine loss (lr constant)  "
       eval: vgbndhco
-    nc7ygqdk : 
+    q3t4hzw6:
       slurm_id: 0
-      description: "Cosine distance loss fineutning"
+      description: "Latent alignment loss + cosine loss (lr constant)"
       eval: vgbndhco
-    hn3v2uk6 : 
+    hn3v2uk6:
       slurm_id: 0
-      description: "Cosine distance loss pre-training"
+      description: "cosine loss (lr constant) "
       eval: vgbndhco

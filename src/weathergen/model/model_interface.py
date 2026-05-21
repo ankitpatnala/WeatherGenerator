@@ -17,7 +17,7 @@ from torch.distributed.fsdp import (
     MixedPrecisionPolicy,
     fully_shard,
 )
-from torch.distributed.tensor import distribute_tensor
+from torch.distributed.tensor import DTensor, distribute_tensor
 
 from weathergen.common.config import Config, get_path_model, merge_configs
 from weathergen.model.attention import (
@@ -193,13 +193,16 @@ def load_model(cf, model, device, run_id: str, mini_epoch=-1):
         maybe_sharded_sd = {}
         for param_name, full_tensor in params.items():
             sharded_meta_param = meta_sharded_sd.get(param_name)
-            sharded_tensor = distribute_tensor(
-                full_tensor,
-                sharded_meta_param.device_mesh,
-                sharded_meta_param.placements,
-            )
-            # maybe_sharded_sd[param_name.replace("module.", "")] = nn.Parameter(sharded_tensor)
-            maybe_sharded_sd[param_name] = torch.nn.Parameter(sharded_tensor)
+            if isinstance(sharded_meta_param, DTensor):
+                sharded_tensor = distribute_tensor(
+                    full_tensor,
+                    sharded_meta_param.device_mesh,
+                    sharded_meta_param.placements,
+                )
+                maybe_sharded_sd[param_name] = torch.nn.Parameter(sharded_tensor)
+            else:
+                # Plain registered buffer (not sharded by FSDP) — load as-is.
+                maybe_sharded_sd[param_name] = full_tensor
         # choose `assign=True` for sharded model since we cannot call `copy_` on meta tensor
         mkeys, ukeys = model.load_state_dict(maybe_sharded_sd, strict=False, assign=True)
 

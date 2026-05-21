@@ -179,6 +179,7 @@ class TokenizerMasking(Tokenizer):
             self.hpy_verts_local_target,
             self.hpy_nctrs_target,
             encode_times_target,
+            use_fourier_coords=stream_info.get("use_fourier_coords", False),
         )
 
         return (coords_local, coords_per_cell)
