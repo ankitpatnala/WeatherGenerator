@@ -160,7 +160,7 @@ class DataReaderCondition(DataReaderTimestep):
 
         if self.transform == "absolute":
             for var in variables:
-                values.append(_RAW[var])
+                values.append(_RAW[var] / _PERIODS[var])
 
         elif self.transform == "cos_sin":
             for var in variables:
