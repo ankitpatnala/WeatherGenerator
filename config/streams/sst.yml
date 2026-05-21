@@ -1,0 +1,21 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+SST_conditions :
+  type : condition
+  condition_type: spatial
+  filetype : anemoi
+  filenames : ERA5-1deg-6h-mean-forcing-1978-2024.zarr
+  source : ['sea_surface_temperature']
+  transform : "absolute"  # absolute, cos_sin, fourier
+  entry_point : "forecast_engine"
+  healpix_order:  5
+  forcing: True  
+  diagnostic: True
+  emb_dimension : None 
