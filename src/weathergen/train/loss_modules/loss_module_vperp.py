@@ -19,16 +19,21 @@ from weathergen.utils.train_logger import Stage
 _logger = logging.getLogger(__name__)
 
 
-class LossLatentCosineMatching(LossModuleBase):
+class LossLatentVPerpNorm(LossModuleBase):
     """
-    Band hinge on per-token cosine similarity between consecutive FE latent steps.
+    Penalises tokens where the FE output is parallel to prev_tokens (v_perp_norm ≈ 0).
 
-    Penalises tokens whose cosine similarity to the previous step falls outside
-    [cosine_low, cosine_high]. Both bounds are enforced as soft hinge losses so
-    the FE is free inside the sweet-spot and pays a quadratic penalty outside it.
+    When fe_enforce_cosine=True, model.forward() geometrically projects each FE
+    step to a fixed cosine angle. The projection uses v_perp — the component of
+    the FE output orthogonal to prev_tokens — as the rotation direction. If
+    v_perp ≈ 0 the FE is not providing a useful rotation direction and the
+    enforcement has nothing to work with.
 
-    cos_sim_to_prev is computed in model.forward() per patch token and stored in
-    output.latent[step]["cos_sim_to_prev"] — no target calculator needed.
+    Hinge loss: relu(v_perp_min - v_perp_norm)^2 per token, averaged over tokens
+    and steps. Zero when v_perp_norm >= v_perp_min, quadratic below.
+
+    v_perp_norm is stored in output.latent[step]["v_perp_norm"] by model.forward()
+    only when fe_enforce_cosine=True — this loss is a no-op otherwise.
     """
 
     def __init__(self, cf: DictConfig, mode_cfg: DictConfig, stage: Stage, device: str, **loss_fcts):
@@ -36,26 +41,22 @@ class LossLatentCosineMatching(LossModuleBase):
         self.cf = cf
         self.stage = stage
         self.device = device
-        self.name = "LossLatentCosineMatching"
+        self.name = "LossLatentVPerpNorm"
 
         params = next(iter(loss_fcts.values()), {}) if loss_fcts else {}
-        self.cosine_low = params.get("cosine_low", 0.68)
-        self.cosine_high = params.get("cosine_high", 0.78)
+        self.v_perp_min = float(params.get("v_perp_min", 0.1))
 
     def compute_loss(self, preds, targets, metadata, **kwargs) -> LossValues:
         acc_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         count = 0
 
         for step_pred in preds.latent:
-            cos_sim = step_pred.get("cos_sim_to_prev", None)
-            if cos_sim is None:
+            v_perp_norm = step_pred.get("v_perp_norm", None)
+            if v_perp_norm is None:
                 continue
-            step_loss = (
-                F.relu(cos_sim - self.cosine_high) ** 2
-                + F.relu(self.cosine_low - cos_sim) ** 2
-            ).mean()
+            step_loss = F.relu(self.v_perp_min - v_perp_norm).pow(2).mean()
             acc_loss = acc_loss + step_loss
             count += 1
 
         loss = acc_loss / count if count > 0 else acc_loss
-        return LossValues(loss=loss, losses_all={"cosine_band": loss.detach().item()}, stddev_all={})
+        return LossValues(loss=loss, losses_all={"v_perp_norm": loss.detach().item()}, stddev_all={})
