@@ -1,0 +1,22 @@
+train : 
+  plot :
+    pd0k6v35:
+      slurm_id: 0
+      description: "cosine loss + absolute_time_condition"
+      eval: vgbndhco
+    v05los3n:
+      slurm_id: 0
+      description: "cosine loss + absolute_time_condition_normalized"
+      eval: vgbndhco
+    len6k4c9:
+      slurm_id: 0
+      description: "cosine loss + cos_sine_time_condition_normalized"
+      eval: vgbndhco
+    kp98voer:
+      slurm_id: 0
+      description: "cosine loss + fourier_time_condition_normalized"
+      eval: vgbndhco
+    hn3v2uk6:
+      slurm_id: 0
+      description: "cosine loss (lr constant) "
+      eval: vgbndhco
