@@ -1,10 +1,14 @@
 train : 
   plot :
+    hn3v2uk6:
+      slurm_id: 0
+      description: "cosine loss (lr constant) "
+      eval: vgbndhco
     iiw09hvy:
       slurm_id: 0
       description: "Geom enforce"
       eval: vgbndhco
-    hn3v2uk6:
+    hh1gz328:
       slurm_id: 0
-      description: "cosine loss (lr constant) "
+      description: "Geom enforce (Muon Optimizer)"
       eval: vgbndhco
