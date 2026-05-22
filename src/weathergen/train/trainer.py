@@ -37,6 +37,7 @@ from weathergen.model.utils import apply_fct_to_blocks, set_to_eval
 from weathergen.train.collapse_monitor import CollapseMonitor
 from weathergen.train.loss_calculator import LossCalculator
 from weathergen.train.lr_scheduler import LearningRateScheduler
+from weathergen.train.muon import Muon
 from weathergen.train.target_and_aux_utils import get_target_aux_calculator
 from weathergen.train.trainer_base import TrainerBase
 from weathergen.train.utils import (
@@ -333,13 +334,39 @@ class Trainer(TrainerBase):
         beta2 = 1.0 - kappa * (1.0 - self.training_cfg.optimizer.adamw.beta2)
         eps = self.training_cfg.optimizer.adamw.get("eps", 2e-08) / np.sqrt(kappa)
 
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.training_cfg.learning_rate_scheduling.lr_start,
-            weight_decay=self.training_cfg.optimizer.weight_decay,
-            betas=(beta1, beta2),
-            eps=eps,
-        )
+        optimizer_type = self.training_cfg.optimizer.get("type", "adamw")
+        self._muon_lr_scale = float(self.training_cfg.optimizer.get("muon_lr_scale", 1.0))
+        lr_start = self.training_cfg.learning_rate_scheduling.lr_start
+
+        if optimizer_type == "muon":
+            muon_params = [p for p in self.model.parameters() if p.ndim == 2]
+            adamw_params = [p for p in self.model.parameters() if p.ndim != 2]
+            self.optimizer = Muon(
+                muon_params=muon_params,
+                lr=lr_start * self._muon_lr_scale,
+                momentum=0.95,
+                ns_steps=5,
+                adamw_params=adamw_params,
+                adamw_lr=lr_start,
+                adamw_betas=(beta1, beta2),
+                adamw_eps=eps,
+                adamw_wd=self.training_cfg.optimizer.weight_decay,
+            )
+            self._use_muon = True
+            if is_root():
+                logger.info(
+                    f"Using Muon optimizer: {len(muon_params)} 2D params, "
+                    f"{len(adamw_params)} 1D params, muon_lr_scale={self._muon_lr_scale}"
+                )
+        else:
+            self.optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=lr_start,
+                weight_decay=self.training_cfg.optimizer.weight_decay,
+                betas=(beta1, beta2),
+                eps=eps,
+            )
+            self._use_muon = False
         self.grad_scaler = torch.amp.GradScaler("cuda")
 
         assert len(self.dataset) > 0, f"No data found in {self.dataset}"
@@ -516,6 +543,7 @@ class Trainer(TrainerBase):
 
             # update learning rate
             self.lr_scheduler.step()
+            self._apply_muon_lr_scale()
 
             batch_size_total = self.get_batch_size_total(self.batch_size_per_gpu)
             step = batch_size_total * self.cf.general.istep
@@ -672,6 +700,11 @@ class Trainer(TrainerBase):
             return cpu_state_dict
         else:
             return maybe_sharded_sd
+
+    def _apply_muon_lr_scale(self):
+        """After lr_scheduler updates all param groups, re-scale the Muon group's lr."""
+        if self._use_muon and self._muon_lr_scale != 1.0:
+            self.optimizer.param_groups[0]["lr"] *= self._muon_lr_scale
 
     def _get_full_optimizer_state_dict(self):
         is_rank_zero = is_root()
@@ -972,6 +1005,7 @@ class ProfilingTrainer(Trainer):
                 self.grad_scaler.update()
 
                 self.lr_scheduler.step()
+                self._apply_muon_lr_scale()
 
                 batch_size_total = self.get_batch_size_total(self.batch_size_per_gpu)
                 step = batch_size_total * self.cf.general.istep
