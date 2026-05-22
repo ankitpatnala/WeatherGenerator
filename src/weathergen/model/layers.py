@@ -93,3 +93,65 @@ class MLP(torch.nn.Module):
                 x = x + x_in.repeat([*[1 for _ in x.shape[:-1]], x.shape[-1] // x_in.shape[-1]])
 
         return x
+
+
+class SwiGLUCoordEmbed(torch.nn.Module):
+    """
+    3-layer SwiGLU coordinate embedding.
+
+    Each layer: SiLU(x @ W_gate) ⊙ (x @ W_val) → x @ W_proj
+    Layers 2-3 add a pre-norm residual so gradients flow cleanly.
+    Compared to a GELU-MLP, the multiplicative gate creates sharp
+    input-dependent boundaries — nearby coordinates diverge quickly
+    in embedding space even when their raw features are nearly identical.
+    """
+
+    def __init__(
+        self,
+        dim_in: int,
+        dim_out: int,
+        hidden_factor: int = 4,
+        norm_eps: float = 1e-5,
+        name: str | None = None,
+    ):
+        super().__init__()
+        if name is not None:
+            self.name = name
+
+        H = dim_out * hidden_factor
+        act = nn.SiLU
+
+        # layer 1: dim_in → dim_out  (no residual — dims differ)
+        self.norm1   = nn.LayerNorm(dim_in, eps=norm_eps)
+        self.gate1   = nn.Linear(dim_in, H, bias=False)
+        self.val1    = nn.Linear(dim_in, H, bias=False)
+        self.proj1   = nn.Linear(H, dim_out, bias=False)
+
+        # layer 2: dim_out → dim_out  (pre-norm + residual)
+        self.norm2   = nn.LayerNorm(dim_out, eps=norm_eps)
+        self.gate2   = nn.Linear(dim_out, H, bias=False)
+        self.val2    = nn.Linear(dim_out, H, bias=False)
+        self.proj2   = nn.Linear(H, dim_out, bias=False)
+
+        # layer 3: dim_out → dim_out  (pre-norm + residual)
+        self.norm3   = nn.LayerNorm(dim_out, eps=norm_eps)
+        self.gate3   = nn.Linear(dim_out, H, bias=False)
+        self.val3    = nn.Linear(dim_out, H, bias=False)
+        self.proj3   = nn.Linear(H, dim_out, bias=False)
+
+        self.act = act()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # layer 1
+        h = self.norm1(x)
+        x = self.proj1(self.act(self.gate1(h)) * self.val1(h))
+
+        # layer 2 (residual)
+        h = self.norm2(x)
+        x = x + self.proj2(self.act(self.gate2(h)) * self.val2(h))
+
+        # layer 3 (residual)
+        h = self.norm3(x)
+        x = x + self.proj3(self.act(self.gate3(h)) * self.val3(h))
+
+        return x

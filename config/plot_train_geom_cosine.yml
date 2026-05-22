@@ -12,3 +12,7 @@ train :
       slurm_id: 0
       description: "Geom enforce (Muon Optimizer)"
       eval: vgbndhco
+    hvqa3x2g:
+      slurm_id: 0
+      description: "Geom enforce (Muon Optimizer) + target_encoding(fourier)"
+      eval: vgbndhco

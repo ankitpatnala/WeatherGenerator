@@ -555,10 +555,10 @@ def get_target_coords_fourier(
 
     # (lat, lon) → unit 3-vector on the sphere
     thetas, phis = theta_phi_to_standard_coords(coords)
-    sin_t = torch.tensor(np.sin(thetas), dtype=torch.float32)
-    cos_t = torch.tensor(np.cos(thetas), dtype=torch.float32)
-    sin_p = torch.tensor(np.sin(phis),   dtype=torch.float32)
-    cos_p = torch.tensor(np.cos(phis),   dtype=torch.float32)
+    thetas = thetas.float() if isinstance(thetas, torch.Tensor) else torch.tensor(thetas, dtype=torch.float32)
+    phis = phis.float() if isinstance(phis, torch.Tensor) else torch.tensor(phis, dtype=torch.float32)
+    sin_t, cos_t = torch.sin(thetas), torch.cos(thetas)
+    sin_p, cos_p = torch.sin(phis), torch.cos(phis)
     xyz = torch.stack([sin_t * cos_p, sin_t * sin_p, cos_t], dim=-1)  # [N, 3]
 
     # multi-frequency encoding → [N, 6*F]

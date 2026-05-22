@@ -38,7 +38,7 @@ from weathergen.model.engines import (
     TargetPredictionEngine,
     TargetPredictionEngineClassic,
 )
-from weathergen.model.layers import MLP, NamedLinear
+from weathergen.model.layers import MLP, NamedLinear, SwiGLUCoordEmbed
 from weathergen.model.utils import get_num_parameters
 from weathergen.utils.distributed import is_root
 from weathergen.utils.utils import get_dtype, is_stream_forcing
@@ -450,6 +450,14 @@ class Model(torch.nn.Module):
                             hidden_factor=8,
                             with_residual=False,
                             dropout_rate=dropout_rate,
+                            norm_eps=self.cf.mlp_norm_eps,
+                            name=f"embed_target_coords_{stream_name}",
+                        )
+                    elif etc["net"] == "swiglu":
+                        self.embed_target_coords[stream_name] = SwiGLUCoordEmbed(
+                            dim_in=dim_coord_in,
+                            dim_out=dims_embed[0],
+                            hidden_factor=etc.get("hidden_factor", 4),
                             norm_eps=self.cf.mlp_norm_eps,
                             name=f"embed_target_coords_{stream_name}",
                         )
