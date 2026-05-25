@@ -1,0 +1,18 @@
+train : 
+  plot :
+    aev85iny:
+      slurm_id: 0
+      description: "atmofs02 release model "
+      eval: vgbndhco
+    nc7ygqdk:
+      slurm_id: 0
+      description: "cosine loss (lr constant) "
+      eval: vgbndhco
+    pirmy5jp:
+      slurm_id: 0
+      description: "geom enforce"
+      eval: vgbndhco
+    gks16u84:
+      slurm_id: 0
+      description: "geom enforce muon"
+      eval: vgbndhco

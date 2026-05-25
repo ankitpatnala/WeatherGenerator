@@ -704,7 +704,11 @@ class Trainer(TrainerBase):
     def _apply_muon_lr_scale(self):
         """After lr_scheduler updates all param groups, re-scale the Muon group's lr."""
         if self._use_muon and self._muon_lr_scale != 1.0:
-            self.optimizer.param_groups[0]["lr"] = self.lr_scheduler.get_lr() * self._muon_lr_scale
+            # Read base lr from the AdamW group (index 1). Multiplicative schedulers
+            # (LinearLR cooldown) read group["lr"] and multiply — using the Muon group
+            # would compound the 70x scale each step, causing exponential blow-up.
+            base_lr = self.optimizer.param_groups[1]["lr"]
+            self.optimizer.param_groups[0]["lr"] = base_lr * self._muon_lr_scale
 
     def _get_full_optimizer_state_dict(self):
         is_rank_zero = is_root()
