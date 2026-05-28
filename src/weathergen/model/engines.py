@@ -12,6 +12,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 from torch.utils.checkpoint import checkpoint
 
@@ -537,7 +538,7 @@ class IdentityEngine(torch.nn.Module):
         self.fe_blocks = torch.nn.ModuleList()
 
     def forward(self, tokens, *args, **kwargs):
-        return tokens
+        return tokens, None
 
 
 class ForecastingEngine(torch.nn.Module):
@@ -553,6 +554,7 @@ class ForecastingEngine(torch.nn.Module):
         super(ForecastingEngine, self).__init__()
         self.cf = cf
         self.num_healpix_cells = num_healpix_cells
+        self.num_aux_tokens = cf.num_register_tokens + cf.num_class_tokens
         self.fe_blocks = torch.nn.ModuleList()
 
         global_rate = int(1 / self.cf.forecast_att_dense_rate)
@@ -620,7 +622,42 @@ class ForecastingEngine(torch.nn.Module):
         for block in self.fe_blocks:
             block.apply(init_weights_final)
 
-    def forward(self, tokens, fstep, coords=None):
+    def enforce_cosine_step(
+        self, tokens: torch.Tensor, prev_tokens: torch.Tensor, cos_target: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Geometrically project FE output so that each patch token has exactly
+        cos_target cosine similarity with the corresponding prev token.
+
+            z_out = ||z_prev|| * (cos_target * u  +  sin_target * v_perp_hat)
+
+        Returns
+        -------
+        tokens_out : enforced tokens
+        v_perp_norm : [B*S] per-token norm of the orthogonal component (before
+                      normalisation). Near-zero values mean the FE output was
+                      parallel to prev — used to compute the v_perp penalty loss.
+        """
+        n = self.num_aux_tokens
+        patch     = tokens[:, n:]       # [B, S, D]
+        patch_prv = prev_tokens[:, n:]  # [B, S, D]
+
+        magnitude  = patch_prv.norm(dim=-1, keepdim=True)    # [B, S, 1]
+        u          = F.normalize(patch_prv, dim=-1)           # [B, S, D]
+        v          = F.normalize(patch,     dim=-1)           # [B, S, D]
+
+        v_par      = (v * u).sum(dim=-1, keepdim=True) * u   # parallel component
+        v_perp     = v - v_par                                # orthogonal component
+        v_perp_norm = v_perp.norm(dim=-1)                     # [B, S]  — the signal for penalty
+
+        v_perp_hat = F.normalize(v_perp, dim=-1)              # unit orthogonal (≈0 when FE ∥ prev)
+        sin_target = (1.0 - cos_target ** 2) ** 0.5
+        patch_out  = magnitude * (cos_target * u + sin_target * v_perp_hat)
+
+        tokens_out = torch.cat([tokens[:, :n], patch_out], dim=1)
+        return tokens_out, v_perp_norm.reshape(-1)            # flatten to [B*S]
+
+    def forward(self, tokens, fstep, coords=None, prev_tokens=None):
         if self.training:
             # Impute noise to the latent state
             noise_std = self.cf.get("fe_impute_latent_noise_std", 0.0)
@@ -633,7 +670,13 @@ class ForecastingEngine(torch.nn.Module):
                 tokens = checkpoint(block, tokens, use_reentrant=False)
             else:
                 tokens = checkpoint(block, tokens, coords, aux_info, use_reentrant=False)
-        return tokens
+
+        v_perp_norm = None
+        if prev_tokens is not None and self.cf.get("fe_enforce_cosine", False):
+            cos_target = float(self.cf.get("fe_enforce_cosine_target", 0.75))
+            tokens, v_perp_norm = self.enforce_cosine_step(tokens, prev_tokens, cos_target)
+
+        return tokens, v_perp_norm
 
 
 class EnsPredictionHead(torch.nn.Module):

@@ -209,6 +209,8 @@ _build/
 ~*
 *.sync
 _version.py
+*.png
+*.csv
 
 # development directories
 outputs/
@@ -229,3 +231,6 @@ models
 results
 reports
 profiler_logs
+bias_maps_sample_parallel
+latents_2
+

@@ -18,7 +18,6 @@ import astropy_healpix.healpy
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from weathergen.common.config import Config
@@ -719,9 +718,6 @@ class Model(torch.nn.Module):
 
         # Allow for pushforward trick
         p_fwd = self.cf.training_config.get("forecast", {}).get("pushforward", False)
-        # roll-out in latent space, iterate and generate output over requested output steps
-        enforce_cosine = self.cf.get("fe_enforce_cosine", False)
-        cos_target     = float(self.cf.get("fe_enforce_cosine_target", 0.75))
 
         prev_tokens = tokens
         for step in batch.get_output_idxs():
@@ -729,15 +725,12 @@ class Model(torch.nn.Module):
             if without_grad:
                 # Pushforward mode: advance tokens without grad
                 prev_tokens = tokens
-                tokens = self.forecast_engine(tokens, step, model_params.rope_coords)
-                if enforce_cosine:
-                    tokens, _ = self._enforce_cosine_step(tokens, prev_tokens, cos_target)
+                tokens, _ = self.forecast_engine(tokens, step, model_params.rope_coords, prev_tokens=prev_tokens)
                 continue
 
             prev_tokens = tokens
-            tokens = self.forecast_engine(tokens, step, model_params.rope_coords)
-            if enforce_cosine:
-                tokens, v_perp_norm = self._enforce_cosine_step(tokens, prev_tokens, cos_target)
+            tokens, v_perp_norm = self.forecast_engine(tokens, step, model_params.rope_coords, prev_tokens=prev_tokens)
+            if v_perp_norm is not None:
                 output.add_latent_prediction(step, "v_perp_norm", v_perp_norm)
 
             # per-token cosine similarity between current and previous patch tokens
@@ -752,41 +745,6 @@ class Model(torch.nn.Module):
             output = self.predict_latent(model_params, step, tokens, batch, output)
 
         return output
-
-    def _enforce_cosine_step(
-        self, tokens: torch.Tensor, prev_tokens: torch.Tensor, cos_target: float
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Geometrically project FE output so that each patch token has exactly
-        cos_target cosine similarity with the corresponding prev token.
-
-            z_out = ||z_prev|| * (cos_target * u  +  sin_target * v_perp_hat)
-
-        Returns
-        -------
-        tokens_out : enforced tokens
-        v_perp_norm : [B*S] per-token norm of the orthogonal component (before
-                      normalisation). Near-zero values mean the FE output was
-                      parallel to prev — used to compute the v_perp penalty loss.
-        """
-        n = self.num_aux_tokens
-        patch     = tokens[:, n:]       # [B, S, D]
-        patch_prv = prev_tokens[:, n:]  # [B, S, D]
-
-        magnitude  = patch_prv.norm(dim=-1, keepdim=True)    # [B, S, 1]
-        u          = F.normalize(patch_prv, dim=-1)           # [B, S, D]
-        v          = F.normalize(patch,     dim=-1)           # [B, S, D]
-
-        v_par      = (v * u).sum(dim=-1, keepdim=True) * u   # parallel component
-        v_perp     = v - v_par                                # orthogonal component
-        v_perp_norm = v_perp.norm(dim=-1)                     # [B, S]  — the signal for penalty
-
-        v_perp_hat = F.normalize(v_perp, dim=-1)              # unit orthogonal (≈0 when FE ∥ prev)
-        sin_target = (1.0 - cos_target ** 2) ** 0.5
-        patch_out  = magnitude * (cos_target * u + sin_target * v_perp_hat)
-
-        tokens_out = torch.cat([tokens[:, :n], patch_out], dim=1)
-        return tokens_out, v_perp_norm.reshape(-1)            # flatten to [B*S]
 
     def predict_latent(
         self,
