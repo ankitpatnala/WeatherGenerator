@@ -1,0 +1,41 @@
+global_plotting_options:
+  regions: ["global"]
+  # ERA5:
+  #   use_datashader: true
+
+evaluation:
+  metrics  : ["acc", "froct", "rmse"]
+  regions: ["global"]
+  summary_plots : true
+  ratio_plots : false
+  heat_maps : false
+  summary_dir: "./plots_ankit/"
+  plot_ensemble: false #supported: false, "std", "minmax", "members"
+  plot_score_maps: false #plot scores on a 2D maps. it slows down score computation 
+  print_summary: false #print out score values on screen. it can be verbose
+  log_scale: false
+  add_grid: false
+  score_cards: false
+  bar_plots: false
+
+default_streams:
+  ERA5:
+    channels: ["2t", "q_850"]
+    evaluation:
+      forecast_step: "all"
+      sample: "all"
+      ensemble: "all" #supported: "all", "mean", [0,1,2]
+    plotting:
+      sample: [0]
+      forecast_step: "all" #supported: "all", [1,2,3,...], "1-50" (equivalent of [1,2,3,...50])
+      ensemble: "all" #supported: "all", "mean", [0,1,2]
+      plot_maps: true
+      plot_target: false
+      plot_histograms: false
+      plot_animations: true
+
+run_ids :
+  m5m1cwkz:
+    label: "ERA5 (geom_cosine)"  
+  t7ri3fq0:
+    label: "ERA5 (geom_cosine) Muon Optimizer"  
