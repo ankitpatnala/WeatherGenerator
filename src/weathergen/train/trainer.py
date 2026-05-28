@@ -10,12 +10,8 @@
 # nor does it submit to any jurisdiction.
 import copy
 import logging
-import platform
 import time
-from contextlib import nullcontext
-from functools import partial
-from itertools import islice
-from math import sqrt
+import os
 
 import numpy as np
 import torch
@@ -24,21 +20,18 @@ from omegaconf import OmegaConf
 
 # FSDP2
 from torch.distributed.tensor import DTensor
-from torch.profiler import ProfilerActivity, profile
 
 import weathergen.common.config as config
 from weathergen.common.config import Config
 from weathergen.datasets.multi_stream_data_sampler import MultiStreamDataSampler
 from weathergen.model.ema import EMAModel
 from weathergen.model.model_interface import (
+    get_target_aux_calculator,
     init_model_and_shard,
 )
 from weathergen.model.utils import apply_fct_to_blocks, set_to_eval
-from weathergen.train.collapse_monitor import CollapseMonitor
 from weathergen.train.loss_calculator import LossCalculator
 from weathergen.train.lr_scheduler import LearningRateScheduler
-from weathergen.train.muon import Muon
-from weathergen.train.target_and_aux_utils import get_target_aux_calculator
 from weathergen.train.trainer_base import TrainerBase
 from weathergen.train.utils import (
     TRAIN,
@@ -52,26 +45,20 @@ from weathergen.train.utils import (
     get_target_idxs_from_cfg,
 )
 from weathergen.utils.distributed import is_root
-from weathergen.utils.performance import NullThroughputTracker, ThroughputTracker
-from weathergen.utils.profiling import (
-    export_memory_snapshot,
-    start_record_memory_history,
-    stop_record_memory_history,
-    trace_handler,
-    wrap_module_forward_with_profiling,
-)
 from weathergen.utils.train_logger import TrainLogger, prepare_losses_for_logging
 from weathergen.utils.utils import get_dtype
 from weathergen.utils.validation_io import write_output
 
 logger = logging.getLogger(__name__)
 
+# cfg_keys_to_filter = ["losses", "model_input", "target_input"]
+
 
 class Trainer(TrainerBase):
-    def __init__(self, train_logging: Config):
+    def __init__(self, train_log_freq: Config):
         TrainerBase.__init__(self)
 
-        self.train_logging = train_logging
+        self.train_log_freq = train_log_freq
 
         self.data_loader: torch.utils.data.DataLoader | None = None
         self.data_loader_validation: torch.utils.data.DataLoader | None = None
@@ -95,8 +82,6 @@ class Trainer(TrainerBase):
         self.batch_size_per_gpu = -1
         self.batch_size_validation_per_gpu = -1
         self.batch_size_test_per_gpu = -1
-        self.collapse_monitor: CollapseMonitor | None = None
-        self.perf_tracker: ThroughputTracker | NullThroughputTracker = NullThroughputTracker()
 
     def get_batch_size_total(self, batch_size_per_gpu) -> int:
         """
@@ -159,24 +144,14 @@ class Trainer(TrainerBase):
         self.world_size_original = cf.get("world_size_original", cf.get("world_size", None))
         cf.world_size_original = self.world_size_original
 
-        self.log_grad_norms = cf.train_logging.get("log_grad_norms", False)
+        self.log_grad_norms = self.training_cfg.optimizer.get("log_grad_norms", False)
+
         # create output directory
         if is_root():
             config.get_path_run(cf).mkdir(exist_ok=True, parents=True)
             config.get_path_model(cf).mkdir(exist_ok=True, parents=True)
 
         self.train_logger = TrainLogger(cf, config.get_path_run(self.cf))
-
-        # Initialize collapse monitor for SSL training
-        collapse_config = cf.train_logging.get("collapse_monitoring", {})
-        self.collapse_monitor = CollapseMonitor(collapse_config, None)  # device set later in run()
-
-        if cf.train_logging.get("track_performance_metrics"):
-            self.perf_tracker = ThroughputTracker(
-                device=torch.device(self.devices[0]),
-                warmup_steps=cf.train_logging.get("performance_tracking_warmup_steps", 2),
-                batch_size_per_gpu=self.batch_size_per_gpu,
-            )
 
     def get_target_aux_calculators(self, mode_cfg):
         """
@@ -186,6 +161,8 @@ class Trainer(TrainerBase):
         batch_size = get_batch_size_from_config(mode_cfg)
 
         # get target_aux calculators for different loss terms
+        # del self.cf.training_config.losses["student-teacher"]["loss_fcts"]["JEPA"]
+        # del mode_cfg.losses["student-teacher"]["loss_fcts"]["JEPA"]
         target_and_aux_calculators = {}
         for loss_name, loss_cfg in mode_cfg.losses.items():
             target_and_aux_calculators[loss_name] = get_target_aux_calculator(
@@ -219,8 +196,6 @@ class Trainer(TrainerBase):
             "batch_sampler": None,
             "shuffle": False,
             "num_workers": loader_num_workers,
-            "pin_memory": cf.data_loading.get("memory_pinning", False),
-            "persistent_workers": cf.data_loading.get("persistent_workers", False),
         }
         self.data_loader_validation = torch.utils.data.DataLoader(
             self.dataset, **loader_params, sampler=None
@@ -258,9 +233,6 @@ class Trainer(TrainerBase):
 
         device_type = torch.accelerator.current_accelerator()
         self.device = torch.device(f"{device_type}:{cf.local_rank}")
-
-        # Update collapse monitor device
-        self.collapse_monitor.device = self.device
 
         # create data loaders
         self.dataset = MultiStreamDataSampler(cf, self.training_cfg, stage=TRAIN)
@@ -334,39 +306,13 @@ class Trainer(TrainerBase):
         beta2 = 1.0 - kappa * (1.0 - self.training_cfg.optimizer.adamw.beta2)
         eps = self.training_cfg.optimizer.adamw.get("eps", 2e-08) / np.sqrt(kappa)
 
-        optimizer_type = self.training_cfg.optimizer.get("type", "adamw")
-        self._muon_lr_scale = float(self.training_cfg.optimizer.get("muon_lr_scale", 1.0))
-        lr_start = self.training_cfg.learning_rate_scheduling.lr_start
-
-        if optimizer_type == "muon":
-            muon_params = [p for p in self.model.parameters() if p.ndim == 2]
-            adamw_params = [p for p in self.model.parameters() if p.ndim != 2]
-            self.optimizer = Muon(
-                muon_params=muon_params,
-                lr=lr_start * self._muon_lr_scale,
-                momentum=0.95,
-                ns_steps=5,
-                adamw_params=adamw_params,
-                adamw_lr=lr_start,
-                adamw_betas=(beta1, beta2),
-                adamw_eps=eps,
-                adamw_wd=self.training_cfg.optimizer.weight_decay,
-            )
-            self._use_muon = True
-            if is_root():
-                logger.info(
-                    f"Using Muon optimizer: {len(muon_params)} 2D params, "
-                    f"{len(adamw_params)} 1D params, muon_lr_scale={self._muon_lr_scale}"
-                )
-        else:
-            self.optimizer = torch.optim.AdamW(
-                self.model.parameters(),
-                lr=lr_start,
-                weight_decay=self.training_cfg.optimizer.weight_decay,
-                betas=(beta1, beta2),
-                eps=eps,
-            )
-            self._use_muon = False
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=self.training_cfg.learning_rate_scheduling.lr_start,
+            weight_decay=self.training_cfg.optimizer.weight_decay,
+            betas=(beta1, beta2),
+            eps=eps,
+        )
         self.grad_scaler = torch.amp.GradScaler("cuda")
 
         assert len(self.dataset) > 0, f"No data found in {self.dataset}"
@@ -412,15 +358,14 @@ class Trainer(TrainerBase):
         if is_root():
             config.save(self.cf, None)
             logger.info(config.format_cf(self.cf))
-        self._training_loop(mini_epoch_base)
 
-    def _training_loop(self, mini_epoch_base: int):
         # run validation before training if requested
         self.validate_before_training()
 
+        # training loop
+
         for mini_epoch in range(mini_epoch_base, self.training_cfg.num_mini_epochs):
             logger.info(f"Mini_epoch {mini_epoch} of {self.training_cfg.num_mini_epochs}: train.")
-
             self.train(mini_epoch)
 
             logger.info(
@@ -432,6 +377,9 @@ class Trainer(TrainerBase):
                 f"Mini_epoch {mini_epoch} of {self.training_cfg.num_mini_epochs}: save_model."
             )
             self.save_model(mini_epoch)
+
+        # log final model
+        self.save_model(self.training_cfg.num_mini_epochs)
 
     def validate_before_training(self):
         """
@@ -532,9 +480,9 @@ class Trainer(TrainerBase):
 
             # log gradient norms
             if self.log_grad_norms:
-                if bidx % self.train_logging.terminal == 0:
+                if bidx % self.train_log_freq.terminal == 0:
                     self.last_grad_norm = self._get_tensor_item(total_norm)
-                if bidx % self.train_logging.metrics == 0:
+                if bidx % self.train_log_freq.metrics == 0:
                     self._log_instant_grad_norms(TRAIN)
 
             # optimizer step
@@ -543,7 +491,6 @@ class Trainer(TrainerBase):
 
             # update learning rate
             self.lr_scheduler.step()
-            self._apply_muon_lr_scale()
 
             batch_size_total = self.get_batch_size_total(self.batch_size_per_gpu)
             step = batch_size_total * self.cf.general.istep
@@ -561,37 +508,91 @@ class Trainer(TrainerBase):
             if self.validate_with_ema:
                 self.ema_model.update(self.cf.general.istep * batch_size_total, batch_size_total)
 
-            self.perf_tracker.step(
-                batch,
-                self.cf.general.istep,
-                log_fn=lambda m: self.train_logger.log_metrics(
-                    TRAIN, m, step=self.cf.general.istep
-                ),
-            )
-            # Compute collapse monitoring metrics
-            if self.collapse_monitor.should_compute(self.cf.general.istep):
-                self.collapse_monitor._compute_collapse_metrics(
-                    self.cf,
-                    batch_size_total,
-                    self.target_and_aux_calculators,
-                    preds,
-                    targets_and_auxs,
-                )
-
             self._log_terminal(bidx, mini_epoch, TRAIN)
-            if bidx % self.train_logging.metrics == 0:
+            if bidx % self.train_log_freq.metrics == 0:
                 self._log(TRAIN)
-                # Log collapse metrics
-                if self.collapse_monitor.should_log(self.cf.general.istep):
-                    self._log_collapse_metrics(TRAIN)
 
             # save model checkpoint (with designation _latest)
-            if bidx % self.train_logging.checkpoint == 0 and bidx > 0:
+            if bidx % self.train_log_freq.checkpoint == 0 and bidx > 0:
                 self.save_model(-1)
 
             self.cf.general.istep += 1
 
         self.dataset.advance()
+    
+    def validate_latents(self, mini_epoch, mode_cfg, batch_size):
+        """
+        Perform validation / test computation as specified by mode_cfg
+        """
+
+        cf = self.cf
+        self.model.eval()
+
+        dataset_val_iter = iter(self.data_loader_validation)
+
+        num_samples_write = mode_cfg.get("output", {}).get("num_samples", 0) * batch_size
+
+        with torch.no_grad():
+            # print progress bar but only in interactive mode, i.e. when without ddp
+            with tqdm.tqdm(total=mode_cfg.samples_per_mini_epoch, disable=self.cf.with_ddp) as pbar:
+                for bidx, batch in enumerate(dataset_val_iter):
+                    if cf.data_loading.get("memory_pinning", False):
+                        # pin memory for faster CPU-GPU transfer
+                        batch = batch.pin_memory()
+
+                    batch.to_device(self.device)
+                    os.makedirs(f"latent_{cf.general.run_id}", exist_ok=True)
+
+                    # evaluate model
+                    with torch.autocast(
+                        device_type=f"cuda:{cf.local_rank}",
+                        dtype=self.mixed_precision_dtype,
+                        enabled=cf.with_mixed_precision,
+                    ):
+                        tokens_list = []
+                        if self.ema_model is None:
+                            tokens, output  = self.model.forward_latent(
+                                self.model_params,
+                                batch.get_source_samples(),
+                            )
+                        else:
+                            preds = self.ema_model.forward_eval(
+                                self.model_params,
+                                batch.get_source_samples(),
+                            )
+
+                        tokens_list.append(tokens)
+
+                        forecast_min = mode_cfg.forecast.offset
+                        forecast_max = mode_cfg.forecast.offset
+
+                        forecast_chunk_size = cf.training_config.forecast.forecast_chunk_size
+                        chunk_num = 0
+                        for step in batch.get_source_samples().get_output_idxs():
+                            if self.model.forecast_engine:
+                                tokens = self.model.forecast_engine(tokens, step, coords=self.model_params.rope_coords)
+                                tokens_list.append(tokens)
+                            forecast_max +=1
+                            is_chunk_completed = (forecast_max-forecast_min) % forecast_chunk_size  == 0  
+                            is_last_step = forecast_max == len(batch.get_source_samples().get_output_idxs())
+                            if is_chunk_completed or is_last_step:
+                                torch.save(torch.concatenate(tokens_list), f"latent_{cf.general.run_id}/{chunk_num}.pt")
+                                print(f"-----------done with writing------------------")
+                                chunk_num+=1
+                                forecast_min = forecast_max
+                                tokens_list = []
+                                output.empty_physical_prediction(len(output.physical))
+                                output.empty_latent_prediction(len(output.physical))
+
+                                if (bidx * batch_size) > mode_cfg.samples_per_mini_epoch:
+                                    break
+
+                self._log_terminal(0, mini_epoch, VAL)
+                self._log(VAL)
+
+        # avoid that there is a systematic bias in the validation subset
+        self.dataset_val.advance()
+
 
     def validate(self, mini_epoch, mode_cfg, batch_size):
         """
@@ -607,9 +608,7 @@ class Trainer(TrainerBase):
 
         with torch.no_grad():
             # print progress bar but only in interactive mode, i.e. when without ddp
-            with tqdm.tqdm(
-                total=len(self.data_loader_validation), disable=self.cf.with_ddp
-            ) as pbar:
+            with tqdm.tqdm(total=mode_cfg.samples_per_mini_epoch, disable=self.cf.with_ddp) as pbar:
                 for bidx, batch in enumerate(dataset_val_iter):
                     if cf.data_loading.get("memory_pinning", False):
                         # pin memory for faster CPU-GPU transfer
@@ -624,7 +623,7 @@ class Trainer(TrainerBase):
                         enabled=cf.with_mixed_precision,
                     ):
                         if self.ema_model is None:
-                            preds = self.model(
+                            tokens, output  = self.model.forward_latent(
                                 self.model_params,
                                 batch.get_source_samples(),
                             )
@@ -634,47 +633,69 @@ class Trainer(TrainerBase):
                                 batch.get_source_samples(),
                             )
 
-                        targets_and_auxs = {}
-                        for loss_name, target_aux in self.target_and_aux_calculators_val.items():
-                            target_idxs = get_target_idxs_from_cfg(mode_cfg, loss_name)
-                            targets_and_auxs[loss_name] = target_aux.compute(
-                                self.cf.general.istep,
-                                batch.get_target_samples(target_idxs),
-                                self.model_params,
-                                self.model,
-                            )
+                        forecast_min = mode_cfg.forecast.offset
+                        forecast_max = mode_cfg.forecast.offset
 
-                    _ = self.loss_calculator_val.compute_loss(
-                        preds=preds,
-                        targets_and_aux=targets_and_auxs,
-                        metadata=extract_batch_metadata(batch),
-                    )
+                        forecast_chunk_size = cf.training_config.forecast.forecast_chunk_size
+                        for step in batch.get_source_samples().get_output_idxs():
+                            if self.model.forecast_engine:
+                                tokens = self.model.forecast_engine(tokens, step, coords=self.model_params.rope_coords)
+                            output = self.model.predict_decoders(self.model_params, step, tokens, batch.get_source_samples(), output)
+                            output = self.model.predict_latent(self.model_params, step, tokens, batch.get_source_samples(), output)
+                            forecast_max +=1
+                            is_chunk_completed = (forecast_max-forecast_min) % forecast_chunk_size  == 0  
+                            is_last_step = forecast_max == len(batch.get_source_samples().get_output_idxs())
+                            if is_chunk_completed or is_last_step:
+                                targets_and_auxs = {}
+                                for loss_name, target_aux in self.target_and_aux_calculators_val.items():
+                                    target_idxs = get_target_idxs_from_cfg(mode_cfg, loss_name)
+                                    targets_and_auxs[loss_name] = target_aux.compute(
+                                        self.cf.general.istep,
+                                        batch.get_target_samples(target_idxs),
+                                        self.model_params,
+                                        self.model,
+                                        forecast_min=forecast_min,
+                                        forecast_max=forecast_max,
+                                    )
 
-                    # log output
-                    if bidx < num_samples_write:
-                        # denormalization function for data
-                        denormalize_data_fct = (
-                            (lambda x0, x1: x1)
-                            if mode_cfg.get("output", {}).get("normalized_samples", False)
-                            else self.dataset_val.denormalize_target_channels
-                        )
-                        # write output
-                        write_output(
-                            self.cf,
-                            mode_cfg,
-                            batch_size,
-                            mini_epoch,
-                            bidx,
-                            denormalize_data_fct,
-                            batch,
-                            preds,
-                            targets_and_auxs,
-                        )
+                                _ = self.loss_calculator_val.compute_loss(
+                                    preds=output,
+                                    targets_and_aux=targets_and_auxs,
+                                    metadata=extract_batch_metadata(batch),
+                                    forecast_min=forecast_min,
+                                    forecast_max=forecast_max
+                                )
 
-                    pbar.update(batch_size)
+                                ## log output
+                                num_samples = mode_cfg.get("write_num_samples", 0) * batch_size
+                                if bidx < num_samples_write:
+                                    denormalize_data_fct = (
+                                        (lambda x0, x1: x1)
+                                        if mode_cfg.get("output", {}).get("normalized_samples", False)
+                                        else self.dataset_val.denormalize_target_channels
+                                    )
 
-                    if (bidx * batch_size) > mode_cfg.samples_per_mini_epoch:
-                        break
+                                    write_output(
+                                        self.cf,
+                                        mode_cfg,
+                                        batch_size,
+                                        mini_epoch,
+                                        bidx,
+                                        denormalize_data_fct,
+                                        batch,
+                                        output,
+                                        targets_and_auxs,
+                                        forecast_min=forecast_min,
+                                        forecast_max=forecast_max
+                                    )
+                                print(f"-----------done with writing------------------")
+                                output.empty_physical_prediction(len(output.physical))
+                                output.empty_latent_prediction(len(output.physical))
+                                pbar.update(batch_size)
+                                forecast_min = forecast_max
+
+                                if (bidx * batch_size) > mode_cfg.samples_per_mini_epoch:
+                                    break
 
                 self._log_terminal(0, mini_epoch, VAL)
                 self._log(VAL)
@@ -689,10 +710,7 @@ class Trainer(TrainerBase):
         if self.cf.with_ddp and self.cf.with_fsdp:
             cpu_state_dict = {}
             for param_name, sharded_param in maybe_sharded_sd.items():
-                if isinstance(sharded_param, DTensor):
-                    full_param = sharded_param.full_tensor()
-                else:
-                    full_param = sharded_param
+                full_param = sharded_param.full_tensor()
                 if is_root():
                     cpu_state_dict[param_name] = full_param.cpu()
                 else:
@@ -700,15 +718,6 @@ class Trainer(TrainerBase):
             return cpu_state_dict
         else:
             return maybe_sharded_sd
-
-    def _apply_muon_lr_scale(self):
-        """After lr_scheduler updates all param groups, re-scale the Muon group's lr."""
-        if self._use_muon and self._muon_lr_scale != 1.0:
-            # Read base lr from the AdamW group (index 1). Multiplicative schedulers
-            # (LinearLR cooldown) read group["lr"] and multiply — using the Muon group
-            # would compound the 70x scale each step, causing exponential blow-up.
-            base_lr = self.optimizer.param_groups[1]["lr"]
-            self.optimizer.param_groups[0]["lr"] = base_lr * self._muon_lr_scale
 
     def _get_full_optimizer_state_dict(self):
         is_rank_zero = is_root()
@@ -823,15 +832,13 @@ class Trainer(TrainerBase):
         grad_norms = {"grad_norm.total": self.last_grad_norm}
         for name, param in self.model.named_parameters():
             if param.grad is not None:
-                grad_norms["grad_norm." + name] = self._get_tensor_item(
-                    param.grad.norm() / sqrt(param.numel())
-                )
+                grad_norms["grad_norm." + name] = self._get_tensor_item(param.grad.norm())
 
         if is_root():
             self.train_logger.log_metrics(stage, grad_norms)
 
     def _log_terminal(self, bidx: int, mini_epoch: int, stage: Stage):
-        print_freq = self.train_logging.terminal
+        print_freq = self.train_log_freq.terminal
         if bidx % print_freq == 0 and bidx > 0 or stage == VAL:
             # compute from last iteration
             loss_calculator = self.loss_calculator_val if stage == VAL else self.loss_calculator
@@ -871,232 +878,3 @@ class Trainer(TrainerBase):
                 logger.info("\n")
 
             self.t_start = time.time()
-
-
-class ProfilingTrainer(Trainer):
-    def init(self, cf, devices):
-        # create profiler trace directory
-        super().init(cf, devices)
-        if is_root():
-            config.get_path_profiler(self.cf).mkdir(exist_ok=True, parents=True)
-
-    def _training_loop(self, mini_epoch_base: int):
-        # run validation before training if requested
-        self.validate_before_training()
-
-        end = min(mini_epoch_base + 1, self.training_cfg.num_mini_epochs)
-        for mini_epoch in range(mini_epoch_base, end):
-            logger.info(f"Mini_epoch {mini_epoch} of {end}: train.")
-
-            self.train(mini_epoch)
-
-    def train(self, mini_epoch):
-        """
-        Profiling the training using torch profiler.
-        """
-
-        cf = self.cf
-        self.model.train()
-
-        apply_fct_to_blocks(self.model, cf.freeze_modules, set_to_eval)
-
-        dataset_iter = iter(self.data_loader)
-
-        self.optimizer.zero_grad()
-
-        # training loop
-        self.t_start = time.time()
-
-        wrap_module_forward_with_profiling(self.model, prefix="model")
-
-        max_profile_steps = (
-            cf.profiling.wait_iteration
-            + cf.profiling.warmup_iteration
-            + cf.profiling.active_iteration
-        ) * cf.profiling.repeat
-
-        handler = partial(trace_handler, cf)
-
-        # Detect ARM architecture (e.g., NVIDIA GH200 uses aarch64 CPU)
-        # PyTorch's memory timeline profiler (export_memory_timeline) internally requires
-        # with_stack=True, which relies on C++ stack unwinding (record_context_cpp).
-        # This is only supported on Linux x86_64 — on aarch64 it silently fails during
-        # profiler teardown, causing a "Python replay stack is empty" RuntimeError.
-        # Therefore, on aarch64 we disable with_stack and skip the memory timeline export.
-        # CUDA kernel profiling, FLOPS, shapes, and chrome traces are unaffected.
-        on_aarch64 = platform.machine() == "aarch64"
-
-        # Determine profiler setup
-        if is_root():
-            prof = profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=not on_aarch64,
-                with_modules=True,
-                with_flops=True,
-                schedule=torch.profiler.schedule(
-                    wait=cf.profiling.wait_iteration,
-                    warmup=cf.profiling.warmup_iteration,
-                    active=cf.profiling.active_iteration,
-                    repeat=cf.profiling.repeat,
-                ),
-                on_trace_ready=handler,
-            )
-        else:
-            prof = nullcontext()
-
-        if is_root():
-            # Start recording memory snapshot history
-            start_record_memory_history()
-
-        with prof:
-            for bidx, batch in enumerate(islice(dataset_iter, max_profile_steps)):
-                if cf.data_loading.get("memory_pinning", False):
-                    batch = batch.pin_memory()
-                batch.to_device(self.device)
-
-                with torch.autocast(
-                    device_type=f"cuda:{cf.local_rank}",
-                    dtype=self.mixed_precision_dtype,
-                    enabled=cf.with_mixed_precision,
-                ):
-                    preds = self.model(
-                        self.model_params,
-                        batch.get_source_samples(),
-                    )
-
-                    targets_and_auxs = {}
-                    for loss_name, target_aux in self.target_and_aux_calculators.items():
-                        target_idxs = get_target_idxs_from_cfg(self.training_cfg, loss_name)
-                        targets_and_auxs[loss_name] = target_aux.compute(
-                            self.cf.general.istep,
-                            batch.get_target_samples(target_idxs),
-                            self.model_params,
-                            self.model,
-                        )
-
-                loss = self.loss_calculator.compute_loss(
-                    preds=preds,
-                    targets_and_aux=targets_and_auxs,
-                    metadata=extract_batch_metadata(batch),
-                )
-
-                [
-                    target_aux.update_state_pre_backward(self.cf.general.istep, batch, self.model)
-                    for _, target_aux in self.target_and_aux_calculators.items()
-                ]
-                [
-                    target_aux.update_state_pre_backward(self.cf.general.istep, batch, self.model)
-                    for _, target_aux in self.target_and_aux_calculators_val.items()
-                ]
-
-                self.optimizer.zero_grad()
-                self.grad_scaler.scale(loss).backward()
-
-                self.grad_scaler.unscale_(self.optimizer)
-                total_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), max_norm=self.training_cfg.optimizer.grad_clip
-                )
-
-                if self.log_grad_norms:
-                    if bidx % self.train_logging.terminal == 0:
-                        self.last_grad_norm = self._get_tensor_item(total_norm)
-                    if bidx % self.train_logging.metrics == 0:
-                        self._log_instant_grad_norms(TRAIN)
-
-                self.grad_scaler.step(self.optimizer)
-                self.grad_scaler.update()
-
-                self.lr_scheduler.step()
-                self._apply_muon_lr_scale()
-
-                batch_size_total = self.get_batch_size_total(self.batch_size_per_gpu)
-                step = batch_size_total * self.cf.general.istep
-
-                [
-                    target_aux.update_state_post_opt_step(step, batch, self.model)
-                    for _, target_aux in self.target_and_aux_calculators.items()
-                ]
-                [
-                    target_aux.update_state_post_opt_step(step, batch, self.model)
-                    for _, target_aux in self.target_and_aux_calculators_val.items()
-                ]
-
-                if self.validate_with_ema:
-                    self.ema_model.update(
-                        self.cf.general.istep * batch_size_total, batch_size_total
-                    )
-
-                if bidx % self.train_logging.metrics == 0:
-                    self._log(TRAIN)
-
-                if bidx % self.train_logging.checkpoint == 0 and bidx > 0:
-                    self.save_model(-1)
-
-                self.cf.general.istep += 1
-
-                if hasattr(prof, "step"):
-                    prof.step()
-
-            # Print only on rank 0
-            if is_root() and hasattr(prof, "key_averages"):
-                logger.info("\n" + "=" * 80)
-                logger.info("PROFILING SUMMARY")
-                logger.info("=" * 80)
-
-                logger.info("\n--- Top Operations by FLOPs ---")
-                logger.info(
-                    prof.key_averages().table(
-                        sort_by="flops", row_limit=20, top_level_events_only=False
-                    )
-                )
-
-                logger.info("\n--- Operations Grouped by Module ---")
-                logger.info(
-                    prof.key_averages(group_by_stack_n=5).table(
-                        sort_by="cuda_time_total", row_limit=30
-                    )
-                )
-
-                logger.info("\n--- Memory Usage ---")
-                logger.info(
-                    prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=20)
-                )
-
-        if is_root():
-            # Create the memory snapshot file
-            export_memory_snapshot(cf)
-
-            # Stop recording memory snapshot history
-            stop_record_memory_history()
-
-        torch.distributed.barrier()
-
-        if is_root():
-            logger.info("Training loop profiling is complete.")
-            logger.info(
-                "The memory snapshot, memory usage distribution, and PyTorch profiler"
-                "trace can be found in the profiler_logs folder."
-            )
-
-        if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
-
-
-def _log_collapse_metrics(self, stage: Stage) -> None:
-    """
-    Log cached collapse monitoring metrics.
-    """
-    metrics = self.collapse_monitor.get_cached_metrics()
-    if metrics and is_root():
-        metrics["num_samples"] = self.cf.general.istep
-        self.train_logger.log_metrics(stage, metrics)
-
-
-def get_trainer(cf: Config) -> Trainer:
-    if cf.get("profiling", {}).get("enabled", False):
-        trainer = ProfilingTrainer(cf.train_logging)
-    else:
-        trainer = Trainer(cf.train_logging)
-    return trainer
