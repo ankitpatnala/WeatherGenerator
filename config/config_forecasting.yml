@@ -159,6 +159,8 @@ training_config:
     parallel_scaling_policy: "sqrt"
 
   optimizer:
+    type: "muon"         # "adamw" or "muon"
+    muon_lr_scale: 70.0   # Muon lr = base_lr * muon_lr_scale (only used when type=muon)
     grad_clip: 1.0
     weight_decay: 0.1
     log_grad_norms: False
