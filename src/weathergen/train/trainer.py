@@ -662,7 +662,9 @@ class Trainer(TrainerBase):
     def _apply_muon_lr_scale(self):
         """After lr_scheduler updates all param groups, re-scale the Muon group's lr."""
         if self._use_muon and self._muon_lr_scale != 1.0:
-            self.optimizer.param_groups[0]["lr"] *= self._muon_lr_scale
+            self.optimizer.param_groups[0]["lr"] = (
+                self.lr_scheduler.get_lr() * self._muon_lr_scale
+            )
 
     def _get_full_model_state_dict(self):
         maybe_sharded_sd = (
