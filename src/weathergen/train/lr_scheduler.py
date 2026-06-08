@@ -80,6 +80,7 @@ class LearningRateScheduler:
 
         self.lr_max_scaled = kappa * lr_cfg.lr_max
         lr_final_decay_scaled = kappa * lr_cfg.lr_final_decay
+        self.lr_final_scaled = kappa * lr_cfg.lr_final
 
         self.policy_warmup = lr_cfg.policy_warmup
         self.policy_decay = lr_cfg.policy_decay
@@ -149,16 +150,13 @@ class LearningRateScheduler:
             assert False, "Unsupported decay policy for learning rate scheduler"
 
         # cool down
+        # Linear cooldown is implemented manually (like sqrt/constant decay) to avoid
+        # LinearLR's multiplicative formula reading optimizer group['lr'], which breaks
+        # when an optimizer wrapper (e.g. Muon) re-scales group['lr'] after each step.
+        self.cooldown_lr_start = None  # captured at the decay→cooldown transition
 
         if self.policy_cooldown == "linear":
-            self.scheduler_cooldown = LinearLR(
-                optimizer,
-                start_factor=lr_cfg.lr_start / self.lr_max_scaled,
-                end_factor=lr_cfg.lr_final / lr_cfg.lr_final_decay
-                if lr_cfg.lr_final_decay > 0.0
-                else 0.0,
-                total_iters=self.n_steps_cooldown,
-            )
+            self.scheduler_cooldown = None  # handled manually in step()
         # TODO: this overwrites the cosine scheduler for warmup (seems there are some global vars )
         # elif policy_cooldown == 'cosine' :
         # self.scheduler_cooldown = torch.optim.lr_scheduler.OneCycleLR(
@@ -169,7 +167,8 @@ class LearningRateScheduler:
         # )
         else:
             if self.n_steps_cooldown > 0:
-                assert "Unsupported cooldown policy for learning rate scheduler"
+                assert False, "Unsupported cooldown policy for learning rate scheduler"
+            self.scheduler_cooldown = None
 
         # final setup
 
@@ -202,6 +201,7 @@ class LearningRateScheduler:
 
         end_decay = self.n_steps_warmup + self.n_steps_decay
         phase_decay = (self.i_step > self.n_steps_warmup) and (self.i_step <= end_decay)
+        phase_cooldown = self.i_step > end_decay
 
         if self.policy_decay == "sqrt" and phase_decay:
             self.lr = (
@@ -218,6 +218,12 @@ class LearningRateScheduler:
             if cur_lr < self.lr:
                 for g in self.optimizer.param_groups:
                     g["lr"] = self.lr
+        elif self.policy_cooldown == "linear" and phase_cooldown:
+            n = self.i_step - end_decay
+            frac = min(n / self.n_steps_cooldown, 1.0) if self.n_steps_cooldown > 0 else 1.0
+            self.lr = self.cooldown_lr_start + frac * (self.lr_final_scaled - self.cooldown_lr_start)
+            for g in self.optimizer.param_groups:
+                g["lr"] = self.lr
         else:
             self.cur_scheduler.step()
             self.lr = self.cur_scheduler.get_last_lr()[0]
@@ -225,12 +231,20 @@ class LearningRateScheduler:
         # switch scheduler when learning rate regime completed
         if self.i_step == self.n_steps_warmup:
             self.cur_scheduler = self.scheduler_decay
+            # Update base_lrs to current learning rates to avoid jumps when switching schedulers
+            if self.cur_scheduler is not None and hasattr(self.cur_scheduler, 'base_lrs'):
+                self.cur_scheduler.base_lrs = [g['lr'] for g in self.optimizer.param_groups]
             str = f"Switching lr scheduler to '{self.policy_decay}' at step = {self.i_step}."
             logging.getLogger("obslearn").info(str)
 
         # switch scheduler when learning rate completed
         if self.i_step == self.n_steps_warmup + self.n_steps_decay:
             self.cur_scheduler = self.scheduler_cooldown
+            # Update base_lrs to current learning rates to avoid jumps when switching schedulers
+            if self.cur_scheduler is not None and hasattr(self.cur_scheduler, 'base_lrs'):
+                self.cur_scheduler.base_lrs = [g['lr'] for g in self.optimizer.param_groups]
+            if self.policy_cooldown == "linear":
+                self.cooldown_lr_start = self.lr
             str = f"Switching lr scheduler to '{self.policy_cooldown}' at step = {self.i_step}."
             logging.getLogger("obslearn").info(str)
 
