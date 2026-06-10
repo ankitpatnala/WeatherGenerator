@@ -135,31 +135,28 @@ def locs_to_cell_coords(hl: int, locs: list, dx=0.5, dy=0.5) -> list:
 
 
 ####################################################################################################
-def locs_to_ctr_coords(ctrs_r3, locs: list[torch.Tensor]) -> list:
+def locs_to_ctr_coords(
+    ctrs_r3, locs: list[torch.Tensor], cell_indices: torch.Tensor | None = None
+) -> list:
     """
     Map a list of locations per cell to spherical local coordinates centered
     at the healpix cell center
     """
 
-    ctrs_rots = vecs_to_rots(ctrs_r3).to(torch.float32)
-
-    ## express each centroid in local coordinates w.r.t to healpix center
-    #  by rotating center to origin
-
-    # Concatenate all points into single tensor
     all_points = torch.cat(locs, dim=0)
-
     lengths = torch.tensor([len(s) for s in locs], device=all_points.device)
-    batch_indices = torch.repeat_interleave(
-        torch.arange(len(locs), device=all_points.device), lengths
-    )
 
-    point_rotations = ctrs_rots[batch_indices]
+    if cell_indices is not None:
+        # Per-point target cell indices: select the rotation for each point directly.
+        point_rotations = vecs_to_rots(ctrs_r3[cell_indices]).to(torch.float32)
+    else:
+        ctrs_rots = vecs_to_rots(ctrs_r3).to(torch.float32)
+        batch_indices = torch.repeat_interleave(
+            torch.arange(len(locs), device=all_points.device), lengths
+        )
+        point_rotations = ctrs_rots[batch_indices]
 
-    # Single vectorized batch matrix multiplication
     rotated_points = torch.bmm(point_rotations, all_points.unsqueeze(-1)).squeeze(-1)
-
-    # Split back using tensor operations
     local_locs = torch.split(rotated_points, lengths.tolist())
 
     return list(local_locs)
@@ -200,29 +197,27 @@ def healpix_verts_rots(hl: int, dx=0.5, dy=0.5):
 
 ####################################################################################################
 def locs_to_cell_coords_ctrs(
-    healpix_centers_rots: torch.Tensor, locs: list[torch.Tensor]
+    healpix_centers_rots: torch.Tensor,
+    locs: list[torch.Tensor],
+    cell_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Map a list of locations per cell to spherical local coordinates centered
     at the healpix cell center
     """
 
-    ## express each centroid in local coordinates w.r.t to healpix center
-    #  by rotating center to origin
-
-    # Concatenate all non-empty locations
     all_points = torch.cat(locs, dim=0)
-    lengths = torch.tensor([len(s) for s in locs], device=all_points.device)
 
-    # Efficiently create batch indices using torch.repeat_interleave
-    batch_indices = torch.repeat_interleave(
-        torch.arange(len(locs), device=all_points.device), lengths
-    )
+    if cell_indices is not None:
+        # Per-point target cell indices: select rotation for each point directly.
+        rotations_selected = healpix_centers_rots[cell_indices]
+    else:
+        lengths = torch.tensor([len(s) for s in locs], device=all_points.device)
+        batch_indices = torch.repeat_interleave(
+            torch.arange(len(locs), device=all_points.device), lengths
+        )
+        rotations_selected = healpix_centers_rots[batch_indices]
 
-    # Select rotation matrices for each point
-    rotations_selected = healpix_centers_rots[batch_indices]
-
-    # Vectorized matrix multiplication
     local_locs = torch.bmm(rotations_selected, all_points.unsqueeze(-1)).squeeze(-1)
 
     return local_locs

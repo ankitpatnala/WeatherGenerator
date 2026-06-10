@@ -24,12 +24,12 @@ class Tokenizer:
     Base class for tokenizers.
     """
 
-    def __init__(self, healpix_level: int):
+    def __init__(self, healpix_level: int, healpix_level_target: int | None = None):
         ref = torch.tensor([1.0, 0.0, 0.0])
 
         self.healpix_level = healpix_level
         self.hl_source = healpix_level
-        self.hl_target = healpix_level
+        self.hl_target = healpix_level_target if healpix_level_target is not None else healpix_level
 
         self.num_healpix_cells_source = 12 * 4**self.hl_source
         self.num_healpix_cells_target = 12 * 4**self.hl_target

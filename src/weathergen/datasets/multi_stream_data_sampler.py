@@ -91,6 +91,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.world_size = cf.world_size
 
         self.healpix_level: int = cf.healpix_level
+        self.healpix_level_target: int = cf.get("healpix_level_target", None) or cf.healpix_level
         self.num_healpix_cells: int = 12 * 4**self.healpix_level
 
         self.mode_cfg = mode_cfg
@@ -241,7 +242,11 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             else cf.data_loading.rng_seed * 97
         )
 
-        self.tokenizer = TokenizerMasking(cf.healpix_level, Masker(cf.healpix_level, stage))
+        self.tokenizer = TokenizerMasking(
+            cf.healpix_level,
+            Masker(cf.healpix_level, stage),
+            self.healpix_level_target if self.healpix_level_target != cf.healpix_level else None,
+        )
 
         self.mini_epoch = 0
 

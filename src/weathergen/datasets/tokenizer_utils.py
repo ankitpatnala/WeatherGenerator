@@ -436,13 +436,20 @@ def get_target_coords_local(
 
     # target_coords_lens = [len(t) for t in target_coords]
     # tcs, target_coords = tcs_optimized(target_coords)
-    target_coords = s2tor3(*theta_phi_to_standard_coords(coords))
+    thetas, phis = theta_phi_to_standard_coords(coords)
+    target_coords = s2tor3(thetas, phis)
     tcs = torch.split(target_coords, masked_points_per_cell.tolist())
 
     if target_coords.shape[0] == 0:
         return torch.tensor([])
     # target_geoinfos = torch.cat(target_geoinfos)
     # target_times = torch.cat(target_times)
+
+    # Per-point target cell indices: needed so verts_local and rotation lookups use the
+    # correct target-level cell when hl_source != hl_target.
+    target_cell_idxs = torch.from_numpy(
+        ang2pix(2**hlc, thetas.numpy(), phis.numpy(), nest=True)
+    ).long()
 
     verts00_rots, verts10_rots, verts11_rots, verts01_rots, vertsmm_rots = verts_rots
 
@@ -461,22 +468,12 @@ def get_target_coords_local(
 
     ref = torch.tensor([1.0, 0.0, 0.0])
 
-    tcs_lens = torch.tensor([tt.shape[0] for tt in tcs], dtype=torch.int32)
-    tcs_lens_mask = tcs_lens > 0
-    tcs_lens = tcs_lens[tcs_lens_mask]
-
-    vls = torch.cat(
-        [
-            vl.repeat([tt, 1, 1])
-            for tt, vl in zip(tcs_lens, verts_local[tcs_lens_mask], strict=False)
-        ],
-        0,
-    )
-    vls = vls.transpose(0, 1)
+    vls = verts_local[target_cell_idxs]  # [N, 5, 12]
+    vls = vls.transpose(0, 1)  # [5, N, 12]
 
     zi = 0
     a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + 3)] = ref - locs_to_cell_coords_ctrs(
-        verts00_rots, tcs
+        verts00_rots, tcs, cell_indices=target_cell_idxs
     )
 
     zi = 3
@@ -484,7 +481,7 @@ def get_target_coords_local(
 
     zi = 15
     a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + 3)] = ref - locs_to_cell_coords_ctrs(
-        verts10_rots, tcs
+        verts10_rots, tcs, cell_indices=target_cell_idxs
     )
 
     zi = 18
@@ -492,7 +489,7 @@ def get_target_coords_local(
 
     zi = 30
     a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + 3)] = ref - locs_to_cell_coords_ctrs(
-        verts11_rots, tcs
+        verts11_rots, tcs, cell_indices=target_cell_idxs
     )
 
     zi = 33
@@ -500,7 +497,7 @@ def get_target_coords_local(
 
     zi = 45
     a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + 3)] = ref - locs_to_cell_coords_ctrs(
-        verts01_rots, tcs
+        verts01_rots, tcs, cell_indices=target_cell_idxs
     )
 
     zi = 48
@@ -508,13 +505,15 @@ def get_target_coords_local(
 
     zi = 60
     a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + 3)] = ref - locs_to_cell_coords_ctrs(
-        vertsmm_rots, tcs
+        vertsmm_rots, tcs, cell_indices=target_cell_idxs
     )
 
     zi = 63
     a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + vls.shape[-1])] = vls[4]
 
-    tcs_ctrs = torch.cat([ref - torch.cat(locs_to_ctr_coords(c, tcs)) for c in nctrs], -1)
+    tcs_ctrs = torch.cat(
+        [ref - torch.cat(locs_to_ctr_coords(c, tcs, cell_indices=target_cell_idxs)) for c in nctrs], -1
+    )
     zi = 75
     a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + (3 * 8))] = tcs_ctrs
 
