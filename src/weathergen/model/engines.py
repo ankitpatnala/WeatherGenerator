@@ -29,7 +29,6 @@ from weathergen.model.embeddings import (
     StreamEmbedTransformer,
 )
 from weathergen.model.layers import MLP
-from weathergen.model.positional_encoding import get_rope_mode
 from weathergen.model.utils import ActivationFactory
 from weathergen.utils.utils import get_dtype
 
@@ -49,16 +48,15 @@ class EmbeddingEngine(torch.nn.Module):
         self.dtype = get_dtype(self.cf.mixed_precision_dtype)
         self.sources_size = sources_size  # KCT:iss130, what is this?
         self.embeds = torch.nn.ModuleDict()
-        self.stream_names = [str(stream_cfg["name"]) for stream_cfg in cf.streams]
+        self.streams = cf.streams
 
-        for i, (si, stream_name) in enumerate(zip(self.cf.streams, self.stream_names, strict=True)):
+        for i, (stream_name, si) in enumerate(self.streams.items()):
             if si.get("diagnostic", False) or self.sources_size[i] == 0:
                 self.embeds[stream_name] = torch.nn.Identity()
                 continue
 
             if si["embed"]["net"] == "transformer":
                 self.embeds[stream_name] = StreamEmbedTransformer(
-                    mode=self.cf.embed_orientation,
                     num_tokens=si["embed"]["num_tokens"],
                     token_size=si["token_size"],
                     num_channels=self.sources_size[i],
@@ -80,56 +78,33 @@ class EmbeddingEngine(torch.nn.Module):
             else:
                 raise ValueError("Unsupported embedding network type")
 
-    def _get_embed_batch_chunk_size(self) -> int | None:
-        chunk_size = self.cf.get("embed_batch_chunk_size", None)
-        if chunk_size is not None:
-            return chunk_size if chunk_size > 0 else None
-
-        # Validation / inference favors lower peak memory over throughput.
-        return 1024 if not self.training else None
-
-    def _iter_stream_data_chunks(self, batch, stream_name: str, num_steps_input: int, dtype):
-        chunk_size = self._get_embed_batch_chunk_size()
-        if chunk_size is None:
-            sdata = []
-            for istep in range(num_steps_input):
-                for sample in batch.get_samples():
-                    sdata_cur = sample.streams_data[stream_name].source_tokens_cells[istep]
-                    if sdata_cur is not None and sdata_cur.numel() > 0:
-                        sdata.append(sdata_cur)
-
-            if sdata:
-                yield torch.cat(sdata).to(dtype)
-            return
-
-        sdata_chunks = []
-        sdata_rows = 0
-        for istep in range(num_steps_input):
-            for sample in batch.get_samples():
-                sdata_cur = sample.streams_data[stream_name].source_tokens_cells[istep]
-                if sdata_cur is None or sdata_cur.numel() == 0:
-                    continue
-
-                sdata_cur = sdata_cur.to(dtype)
-                for start in range(0, sdata_cur.shape[0], chunk_size):
-                    sdata_part = sdata_cur[start : start + chunk_size]
-                    sdata_chunks.append(sdata_part)
-                    sdata_rows += sdata_part.shape[0]
-                    if sdata_rows >= chunk_size:
-                        yield torch.cat(sdata_chunks)
-                        sdata_chunks = []
-                        sdata_rows = 0
-
-        if sdata_chunks:
-            yield torch.cat(sdata_chunks)
-
     def forward(self, batch, pe_embed):
-        num_steps_input = batch.get_num_steps()
+        num_steps_input = batch.get_num_source_steps()
 
         num_tokens = torch.sum(batch.tokens_lens, 2).flatten().sum().item()
         tokens_all = torch.empty(
             (num_tokens, self.cf.ae_local_dim_embed), dtype=self.dtype, device=batch.get_device()
         )
+
+        # iterate over all streams
+        x_embeds = []
+        for stream_name in self.streams.keys():
+            # collect all source tokens from all input_steps and all samples in the batch
+            sdata = []
+            for istep in range(num_steps_input):
+                for sample in batch.get_samples():
+                    sdata += [sample.streams_data[stream_name].source_tokens_cells[istep]]
+
+            if all(s is None for s in sdata):
+                continue
+
+            sdata = torch.cat(sdata).to(tokens_all.dtype)
+            # skip empty stream
+            if sdata.numel() == 0:
+                continue
+
+            # embedding from physical space to per patch latent representation
+            x_embeds += [self.embeds[stream_name](sdata).flatten(0, 1)]
 
         # switch from stream to cell-based ordering and apply per cell positional encoding
 
@@ -137,35 +112,22 @@ class EmbeddingEngine(torch.nn.Module):
         max_tokens = self.cf.get("ae_local_max_tokens_per_cell", 64)
         assert batch.tokens_lens.flatten(0, 2).sum(0).max() <= max_tokens, (
             "max number of tokens per cell for positional encoding exceeded."
-            " Increase ae_local_max_tokens_per_cell in config."
         )
-        # compute scatter index across batch items and input steps
-        tok_counts_flat = batch.tokens_lens.permute([2, 0, 1, 3]).flatten()
-        scatter_idxs = torch.repeat_interleave(
-            torch.ones(len(tok_counts_flat), dtype=torch.int64, device=tok_counts_flat.device),
-            tok_counts_flat,
-        )
-        scatter_idxs = scatter_idxs.cumsum(0) - 1
+        " Increase ae_local_max_tokens_per_cell in config."
 
-        # per cell indices into positional encoding
-        tok_counts = batch.tokens_lens.permute([2, 0, 1, 3]).sum(0).flatten()
-        pe_idxs = torch.cat([torch.arange(int(c), device=tok_counts.device) for c in tok_counts])
-        # iterate over all streams and write embedded tokens incrementally to lower peak memory
-        offset = 0
-        for stream_name in self.stream_names:
-            for sdata in self._iter_stream_data_chunks(
-                batch, stream_name, num_steps_input, tokens_all.dtype
-            ):
-                stream_embeds = self.embeds[stream_name](sdata).flatten(0, 1)
-                next_offset = offset + stream_embeds.shape[0]
-                tokens_all.index_copy_(
-                    0,
-                    scatter_idxs[offset:next_offset],
-                    stream_embeds + pe_embed[pe_idxs[offset:next_offset]],
-                )
-                offset = next_offset
+        if batch.tokens_lens.shape[2] == 1:
+            # trivial with one stream
+            tokens_all = torch.cat(x_embeds)
 
-        assert offset == num_tokens, "Embedded token count does not match token lens metadata."
+        else:
+            scatter_idxs = self.get_scatter_idxs_vectorized(batch)
+            scatter_idxs = scatter_idxs.unsqueeze(1).repeat((1, self.cf.ae_local_dim_embed))
+
+            # actual scatter operation and apply per cell positional encoding
+            tokens_all.scatter_(0, scatter_idxs, torch.cat(x_embeds))
+
+        pe_idxs = self.get_pe_idxs_vectorized(batch)
+        tokens_all = tokens_all + pe_embed[pe_idxs]
 
         return tokens_all
 
@@ -427,7 +389,6 @@ class QueryAggregationEngine(torch.nn.Module):
         super(QueryAggregationEngine, self).__init__()
         self.cf = cf
         self.num_healpix_cells = num_healpix_cells
-        rope_mode = get_rope_mode(self.cf)
 
         self.ae_aggregation_blocks = torch.nn.ModuleList()
 
@@ -448,7 +409,7 @@ class QueryAggregationEngine(torch.nn.Module):
                         qk_norm_type=self.cf.get("qk_norm_type", self.cf.norm_type),
                         norm_eps=self.cf.norm_eps,
                         attention_dtype=get_dtype(self.cf.attention_dtype),
-                        rope_mode=rope_mode,
+                        with_2d_rope=self.cf.get("rope_2D", False),
                     )
                 )
             else:
@@ -504,7 +465,6 @@ class GlobalAssimilationEngine(torch.nn.Module):
         super(GlobalAssimilationEngine, self).__init__()
         self.cf = cf
         self.num_healpix_cells = num_healpix_cells
-        rope_mode = get_rope_mode(self.cf)
 
         self.ae_global_blocks = torch.nn.ModuleList()
 
@@ -525,7 +485,7 @@ class GlobalAssimilationEngine(torch.nn.Module):
                         qk_norm_type=self.cf.get("qk_norm_type", self.cf.norm_type),
                         norm_eps=self.cf.norm_eps,
                         attention_dtype=get_dtype(self.cf.attention_dtype),
-                        rope_mode=rope_mode,
+                        with_2d_rope=self.cf.get("rope_2D", False),
                     )
                 )
             else:
@@ -542,7 +502,7 @@ class GlobalAssimilationEngine(torch.nn.Module):
                         qk_norm_type=self.cf.get("qk_norm_type", self.cf.norm_type),
                         norm_eps=self.cf.norm_eps,
                         attention_dtype=get_dtype(self.cf.attention_dtype),
-                        rope_mode=rope_mode,
+                        with_2d_rope=self.cf.get("rope_2D", False),
                     )
                 )
             # MLP block
@@ -593,7 +553,6 @@ class ForecastingEngine(torch.nn.Module):
         super(ForecastingEngine, self).__init__()
         self.cf = cf
         self.num_healpix_cells = num_healpix_cells
-        rope_mode = get_rope_mode(self.cf)
         self.fe_blocks = torch.nn.ModuleList()
 
         global_rate = int(1 / self.cf.forecast_att_dense_rate)
@@ -613,7 +572,7 @@ class ForecastingEngine(torch.nn.Module):
                             dim_aux=dim_aux,
                             norm_eps=self.cf.norm_eps,
                             attention_dtype=get_dtype(self.cf.attention_dtype),
-                            rope_mode=rope_mode,
+                            with_2d_rope=self.cf.get("rope_2D", False),
                         )
                     )
                 else:
@@ -631,7 +590,7 @@ class ForecastingEngine(torch.nn.Module):
                             dim_aux=dim_aux,
                             norm_eps=self.cf.norm_eps,
                             attention_dtype=get_dtype(self.cf.attention_dtype),
-                            rope_mode=rope_mode,
+                            with_2d_rope=self.cf.get("rope_2D", False),
                         )
                     )
                 # Add MLP block
@@ -905,6 +864,7 @@ class TargetPredictionEngine(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, 9, self.cf.ae_global_dim_embed))
         dim_aux = self.cf.ae_global_dim_embed
 
+        target_readout_num_heads = next(self.cf.streams.values())["target_readout"]["num_heads"]
         for ith, dim in enumerate(self.dims_embed[:-1]):
             if self.cf.decoder_type == "PerceiverIO":
                 # a single cross attention layer as per https://arxiv.org/pdf/2107.14795
@@ -913,7 +873,7 @@ class TargetPredictionEngine(nn.Module):
                         dim_q=dim,
                         dim_kv=dim_aux,
                         dim_aux=dim_aux,
-                        num_heads=self.cf.streams[0]["target_readout"]["num_heads"],
+                        num_heads=target_readout_num_heads,
                         with_self_attn=False,
                         with_adanorm=False,
                         with_mlp=False,
@@ -925,7 +885,7 @@ class TargetPredictionEngine(nn.Module):
                     SelfAttentionBlock(
                         dim=dim,
                         dim_aux=dim_aux,
-                        num_heads=self.cf.streams[0]["target_readout"]["num_heads"],
+                        num_heads=target_readout_num_heads,
                         attention_kwargs=attention_kwargs,
                         with_adanorm=True,
                         dropout_rate=0.1,
@@ -937,7 +897,7 @@ class TargetPredictionEngine(nn.Module):
                         dim_q=dim,
                         dim_kv=self.cf.ae_global_dim_embed,
                         dim_aux=dim_aux,
-                        num_heads=self.cf.streams[0]["target_readout"]["num_heads"],
+                        num_heads=target_readout_num_heads,
                         with_self_attn=True,
                         with_adanorm=False,
                         with_mlp=True,
@@ -951,7 +911,7 @@ class TargetPredictionEngine(nn.Module):
                         dim_q=dim,
                         dim_kv=dim_aux,
                         dim_aux=dim_aux,
-                        num_heads=self.cf.streams[0]["target_readout"]["num_heads"],
+                        num_heads=target_readout_num_heads,
                         with_self_attn=True,
                         with_adanorm=True,
                         with_mlp=True,
@@ -967,7 +927,7 @@ class TargetPredictionEngine(nn.Module):
                         dim_out=self.dims_embed[ith + 1],
                         dim_kv=dim_aux,
                         dim_aux=self.dim_coord_in,
-                        num_heads=self.cf.streams[0]["target_readout"]["num_heads"],
+                        num_heads=target_readout_num_heads,
                         attention_kwargs=attention_kwargs,
                         tr_dim_head_proj=tr_dim_head_proj,
                         tr_mlp_hidden_factor=tr_mlp_hidden_factor,
