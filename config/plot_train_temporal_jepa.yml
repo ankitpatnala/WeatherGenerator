@@ -1,0 +1,10 @@
+train : 
+  plot :
+    opo5g66g : 
+      slurm_id: 0
+      description: "AdamW"
+      eval: vgbndhco
+    firlvsoa : 
+      slurm_id: 0
+      description: "Muon"
+      eval: vgbndhco
