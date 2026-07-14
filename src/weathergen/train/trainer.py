@@ -580,8 +580,7 @@ class Trainer(TrainerBase):
                     batch = batch.pin_memory()
 
                 batch.to_device(self.device)
-
-<<<<<<< HEAD
+            
             with torch.autocast(
                 device_type=f"cuda:{cf.local_rank}",
                 dtype=self.mixed_precision_dtype,
@@ -604,16 +603,6 @@ class Trainer(TrainerBase):
                         batch.get_target_samples(target_idxs),
                         self.model_params,
                         self.model,
-=======
-                with torch.autocast(
-                    device_type=f"cuda:{cf.local_rank}",
-                    dtype=self.mixed_precision_dtype,
-                    enabled=cf.with_mixed_precision,
-                ):
-                    preds = self.model(
-                        model_params=self.model_params,
-                        batch=batch.get_source_samples(),
->>>>>>> origin/develop
                     )
 
                     targets_and_auxs = {}
@@ -737,7 +726,6 @@ class Trainer(TrainerBase):
 
         with torch.no_grad():
             # print progress bar but only in interactive mode, i.e. when without ddp
-<<<<<<< HEAD
             num_val_batches = len(self.data_loader_validation)
             with tqdm.tqdm(total=num_val_batches, disable=self.cf.with_ddp) as pbar:
                 for bidx in range(num_val_batches):
@@ -765,14 +753,6 @@ class Trainer(TrainerBase):
                         else:
                             targets_and_auxs = {}
                         batch.to_device(self.device, include_targets=False)
-=======
-            with tqdm.tqdm(
-                total=len(self.data_loader_validation), disable=self.cf.with_ddp
-            ) as pbar:
-                for bidx, batch in enumerate(dataset_val_iter):
-                    batch.to_device(self.device)
->>>>>>> origin/develop
-
                     # evaluate model
                     with torch.autocast(
                         device_type=f"cuda:{cf.local_rank}",

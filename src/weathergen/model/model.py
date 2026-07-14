@@ -709,7 +709,7 @@ class Model(torch.nn.Module):
             batch_ctx = batch
             tokens, posteriors = self.encoder(model_params, batch_ctx)
             output.add_latent_prediction(0, "posteriors", posteriors)
-            shape = (len(batch), batch.get_num_steps(), *tokens.shape[1:])
+            shape = (len(batch), batch.get_num_source_steps(), *tokens.shape[1:])
             tokens = tokens.reshape(shape).sum(axis=1)
         else:
             step_offset = batch.step_offset + len(batch.physical)
@@ -734,9 +734,9 @@ class Model(torch.nn.Module):
                 if without_grad:
                     # Pushforward mode: advance tokens without grad; no decoding
                     with torch.no_grad():
-                        tokens = self.forecast_engine(tokens, step, coords=rope_data)
+                        tokens = self.forecast_engine(tokens, step, coords=model_params.rope_coords)
                     continue
-                tokens = self.forecast_engine(tokens, step, coords=rope_data)
+                tokens = self.forecast_engine(tokens, step, coords=model_params.rope_coords)
             # decoder predictions
             output = self.predict_decoders(
                 model_params, step, step + batch_step_offset, tokens, batch_ctx, output

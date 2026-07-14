@@ -68,12 +68,9 @@ def write_output(
             # there)
             t_chunk_idx = t_idx - fstep_offset
             if target_aux_out.physical[t_idx][sname]["is_spoof"][0]:
-<<<<<<< HEAD
                 preds = model_output.get_physical_prediction(t_chunk_idx, sname)
                 preds_shape = preds[0].shape
-=======
                 targets = target_aux_out.physical[t_idx][sname]["target"]
->>>>>>> origin/develop
                 # for-loop to make sure we have a consistent number of samples
                 preds_s = [np.zeros((1, 0, t.shape[1])) for t in targets]
                 targets_s = [np.zeros((0, t.shape[1])) for t in targets]
