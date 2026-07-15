@@ -483,6 +483,19 @@ class ZarrIO:
 
     @functools.cached_property
     def forecast_offset(self) -> int:
+        """
+        try:
+            sample, example_sample = next(self.data_root.groups())
+            stream, example_stream = next(example_sample.groups())
+        except StopIteration as e:
+            msg = f"Data store at: {self._store_path} is empty."
+            raise FileNotFoundError(msg) from e
+
+        fstep0_key = ItemKey(int(sample), 0, stream)
+        if self.data_root.get(fstep0_key.path) is None:
+            return 1
+        fstep0_datasets = self._get_datasets(fstep0_key)
+        """
         fstep0_datasets = self._get_datasets(self.example_key)
         return ItemKey._infer_forecast_offset(fstep0_datasets)
 
@@ -491,12 +504,18 @@ class ZarrIO:
         try:
             sample, example_sample = next(self.data_root.groups())
             stream, example_stream = next(example_sample.groups())
-            fstep = 0
+            """
+            forecast_steps = list(example_stream.group_keys())
+            if len(forecast_steps) == 0:
+                raise StopIteration
+            fstep = int(forecast_steps[0])
+            """
+            fstep = int(next(example_stream.group_keys()))
         except StopIteration as e:
             msg = f"Data store at: {self._store_path} is empty."
             raise FileNotFoundError(msg) from e
 
-        return ItemKey(sample, fstep, stream)
+        return ItemKey(int(sample), fstep, stream)
 
     @functools.cached_property
     def samples(self) -> list[int]:
@@ -582,6 +601,13 @@ class OutputBatchData:
 
     sample_start: int
     forecast_offset: int
+    forecast_steps_override: list[int] | None = None
+
+    @functools.cached_property
+    def _forecast_step_to_index(self) -> dict[int, int] | None:
+        if self.forecast_steps_override is None:
+            return None
+        return {step: idx for idx, step in enumerate(self.forecast_steps_override)}
 
     @functools.cached_property
     def samples(self):
@@ -595,6 +621,8 @@ class OutputBatchData:
         """Indices of all forecast steps adjusted by the forecast offset"""
         # forecast offset should be either 1 for forecasting or 0 for MTM
         assert self.forecast_offset in (0, 1)
+        if self.forecast_steps_override is not None:
+            return np.array(self.forecast_steps_override)
         return np.arange(len(self.targets) + self.forecast_offset)
 
     def items(self) -> typing.Generator[OutputItem, None, None]:
@@ -652,9 +680,13 @@ class OutputBatchData:
             - `forecast_step` is adjusted from including `forecast_offset` to indexing
                the data (always starts at 0)
         """
-        return ItemKey(
-            key.sample - self.sample_start, key.forecast_step - self.forecast_offset, key.stream
-        )
+        if self._forecast_step_to_index is None:
+            forecast_step = key.forecast_step - self.forecast_offset
+        else:
+            if key.forecast_step not in self._forecast_step_to_index:
+                raise KeyError(f"Unknown forecast_step {key.forecast_step}")
+            forecast_step = self._forecast_step_to_index[key.forecast_step]
+        return ItemKey(key.sample - self.sample_start, forecast_step, key.stream)
 
     def _extract_targets_predictions(self, stream_idx, offset_key, key, source_interval):
         datapoints = self._get_datapoints_per_sample(offset_key, stream_idx)

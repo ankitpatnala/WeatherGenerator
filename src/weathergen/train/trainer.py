@@ -26,6 +26,7 @@ import weathergen.common.config as config
 from weathergen.common.config import Config
 from weathergen.datasets.multi_stream_data_sampler import MultiStreamDataSampler
 from weathergen.model.ema import EMAModel
+from weathergen.model.model import ModelOutput
 from weathergen.model.model_interface import (
     init_model_and_shard,
 )
@@ -164,6 +165,11 @@ class Trainer(TrainerBase):
         # Initialize collapse monitor for SSL training
         collapse_config = cf.train_logging.get("collapse_monitoring", {})
         self.collapse_monitor = CollapseMonitor(collapse_config, None)  # device set later in run()
+        # self.fcst_chunks_by_mode = {
+        #    "training": self._init_fcst_chunks(self.training_cfg),
+        #    "validation": self._init_fcst_chunks(self.validation_cfg),
+        #    "test": self._init_fcst_chunks(self.test_cfg),
+        # }
 
         if cf.train_logging.get("track_performance_metrics"):
             self.perf_tracker = ThroughputTracker(
@@ -189,6 +195,126 @@ class Trainer(TrainerBase):
             ).to_device(self.device)
 
         return target_and_aux_calculators
+
+    def _get_output_target_and_auxs(self, mode_cfg, batch):
+        output_target_and_auxs = {}
+        for loss_name, loss_cfg in mode_cfg.losses.items():
+            if loss_cfg.type != "LossPhysical":
+                continue
+
+            target_aux = self.target_and_aux_calculators_val[loss_name]
+            target_idxs = get_target_idxs_from_cfg(mode_cfg, loss_name)
+            output_target_and_auxs[loss_name] = target_aux.compute(
+                self.cf.general.istep,
+                batch.get_target_samples_view(target_idxs),
+                self.model_params,
+                self.model,
+            )
+
+        return output_target_and_auxs
+
+    def _get_forecast_chunks(self, forecast_cfg):
+        n_full_chunks = forecast_cfg.num_steps // forecast_cfg.chunk_size
+        remainder_fsteps = forecast_cfg.num_steps % forecast_cfg.chunk_size
+        return [forecast_cfg.chunk_size] * n_full_chunks + (
+            [remainder_fsteps] if remainder_fsteps else []
+        )
+
+    def _process_validation_chunks(
+        self,
+        batch,
+        mode_cfg,
+        batch_size,
+        mini_epoch,
+        bidx,
+        targets_and_auxs,
+        preds_full,
+    ):
+        # chunks = self._get_fcst_chunks(mode_cfg)
+        chunks = self._get_forecast_chunks(mode_cfg.get("forecast", {}))
+        source_samples = batch.get_source_samples()
+        num_samples_write = mode_cfg.get("output", {}).get("num_samples", 0) * batch_size
+        should_write_output = bidx < num_samples_write
+        if should_write_output:
+            denormalize_data_fct = (
+                (lambda x0, x1: x1)
+                if mode_cfg.get("output", {}).get("normalized_samples", False)
+                else self.dataset_val.denormalize_target_channels
+            )
+            if not targets_and_auxs:
+                raise ValueError(
+                    "Writing validation output requires targets. "
+                    "Configure validation losses or set output.num_samples=0."
+                )
+
+        output_idxs = batch.get_output_idxs()
+        forecast_step_offset = output_idxs[0] if len(output_idxs) > 0 else 0
+
+        with tqdm.tqdm(
+            total=len(chunks),
+            disable=self.cf.with_ddp or len(chunks) <= 1,
+            leave=False,
+            desc=f"batch {bidx + 1} chunks",
+        ) as chunk_pbar:
+            for chunk_idx, chunk_size in enumerate(chunks):
+                chunk_pbar.set_postfix_str(
+                    f"running {chunk_idx + 1}/{len(chunks)} ({chunk_size} steps)"
+                )
+                chunk_pbar.refresh()
+
+                if self.ema_model is None:
+                    source_samples = self.model(
+                        self.model_params,
+                        source_samples,
+                        chunk_size,
+                    )
+                else:
+                    source_samples = self.ema_model.forward_eval(
+                        self.model_params,
+                        source_samples,
+                        chunk_size,
+                    )
+
+                chunk_step_offset = forecast_step_offset + source_samples.step_offset
+
+                if should_write_output:
+                    chunk_pbar.set_postfix_str(
+                        f"writing {chunk_idx + 1}/{len(chunks)} "
+                        f"(steps {chunk_step_offset}-{chunk_step_offset + chunk_size - 1})"
+                    )
+                    chunk_pbar.refresh()
+                    timestep_idxs = list(range(chunk_step_offset, chunk_step_offset + chunk_size))
+                    write_output(
+                        self.cf,
+                        mode_cfg,
+                        batch_size,
+                        mini_epoch,
+                        bidx,
+                        denormalize_data_fct,
+                        batch,
+                        source_samples,
+                        targets_and_auxs,
+                        timestep_idxs=timestep_idxs,
+                        fstep_offset=chunk_step_offset,
+                    )
+
+                if preds_full is not None:
+                    for step_idx in range(chunk_size):
+                        preds_full.physical[chunk_step_offset + step_idx].update(
+                            source_samples.physical[step_idx]
+                        )
+                        preds_full.latent[chunk_step_offset + step_idx].update(
+                            source_samples.latent[step_idx]
+                        )
+
+                if chunk_size and chunk_idx < len(chunks) - 1:
+                    if (
+                        not source_samples.latent
+                        or "latent_state" not in source_samples.latent[chunk_size - 1]
+                    ):
+                        raise ValueError("Missing latent_state for chunked forecast continuation.")
+
+                chunk_pbar.update(1)
 
     def inference(self, cf, devices, run_id_contd, mini_epoch_contd):
         # general initalization
@@ -454,15 +580,29 @@ class Trainer(TrainerBase):
                     batch = batch.pin_memory()
 
                 batch.to_device(self.device)
+            
+            with torch.autocast(
+                device_type=f"cuda:{cf.local_rank}",
+                dtype=self.mixed_precision_dtype,
+                enabled=cf.with_mixed_precision,
+            ):
+                x = batch.get_source_samples()
+                preds = self.model(
+                    self.model_params,
+                    x,
+                    x.get_output_len(),
+                )
 
-                with torch.autocast(
-                    device_type=f"cuda:{cf.local_rank}",
-                    dtype=self.mixed_precision_dtype,
-                    enabled=cf.with_mixed_precision,
-                ):
-                    preds = self.model(
-                        model_params=self.model_params,
-                        batch=batch.get_source_samples(),
+                targets_and_auxs = {}
+                for loss_name, target_aux in self.target_and_aux_calculators.items():
+                    # find targets for this target-aux calculator
+                    target_idxs = get_target_idxs_from_cfg(self.training_cfg, loss_name)
+                    # apply target-aux calculator
+                    targets_and_auxs[loss_name] = target_aux.compute(
+                        self.cf.general.istep,
+                        batch.get_target_samples(target_idxs),
+                        self.model_params,
+                        self.model,
                     )
 
                     targets_and_auxs = {}
@@ -581,67 +721,81 @@ class Trainer(TrainerBase):
         dataset_val_iter = iter(self.data_loader_validation)
 
         num_samples_write = mode_cfg.get("output", {}).get("num_samples", 0) * batch_size
+        compute_loss = mode_cfg.get("compute_loss", True)
+        needs_targets_and_aux = compute_loss or num_samples_write > 0
 
         with torch.no_grad():
             # print progress bar but only in interactive mode, i.e. when without ddp
-            with tqdm.tqdm(
-                total=len(self.data_loader_validation), disable=self.cf.with_ddp
-            ) as pbar:
-                for bidx, batch in enumerate(dataset_val_iter):
-                    batch.to_device(self.device)
+            num_val_batches = len(self.data_loader_validation)
+            with tqdm.tqdm(total=num_val_batches, disable=self.cf.with_ddp) as pbar:
+                for bidx in range(num_val_batches):
+                    pbar.set_description_str(f"loading batch {bidx + 1}/{num_val_batches}")
+                    pbar.refresh()
+                    try:
+                        batch = next(dataset_val_iter)
+                    except StopIteration:
+                        break
 
+                    pbar.set_description_str(f"validating batch {bidx + 1}/{num_val_batches}")
+                    pbar.set_postfix_str("moving batch to device")
+                    pbar.refresh()
+
+                    if cf.data_loading.get("memory_pinning", False):
+                        # pin memory for faster CPU-GPU transfer
+                        batch = batch.pin_memory()
+
+                    should_write_output = bidx < num_samples_write
+                    if compute_loss:
+                        batch.to_device(self.device)
+                    else:
+                        if should_write_output:
+                            targets_and_auxs = self._get_output_target_and_auxs(mode_cfg, batch)
+                        else:
+                            targets_and_auxs = {}
+                        batch.to_device(self.device, include_targets=False)
                     # evaluate model
                     with torch.autocast(
                         device_type=f"cuda:{cf.local_rank}",
                         dtype=self.mixed_precision_dtype,
                         enabled=cf.with_mixed_precision,
                     ):
-                        if self.ema_model is None:
-                            preds = self.model(
-                                self.model_params,
-                                batch.get_source_samples(),
-                            )
-                        else:
-                            preds = self.ema_model.forward_eval(
-                                self.model_params,
-                                batch.get_source_samples(),
-                            )
-
-                        targets_and_auxs = {}
-                        for loss_name, target_aux in self.target_and_aux_calculators_val.items():
-                            target_idxs = get_target_idxs_from_cfg(mode_cfg, loss_name)
-                            targets_and_auxs[loss_name] = target_aux.compute(
-                                self.cf.general.istep,
-                                batch.get_target_samples(target_idxs),
-                                self.model_params,
-                                self.model,
-                            )
-
-                    _ = self.loss_calculator_val.compute_loss(
-                        preds=preds,
-                        targets_and_aux=targets_and_auxs,
-                        metadata=extract_batch_metadata(batch),
-                    )
-
-                    # log output
-                    if bidx < num_samples_write:
-                        # denormalization function for data
-                        denormalize_data_fct = (
-                            (lambda x0, x1: x1)
-                            if mode_cfg.get("output", {}).get("normalized_samples", False)
-                            else self.dataset_val.denormalize_target_channels
+                        pbar.set_postfix_str("running model")
+                        pbar.refresh()
+                        total_steps = batch.get_output_len()
+                        preds_full = (
+                            ModelOutput(total_steps, batch=batch.get_source_samples())
+                            if compute_loss and total_steps > 0
+                            else None
                         )
-                        # write output
-                        write_output(
-                            self.cf,
+                        if compute_loss and needs_targets_and_aux:
+                            targets_and_auxs = {}
+                            for (
+                                loss_name,
+                                target_aux,
+                            ) in self.target_and_aux_calculators_val.items():
+                                target_idxs = get_target_idxs_from_cfg(mode_cfg, loss_name)
+                                targets_and_auxs[loss_name] = target_aux.compute(
+                                    self.cf.general.istep,
+                                    batch.get_target_samples(target_idxs),
+                                    self.model_params,
+                                    self.model,
+                                )
+
+                        self._process_validation_chunks(
+                            batch,
                             mode_cfg,
                             batch_size,
                             mini_epoch,
                             bidx,
-                            denormalize_data_fct,
-                            batch,
-                            preds,
                             targets_and_auxs,
+                            preds_full,
+                        )
+
+                    if compute_loss and preds_full is not None:
+                        _ = self.loss_calculator_val.compute_loss(
+                            preds=preds_full,
+                            targets_and_aux=targets_and_auxs,
+                            metadata=extract_batch_metadata(batch),
                         )
 
                     pbar.update(batch_size)
@@ -806,10 +960,16 @@ class Trainer(TrainerBase):
 
             if is_root():
                 if stage == VAL:
-                    logger.info(
-                        f"""validation ({self.cf.general.run_id}) : {mini_epoch:03d} : 
-                        {np.nanmean(avg_loss)}"""
-                    )
+                    if len(avg_loss) == 0:
+                        logger.info(
+                            f"validation ({self.cf.general.run_id}) : {mini_epoch:03d} : "
+                            "loss disabled"
+                        )
+                    else:
+                        logger.info(
+                            f"""validation ({self.cf.general.run_id}) : {mini_epoch:03d} : 
+                            {np.nanmean(avg_loss)}"""
+                        )
 
                 elif stage == TRAIN:
                     # samples per sec

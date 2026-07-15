@@ -21,7 +21,17 @@ _logger = logging.getLogger(__name__)
 
 
 def write_output(
-    cf, val_cfg, batch_size, mini_epoch, batch_idx, dn_data, batch, model_output, target_aux_out
+    cf,
+    val_cfg,
+    batch_size,
+    mini_epoch,
+    batch_idx,
+    dn_data,
+    batch,
+    model_output,
+    target_aux_out,
+    timestep_idxs: list[int] | None = None,
+    fstep_offset: int = 0,
 ):
     """
     Interface for writing model output
@@ -40,8 +50,10 @@ def write_output(
     fp32 = torch.float32
     preds_all, targets_all, targets_coords_all, targets_times_all = [], [], [], []
 
-    timestep_idxs = [0] if len(batch.get_output_idxs()) == 0 else batch.get_output_idxs()
-    forecast_offset = timestep_idxs[0]
+    if timestep_idxs is None:
+        timestep_idxs = [0] if len(batch.get_output_idxs()) == 0 else batch.get_output_idxs()
+    output_idxs = batch.get_output_idxs()
+    forecast_offset = output_idxs[0] if len(output_idxs) > 0 else 0
     targets_lens = []
 
     data_streams = {}
@@ -59,7 +71,10 @@ def write_output(
         for sname in data_streams.keys():
             # handle spoof data: do not write since it might corrupt validation (spoofing invisible
             # there)
+            t_chunk_idx = t_idx - fstep_offset
             if target_aux_out.physical[t_idx][sname]["is_spoof"][0]:
+                preds = model_output.get_physical_prediction(t_chunk_idx, sname)
+                preds_shape = preds[0].shape
                 targets = target_aux_out.physical[t_idx][sname]["target"]
                 # for-loop to make sure we have a consistent number of samples
                 preds_s = [np.zeros((1, 0, t.shape[1])) for t in targets]
@@ -68,7 +83,7 @@ def write_output(
                 t_times_s = [np.array([]).astype("datetime64[ns]") for t in targets]
 
             else:
-                preds = model_output.get_physical_prediction(t_idx, sname)
+                preds = model_output.get_physical_prediction(t_chunk_idx, sname)
                 targets = target_aux_out.physical[t_idx][sname]["target"]
 
                 preds_s, targets_s, t_coords_s, t_times_s = [], [], [], []
@@ -86,7 +101,12 @@ def write_output(
 
                     idxs_inv = target_aux_out.physical[t_idx][sname]["idxs_inv"][i_batch]
                     if idxs_inv is not None:
-                        pred = pred[:, idxs_inv]
+                        pred_idxs_inv = (
+                            idxs_inv.to(pred.device, non_blocking=True)
+                            if isinstance(idxs_inv, torch.Tensor) and idxs_inv.device != pred.device
+                            else idxs_inv
+                        )
+                        pred = pred[:, pred_idxs_inv]
                         target = target[idxs_inv]
                         t_coords = t_coords[idxs_inv]
                         t_times = t_times[idxs_inv]
@@ -173,6 +193,7 @@ def write_output(
         geoinfo_channels,
         sample_start,
         forecast_offset,
+        forecast_steps_override=timestep_idxs,
     )
     with zarrio_writer(config.get_path_results(cf, mini_epoch)) as zio:
         for subset in data.items():

@@ -340,13 +340,17 @@ class ModelBatch:
 
         return self
 
-    def to_device(self, device):  # -> ModelBatch
+    def to_device(
+        self, device, include_targets: bool = True, include_sources: bool = True
+    ):  # -> ModelBatch
         """
         Move batch to device
         """
 
-        self.source_samples.to_device(device)
-        self.target_samples.to_device(device)
+        if include_sources:
+            self.source_samples.to_device(device)
+        if include_targets:
+            self.target_samples.to_device(device)
 
         self.device = device
 
@@ -468,6 +472,12 @@ class ModelBatch:
         Get target samples
         """
         return self.target_samples.get_subset(subset)
+
+    def get_target_samples_view(self, subset: list | None = None) -> BatchSamples:
+        """
+        Get a read-only view of target samples without duplicating underlying tensor storage.
+        """
+        return self.target_samples.get_subset_view(subset)
 
     def get_source_idx_for_target(self, target_idx: int) -> int:
         """
