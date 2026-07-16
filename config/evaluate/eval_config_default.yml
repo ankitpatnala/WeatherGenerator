@@ -62,7 +62,12 @@ run_ids :
     label: "absolute"
     results_base_dir : "./results/oxykl0iz"
     #NEW: if "streams" is not specified, the default streams are used
-
+  
+  k6ns73h2:
+    label: "absolute_after_fix"
+    results_base_dir : "./results/k6ns73h2"
+    #NEW: if "streams" is not specified, the default streams are used
+  
   pdweqg0k:
     label: "absolute normalized"
     results_base_dir : "./results/pdweqg0k"

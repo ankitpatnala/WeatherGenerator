@@ -765,16 +765,15 @@ class Model(torch.nn.Module):
             # apply forecasting engine (if present)
             if self.forecast_engine:
                 without_grad = p_fwd and self.training and step != rollout_steps - 1
+                condition = batch_ctx.conditions[step + batch_step_offset]
                 if without_grad:
                     # Pushforward mode: advance tokens without grad; no decoding
                     with torch.no_grad():
-                        tokens = self.forecast_engine(tokens, 
-                              batch.conditions[step] if type(batch)!=ModelOutput else batch.batch.conditions[step],
-                              coords=model_params.rope_coords)
+                        tokens = self.forecast_engine(
+                            tokens, condition, coords=model_params.rope_coords
+                        )
                     continue
-                tokens = self.forecast_engine(tokens, 
-                      batch.conditions[step] if type(batch)!=ModelOutput else batch.batch.conditions[step],
-                      coords=model_params.rope_coords)
+                tokens = self.forecast_engine(tokens, condition, coords=model_params.rope_coords)
             # decoder predictions
             output = self.predict_decoders(
                 model_params, step, step + batch_step_offset, tokens, batch_ctx, output
