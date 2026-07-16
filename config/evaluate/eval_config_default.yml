@@ -52,27 +52,28 @@ default_streams:
     plotting:
       sample: [0]
       forecast_step: "all" #supported: "all", [1,2,3,...], "1-50" (equivalent of [1,2,3,...50])
+      plot_timeseries: true
       plot_maps: false
       plot_histograms: false
       plot_animations: false
       
 run_ids :
-  i3y14pw9:
+  oxykl0iz:
     label: "absolute"
-    results_base_dir : "./results/i3y14pw9"
+    results_base_dir : "./results/oxykl0iz"
     #NEW: if "streams" is not specified, the default streams are used
-    
-  uab9gi2q:
+
+  pdweqg0k:
     label: "absolute normalized"
-    results_base_dir : "./results/uab9gi2q"
+    results_base_dir : "./results/pdweqg0k"
     #NEW: if "streams" is not specified, the default streams are used
-      
-  iv0z6u29:
+
+  yb5z0sh7:
     label: "cos_sin"
-    results_base_dir : "./results/iv0z6u29"
+    results_base_dir : "./results/yb5z0sh7"
     #NEW: if "streams" is not specified, the default streams are used
-  
-  dc0i1osz:
+
+  dlf08kxi:
     label: "fourier_emb_16"
-    results_base_dir : "./results/dc0i1osz"
-    #NEW: if "streams" is not specified, the default streams are used
+    results_base_dir : "./results/dlf08kxi"
+    #NEW: if "streams" is not specified, the default streams are usedams" is not specified, the default streams are used
