@@ -12,10 +12,11 @@ embed_unembed_mode: "block"
 embed_dropout_rate: 0.1
 
 ae_local_dim_embed: 2048
-ae_local_num_blocks: 0
+ae_local_num_blocks: 4
 ae_local_num_heads: 16
 ae_local_dropout_rate: 0.1
 ae_local_with_qk_lnorm: True
+ae_local_max_tokens_per_cell: 128
 
 ae_local_num_queries: 1
 ae_local_queries_per_cell: False
@@ -56,7 +57,7 @@ num_register_tokens: 0
 # number of steps offset applied to first target window; if set to zero and forecast_steps=0 then
 # one is training an auto-encoder
 fe_num_blocks: 16
-fe_num_heads: 16
+fe_num_heads: 32
 fe_dropout_rate: 0.1
 fe_with_qk_lnorm: True
 fe_layer_norm_after_blocks: [7]  # Index starts at 0. Thus, [3] adds a LayerNorm after the fourth layer
@@ -88,12 +89,15 @@ load_chkpt: {}
 
 norm_type: "LayerNorm"
 
+# decoder_ens_latent_perturbation : 
+#   num_members: 2    # 0 / 1 = disabled; >1 = number of ensemble members
+#   sigma_init: 0.2  # initial noise standard deviation
+#   sigma_learnable: True  # true = nn.Parameter; false = fixed buffer
+
 #####################################
 
-# streams_directory: "./config/streams/era5_1deg_forecasting/"
-# streams_directory: "./config/streams/era5_georing_avhrr_synop_lowres/"
-# streams_directory: "./weathergen-configs/streams/era5_1deg_forecasting/"
-streams_directory: "./config/streams/era5_georing_avhrr_synop_lowres/"
+# streams_directory: "./config/streams/era5_georing_avhrr/"
+streams_directory: "./weathergen-configs/streams/era5_georing_avhrr_synop_lowres/"
 streams: ???
 
 # type of zarr_store
@@ -121,9 +125,9 @@ general:
 
 # logging frequency in the training loop (in number of batches)
 train_logging:
-  terminal: 10
-  metrics: 20
-  checkpoint: 50 #250
+  terminal: 100
+  metrics: 100
+  checkpoint: 500
 
 # parameters for data loading
 data_loading :
@@ -132,8 +136,6 @@ data_loading :
   rng_seed: ???
   repeat_data_in_mini_epoch : False
 
-  memory_pinning: True
-
 
 # config for training
 training_config:
@@ -141,14 +143,14 @@ training_config:
   # training_mode: "masking", "student_teacher", "latent_loss"
   training_mode: ["masking"]
 
-  num_mini_epochs: 164
-  samples_per_mini_epoch: 4096
+  num_mini_epochs: 82
+  samples_per_mini_epoch: 8192
   shuffle: True
 
-  start_date: 1990-01-01T00:00
+  start_date: 1979-01-01T00:00
   end_date: 2022-12-31T00:00
 
-  time_window_step: 06:00:00
+  time_window_step: 01:00:00
   time_window_len: 06:00:00
   
   learning_rate_scheduling :
@@ -167,7 +169,7 @@ training_config:
     # which optimizer to use: "adamw" or "muon"
     # muon only optimizes 2D weight matrices of hidden layers; all other
     # parameters (biases, norms, ...) are still optimized with adamw
-    name: adamw
+    name: muon
     grad_clip: 1.0
     weight_decay: 0.1
     log_grad_norms: False
@@ -195,7 +197,7 @@ training_config:
     }
   
   model_input: {
-    "forecasting" : {
+    "source_masking" : {
       # masking strategy: "random", "healpix", "forecast"
       masking_strategy: "forecast",
       },
@@ -211,12 +213,12 @@ training_config:
 # validation config; full validation config is merge of training and validation config
 validation_config: 
 
-  samples_per_mini_epoch: 128
-  shuffle: False
+  samples_per_mini_epoch: 256
+  shuffle: true
 
   start_date: 2023-10-01T00:00
   end_date: 2023-12-31T00:00
-  
+
   # whether to track the exponential moving average of weights for validation
   validate_with_ema: 
     enabled : True
@@ -237,8 +239,27 @@ validation_config:
   validate_before_training: False
 
 
-# test config; full test config is merge of validation and test config
-# test config is used by default when running inference
+test_config: 
+
+  samples_per_mini_epoch: 4096
+  shuffle: False
+
+  start_date: 2023-06-01T00:00
+  end_date: 2023-08-31T00:00
+
+  time_window_step: 01:00:00
+  time_window_len: 06:00:00
+
+  # parameters for validation samples that are written to disk
+  output : {
+    # number of samples that are written
+    num_samples: 4096,
+    # write samples in normalized model space
+    normalized_samples: False,
+    # output streams to write; default all
+    streams: null,
+    }
+
 
 # Tags for experiment tracking
 # These tags will be logged in MLFlow along with completed runs for train, eval, val

@@ -1,0 +1,10 @@
+train : 
+  plot :
+    m636pwwr : 
+      slurm_id: 0
+      description: "AdamW"
+      eval: vgbndhco
+    us13fb4c : 
+      slurm_id: 0
+      description: "Muon"
+      eval: vgbndhco
