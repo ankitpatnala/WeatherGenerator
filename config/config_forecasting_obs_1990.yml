@@ -93,7 +93,7 @@ norm_type: "LayerNorm"
 # streams_directory: "./config/streams/era5_1deg_forecasting/"
 # streams_directory: "./config/streams/era5_georing_avhrr_synop_lowres/"
 # streams_directory: "./weathergen-configs/streams/era5_1deg_forecasting/"
-streams_directory: "./weathergen-configs/streams/era5_georing_avhrr_synop_lowres/"
+streams_directory: "./config/streams/era5_georing_avhrr_synop_lowres/"
 streams: ???
 
 # type of zarr_store
