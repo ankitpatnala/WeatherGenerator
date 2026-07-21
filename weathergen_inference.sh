@@ -16,5 +16,5 @@
 source .venv/bin/activate
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-srun uv --offline run inference --from-run-id $1  --options test_config.start_date=202301010000 test_config.end_date=202312310000 test_config.output.num_samples=1 test_config.samples_per_mini_epoch=1 test_config.forecast.num_steps=650 test_config.forecast.chunk_size=100 test_config.output.streams=[ERA5]
+srun uv --offline run inference --from-run-id $1  --options test_config.start_date=202301010000 test_config.end_date=202312310000 test_config.output.num_samples=1 test_config.samples_per_mini_epoch=1 test_config.forecast.num_steps=1440 test_config.forecast.chunk_size=50 test_config.output.streams=[ERA5] test_config.compute_loss=false
 

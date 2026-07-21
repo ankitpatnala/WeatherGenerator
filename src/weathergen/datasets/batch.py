@@ -213,6 +213,24 @@ class BatchSamples:
             bs.tokens_lens = torch.index_select(bs.tokens_lens, 1, torch_idxs)
             return bs
 
+    def get_subset_view(self, subset: list | None = None):
+        """
+        Get a read-only view of a subset of samples without duplicating tensor storage.
+
+        Unlike `get_subset`, this does not deep-copy the underlying samples/tensors;
+        it only rebinds `samples` and `tokens_lens` to the selected subset. Safe as
+        long as the returned object's fields are not mutated in place.
+        """
+        if subset is None:
+            return self
+        else:
+            assert len(list(set(subset))) == len(subset), "subset contains duplicates"
+            bs = copy.copy(self)
+            bs.samples = [self.samples[i] for i in subset]
+            torch_idxs = torch.tensor(subset, dtype=torch.long, device=self.tokens_lens.device)
+            bs.tokens_lens = torch.index_select(self.tokens_lens, 1, torch_idxs)
+            return bs
+
     def get_num_source_steps(self) -> int:
         """
         Get number of input/source steps from smallest of all available streams
