@@ -133,6 +133,8 @@ class IOReaderData:
     data: NDArray[DType]
     datetimes: NDArray[NPDT64]
     is_spoof: bool = False
+    # free-running forecast step beyond the data: no ground-truth target (see ReaderData).
+    is_forecast_query: bool = False
 
     def is_empty(self):
         """
@@ -175,6 +177,7 @@ class IOReaderData:
         data = np.zeros((0, other.data.shape[1]), dtype=other.data.dtype)
         datetimes = np.array([], dtype=other.datetimes.dtype)
         is_spoof = True
+        is_forecast_query = True
 
         for other in others:
             n_datapoints = len(other.data)
@@ -187,8 +190,9 @@ class IOReaderData:
             data = np.concatenate([data, other.data])
             datetimes = np.concatenate([datetimes, other.datetimes])
             is_spoof = is_spoof and other.is_spoof
+            is_forecast_query = is_forecast_query and getattr(other, "is_forecast_query", False)
 
-        return cls(coords, geoinfos, data, datetimes, is_spoof)
+        return cls(coords, geoinfos, data, datetimes, is_spoof, is_forecast_query)
 
 
 @dataclasses.dataclass
@@ -603,6 +607,11 @@ class OutputBatchData:
     forecast_offset: int
     forecast_steps_override: list[int] | None = None
 
+    # fstep, stream, redundant dim (size 1): point count of the predictions, which can differ
+    # from targets_lens for free-running steps (full grid predicted, empty target). Defaults to
+    # targets_lens (predictions and targets share the same points).
+    preds_lens: list[list[list[int]]] | None = None
+
     @functools.cached_property
     def _forecast_step_to_index(self) -> dict[int, int] | None:
         if self.forecast_steps_override is None:
@@ -689,22 +698,31 @@ class OutputBatchData:
         return ItemKey(key.sample - self.sample_start, forecast_step, key.stream)
 
     def _extract_targets_predictions(self, stream_idx, offset_key, key, source_interval):
-        datapoints = self._get_datapoints_per_sample(offset_key, stream_idx)
-        data_coords = self._extract_coordinates(stream_idx, offset_key, datapoints)
+        # predictions and targets are sized independently: normally identical, but for a
+        # free-running step the prediction covers the full grid while the target is empty
+        preds_lens = self.preds_lens if self.preds_lens is not None else self.targets_lens
+        target_dp = self._get_datapoints_per_sample(offset_key, stream_idx, self.targets_lens)
+        preds_dp = self._get_datapoints_per_sample(offset_key, stream_idx, preds_lens)
 
-        if (datapoints.stop - datapoints.start) == 0:
-            target_data = np.zeros((0, len(self.target_channels[stream_idx])), dtype=np.float32)
-            preds_data = np.zeros((0, len(self.target_channels[stream_idx])), dtype=np.float32)
+        target_coords = self._extract_coordinates(stream_idx, offset_key, target_dp)
+        preds_coords = self._extract_coordinates(stream_idx, offset_key, preds_dp)
+
+        n_ch = len(self.target_channels[stream_idx])
+        if (target_dp.stop - target_dp.start) == 0:
+            target_data = np.zeros((0, n_ch), dtype=np.float32)
         else:
-            target_data = self.targets[offset_key.forecast_step][stream_idx][datapoints]
+            target_data = self.targets[offset_key.forecast_step][stream_idx][target_dp]
+        if (preds_dp.stop - preds_dp.start) == 0:
+            preds_data = np.zeros((0, n_ch), dtype=np.float32)
+        else:
             preds_data = self.predictions[offset_key.forecast_step][stream_idx].transpose(1, 2, 0)[
-                datapoints
+                preds_dp
             ]
 
-        assert len(data_coords.channels) == target_data.shape[1], (
+        assert len(target_coords.channels) == target_data.shape[1], (
             "Number of channel names does not align with target data."
         )
-        assert len(data_coords.channels) == preds_data.shape[1], (
+        assert len(preds_coords.channels) == preds_data.shape[1], (
             "Number of channel names does not align with prediction data."
         )
 
@@ -713,20 +731,20 @@ class OutputBatchData:
             key,
             source_interval,
             target_data,
-            **dataclasses.asdict(data_coords),
+            **dataclasses.asdict(target_coords),
         )
         prediction_dataset = OutputDataset(
             "prediction",
             key,
             source_interval,
             preds_data,
-            **dataclasses.asdict(data_coords),
+            **dataclasses.asdict(preds_coords),
         )
 
         return target_dataset, prediction_dataset
 
-    def _get_datapoints_per_sample(self, offset_key, stream_idx):
-        lens = self.targets_lens[offset_key.forecast_step][stream_idx]
+    def _get_datapoints_per_sample(self, offset_key, stream_idx, lens_all):
+        lens = lens_all[offset_key.forecast_step][stream_idx]
 
         # empty target/prediction
         if len(lens) == 0:

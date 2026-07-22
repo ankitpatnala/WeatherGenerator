@@ -13,6 +13,7 @@ import pathlib
 from collections.abc import Sequence
 
 import numpy as np
+import pandas as pd
 import torch
 from omegaconf import OmegaConf
 
@@ -86,6 +87,25 @@ def collect_datasources(stream_datasets: list, idx: int, type: str, rng) -> IORe
     return IOReaderData.combine(rdatas)
 
 
+def collect_forecast_queries(stream_datasets: list, when) -> IOReaderData:
+    """
+    Build a combined full-grid target query for a free-running forecast step beyond the data.
+
+    Mirrors collect_datasources' normalization but sources the target from each gridded
+    reader's get_target_query (fixed grid + analytic geoinfos, unknown values) instead of a
+    dataset read. No shuffle/subsample: the whole grid is predicted.
+    """
+    when_dt = pd.Timestamp(when).to_pydatetime()
+    rdatas = []
+    for ds in stream_datasets:
+        rdata = ds.get_target_query(when_dt).remove_nan_coords_and_geoinfos()
+        rdata.data = ds.normalize_target_channels(rdata.data)
+        rdata.geoinfos = ds.normalize_geoinfos(rdata.geoinfos)
+        rdatas += [rdata]
+
+    return IOReaderData.combine(rdatas)
+
+
 @dataclasses.dataclass
 class _Stream:
     info: Config
@@ -128,6 +148,12 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             mode_cfg.get("samples_per_mini_epoch", 0) == 1
             and chunk_size < int(self.list_num_forecast_steps.max())
         )
+
+        # free-running forecast: for forecast steps beyond the dataset coverage there is no
+        # ground truth, so gridded (anemoi) streams build a full-grid target query with
+        # analytically-computed geoinfos instead of the 2-point spoof. Off by default so
+        # in-range training/validation and spoof-for-gaps behavior are unchanged.
+        self.free_running = forecast_cfg.get("free_running", False)
 
         # initialise fsm, but can change for future mini_epochs
         self.batch_size = get_batch_size_from_config(mode_cfg)
@@ -520,14 +546,21 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 )
 
                 if "target_coords" in mode:
+                    # coords are always needed: they are the decoder's prediction locations
                     stream_data.add_target_coords(
                         self._stage, timestep_idx, tc, tc_l, rdata.is_spoof
                     )
 
+                # a free-running forecast step beyond the data has no ground truth: record the
+                # prediction locations (coords/times) but leave target values empty, so
+                # write_output emits a full prediction with an empty target for this step
                 if "target_values" in mode:
-                    stream_data.add_target_values(
-                        self._stage, timestep_idx, tt_cells, tt_c, tt_t, idxs_inv, rdata.is_spoof
-                    )
+                    if getattr(rdata, "is_forecast_query", False):
+                        stream_data.add_target_query(timestep_idx, tt_c, tt_t)
+                    else:
+                        stream_data.add_target_values(
+                            self._stage, timestep_idx, tt_cells, tt_c, tt_t, idxs_inv, rdata.is_spoof
+                        )
 
         return stream_data
 
@@ -702,16 +735,23 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             rdata = collect_datasources(stream_ds, step_forecast_dt, "target", self.rng)
 
             if rdata.is_empty():
-                # work around for https://github.com/pytorch/pytorch/issues/158719
-                # create non-empty mean data instead of empty tensor
                 time_win = self.time_window_handler.window(step_forecast_dt)
-                rdata = spoof(
-                    self.healpix_level,
-                    time_win.start,
-                    stream_ds[0].get_geoinfo_size(),
-                    len(stream_ds[0].mean[stream_ds[0].target_idx]),
-                )
-                rdata.is_spoof = True
+                if self.free_running and all(
+                    isinstance(ds, DataReaderAnemoi) for ds in stream_ds
+                ):
+                    # forecast beyond the data: predict the full grid using analytic geoinfos
+                    # (no ground truth exists past the dataset). Not a spoof -> outputs written.
+                    rdata = collect_forecast_queries(stream_ds, time_win.start)
+                else:
+                    # work around for https://github.com/pytorch/pytorch/issues/158719
+                    # create non-empty mean data instead of empty tensor
+                    rdata = spoof(
+                        self.healpix_level,
+                        time_win.start,
+                        stream_ds[0].get_geoinfo_size(),
+                        len(stream_ds[0].mean[stream_ds[0].target_idx]),
+                    )
+                    rdata.is_spoof = True
 
             output_data += [rdata]
 

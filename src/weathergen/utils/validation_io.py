@@ -55,6 +55,9 @@ def write_output(
     output_idxs = batch.get_output_idxs()
     forecast_offset = output_idxs[0] if len(output_idxs) > 0 else 0
     targets_lens = []
+    # predictions can cover more points than targets (free-running: full grid predicted, no
+    # target), so predictions are sized independently from targets when writing
+    preds_lens = []
 
     data_streams = {}
     for stream_name in cf.streams.keys():
@@ -68,11 +71,25 @@ def write_output(
         targets_coords_all += [[]]
         targets_times_all += [[]]
         targets_lens += [[]]
+        preds_lens += [[]]
         for sname in data_streams.keys():
             # handle spoof data: do not write since it might corrupt validation (spoofing invisible
             # there)
             t_chunk_idx = t_idx - fstep_offset
-            if target_aux_out.physical[t_idx][sname]["is_spoof"][0]:
+            if target_aux_out.physical[t_idx][sname].get("is_forecast_query", [False])[0]:
+                # free-running step beyond the data: write the full-grid prediction with its
+                # coordinates, but there is no ground-truth target so emit an empty target.
+                preds = model_output.get_physical_prediction(t_chunk_idx, sname)
+                target_data = target_aux_out.physical[t_idx][sname]
+                preds_s, targets_s, t_coords_s, t_times_s = [], [], [], []
+                for i_batch, pred in enumerate(preds):
+                    pred_np = dn_data(sname, pred.to(fp32)).detach().cpu().numpy()
+                    preds_s += [pred_np]
+                    targets_s += [np.zeros((0, pred_np.shape[-1]), dtype=np.float32)]
+                    t_coords_s += [target_data["target_coords"][i_batch].cpu().numpy()]
+                    t_times_s += [target_data["target_times"][i_batch].astype("datetime64[ns]")]
+
+            elif target_aux_out.physical[t_idx][sname]["is_spoof"][0]:
                 preds = model_output.get_physical_prediction(t_chunk_idx, sname)
                 preds_shape = preds[0].shape
                 targets = target_aux_out.physical[t_idx][sname]["target"]
@@ -121,6 +138,11 @@ def write_output(
 
             targets_lens[-1] += [[]]
             targets_lens[-1][-1] += [t.shape[0] for t in targets_s]
+
+            # predictions are shape (ens, points, channels): size them by their own point count
+            # so a full-grid free-running prediction is written even with an empty target
+            preds_lens[-1] += [[]]
+            preds_lens[-1][-1] += [p.shape[1] for p in preds_s]
 
             preds_all[-1] += [np.concatenate(preds_s, axis=1)]
             targets_all[-1] += [np.concatenate(targets_s)]
@@ -194,6 +216,7 @@ def write_output(
         sample_start,
         forecast_offset,
         forecast_steps_override=timestep_idxs,
+        preds_lens=preds_lens,
     )
     with zarrio_writer(config.get_path_results(cf, mini_epoch)) as zio:
         for subset in data.items():
