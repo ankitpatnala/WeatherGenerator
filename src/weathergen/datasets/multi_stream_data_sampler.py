@@ -118,6 +118,17 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         steps = np.array(forecast_cfg["num_steps"], dtype=np.int32).reshape(-1)
         self.list_num_forecast_steps = np.array(steps, dtype=np.int32)
 
+        # Lazy target materialization: for a long single-sample rollout (decadal), building
+        # every forecast step's targets up front blows memory. When the rollout is chunked
+        # (chunk_size < num_steps) and there is a single sample, the trainer materializes one
+        # chunk of targets at a time instead. Multi-sample runs (e.g. weather-range with
+        # several samples) keep the eager path so dataloader workers stay useful.
+        chunk_size = forecast_cfg.get("chunk_size") or int(self.list_num_forecast_steps.max())
+        self._lazy_targets = (
+            mode_cfg.get("samples_per_mini_epoch", 0) == 1
+            and chunk_size < int(self.list_num_forecast_steps.max())
+        )
+
         # initialise fsm, but can change for future mini_epochs
         self.batch_size = get_batch_size_from_config(mode_cfg)
         self.shuffle = mode_cfg.shuffle
@@ -475,21 +486,26 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         output_data: list,
         output_tokens: list,
         target_mask,
+        step_range=None,
     ) -> StreamData:
         """
         Generate stream data for output
 
+        output_data / output_tokens hold the windows for the forecast steps in step_range
+        (absolute timestep indices; None = full range), so they are indexed relative to the
+        range start while the results are written into the absolute timestep slot.
         """
 
-        # collect for all forecast steps
-        num_output_steps = self._get_output_length(num_forecast_steps)
-        for step, timestep_idx in enumerate(range(self.output_offset, num_output_steps)):
+        # collect for the requested forecast steps
+        start, end = self._output_step_range(num_forecast_steps, step_range)
+        for timestep_idx in range(start, end):
+            local_step = timestep_idx - start
             step_forecast_dt = idx + (self.time_step * timestep_idx) // self.step_timedelta
             time_win_target = self.time_window_handler.window(step_forecast_dt)
 
             # collect all targets for current stream
-            rdata = output_data[step]
-            token_data = output_tokens[step]
+            rdata = output_data[local_step]
+            token_data = output_tokens[local_step]
 
             if token_data[0] is None and token_data[1] is None:
                 continue
@@ -528,6 +544,8 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         output_tokens: list,
         output_mask,
         input_mask,
+        step_range=None,
+        build_output: bool = True,
     ) -> StreamData:
         """
         Return one batch of data
@@ -543,6 +561,10 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
             output_mask : mask for output/prediction/target
             input_mask : mask for network input (can be source or target)
+            step_range : absolute forecast-step range to build targets for (None = full range);
+                output_data / output_tokens must be aligned to this range
+            build_output : when False, only the input/network-input side is built and the
+                (allocated but empty) target slots are left for later lazy materialization
 
 
         Returns:
@@ -568,16 +590,18 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             input_mask,
         )
 
-        stream_data = self._build_stream_data_output(
-            modes,
-            stream_data,
-            base_idx,
-            stream_info,
-            num_forecast_steps,
-            output_data,
-            output_tokens,
-            output_mask,
-        )
+        if build_output:
+            stream_data = self._build_stream_data_output(
+                modes,
+                stream_data,
+                base_idx,
+                stream_info,
+                num_forecast_steps,
+                output_data,
+                output_tokens,
+                output_mask,
+                step_range=step_range,
+            )
 
         return stream_data
 
@@ -587,9 +611,10 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         condition_ds: AnyDataReader,
         base_idx: TIndex,
         num_output_steps: int,
+        step_range=None,
     ):
         """
-        Collect encoded condition values for every forecast step.
+        Collect encoded condition values for the requested forecast steps.
 
         Parameters
         ----------
@@ -599,26 +624,45 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             Base time index for this sample.
         num_output_steps :
             Total number of output/forecast steps.
+        step_range :
+            Half-open (start, end) range of condition steps to build (None = all steps).
+            Conditions grow with the rollout length, so a chunked rollout builds only the
+            steps it is about to consume.
 
         Returns
         -------
         np.ndarray of shape (num_output_steps - output_offset, num_channels)
         """
 
-        for i in range(num_output_steps):
+        start, end = (0, num_output_steps) if step_range is None else step_range
+        for i in range(start, end):
             condition_data = condition_ds.get_condition(
                 base_idx + (self.time_step * i) // self.step_timedelta
             )
             batch.get_source_samples().conditions[i] += condition_data
 
-    def _get_data_windows(self, base_idx, num_forecast_steps, num_steps_input_max, stream_ds):
+    def _output_step_range(self, num_forecast_steps, step_range=None):
         """
-        Collect all data needed for current stream to potentially amortize costs by
-        generating multiple samples
+        Resolve the absolute output/forecast step range to build.
 
+        Returns a (start, end) tuple of absolute timestep indices. When step_range is None
+        the full range [output_offset, num_output_steps) is used, i.e. the eager behavior.
+        A sub-range is used to materialize only a chunk of forecast steps at a time.
         """
+        num_output_steps = self._get_output_length(num_forecast_steps)
+        if step_range is None:
+            return (self.output_offset, num_output_steps)
+        start, end = step_range
+        assert self.output_offset <= start <= end <= num_output_steps, (
+            f"output step range {step_range} outside [{self.output_offset}, {num_output_steps}]"
+        )
+        return (start, end)
 
-        # source data: iterate overall input steps
+    def _get_input_windows(self, base_idx, num_steps_input_max, stream_ds):
+        """
+        Collect source/input data windows for the current stream.
+        The input side does not grow with the rollout length, so it is always read in full.
+        """
         input_data = []
         for idx in range(base_idx - num_steps_input_max + 1, base_idx + 1):
             # TODO: check that we are not out of bounds when we go back in time
@@ -639,10 +683,20 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
             input_data += [rdata]
 
-        # target data: collect for all forecast steps
+        return input_data
+
+    def _get_output_windows(self, base_idx, num_forecast_steps, stream_ds, step_range=None):
+        """
+        Collect target/output data windows for the current stream.
+
+        Only the forecast steps in step_range (absolute timestep indices; None = full range)
+        are read, so a chunked rollout can materialize one chunk of targets at a time
+        instead of loading every forecast step up front.
+        """
+        start, end = self._output_step_range(num_forecast_steps, step_range)
+
         output_data = []
-        num_output_steps = self._get_output_length(num_forecast_steps)
-        for timestep_idx in range(self.output_offset, num_output_steps):
+        for timestep_idx in range(start, end):
             step_forecast_dt = base_idx + (self.time_step * timestep_idx) // self.step_timedelta
 
             rdata = collect_datasources(stream_ds, step_forecast_dt, "target", self.rng)
@@ -660,6 +714,17 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 rdata.is_spoof = True
 
             output_data += [rdata]
+
+        return output_data
+
+    def _get_data_windows(self, base_idx, num_forecast_steps, num_steps_input_max, stream_ds):
+        """
+        Collect all data needed for current stream to potentially amortize costs by
+        generating multiple samples
+
+        """
+        input_data = self._get_input_windows(base_idx, num_steps_input_max, stream_ds)
+        output_data = self._get_output_windows(base_idx, num_forecast_steps, stream_ds)
 
         return (input_data, output_data)
 
@@ -816,6 +881,202 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
         return batch
 
+    def _resolve_selects(self, mode):
+        """Determine which source/target fields a training mode builds."""
+        source_select, target_select = [], []
+        if "masking" in mode:
+            source_select += ["network_input", "target_coords"]
+            target_select += ["target_values"]
+        if "student_teacher" in mode or "latent_loss" in mode:
+            source_select += ["network_input"]
+            target_select += ["network_input"]
+        source_select, target_select = list(set(source_select)), list(set(target_select))
+        if len(source_select) == 0 or len(target_select) == 0:
+            raise NotImplementedError(f"Unsupported training mode {mode}.")
+        return source_select, target_select
+
+    def _build_batch_skeleton(self, idx: int, num_forecast_steps: int):
+        """
+        Build a batch with the source/input side only; target slots are allocated but empty.
+
+        Used for lazy target materialization on long single-sample rollouts: the forecast-step
+        targets (target_coords in source samples, target_values in target samples, conditions)
+        are filled later, one chunk at a time, by `_materialize_target_chunk`. The context
+        needed to materialize is stashed on `self._materialize_ctx`.
+        """
+        mode = self.mode_cfg.get("training_mode")
+        source_cfgs = self.mode_cfg.get("model_input")
+        target_cfgs = self.mode_cfg.get("target_input", {})
+
+        masks_streams, num_source_samples, num_target_samples = self._get_source_target_masks(mode)
+        source_select, target_select = self._resolve_selects(mode)
+
+        num_output_steps = self._get_output_length(num_forecast_steps)
+        batch = ModelBatch(
+            list(self.streams_datasets.keys()),
+            num_source_samples,
+            num_target_samples,
+            self.output_offset,
+            num_output_steps,
+        )
+
+        input_steps = None
+        for stream_name, stream_data in self.streams_datasets.items():
+            stream_info, stream_ds = stream_data.info, stream_data.readers
+            (target_masks, source_masks, source_to_target) = masks_streams[stream_name]
+
+            input_steps = np.array([sc.get("num_steps_input", 1) for _, sc in source_cfgs.items()])
+            assert input_steps.min() == input_steps.max(), (
+                "Number of input steps has to be constant across configs."
+            )
+            assert input_steps.min(), "Number of input steps has to be greater than zero."
+
+            # source/input windows only; the target side is materialized lazily per chunk
+            i_max = input_steps.max().item()
+            input_data = self._get_input_windows(idx, i_max, stream_ds)
+            input_tokens = self.tokenizer.get_tokens_windows(stream_info, input_data, True)
+
+            for sidx, source_mask in enumerate(source_masks.masks):
+                tidx = source_to_target[sidx].item()
+                sdata = self._build_stream_data(
+                    source_select,
+                    idx,
+                    num_forecast_steps,
+                    stream_info,
+                    source_masks.metadata[sidx].params.get("num_steps_input", 1),
+                    input_data,
+                    [],
+                    input_tokens,
+                    [],
+                    output_mask=target_masks.masks[tidx],
+                    input_mask=source_mask,
+                    build_output=False,
+                )
+                batch.add_source_stream(sidx, tidx, stream_name, sdata, source_masks.metadata[sidx])
+
+            for tidx, target_mask in enumerate(target_masks.masks):
+                sdata = self._build_stream_data(
+                    target_select,
+                    idx,
+                    num_forecast_steps,
+                    stream_info,
+                    target_masks.metadata[tidx].params.get("num_steps_input", 1),
+                    input_data,
+                    [],
+                    input_tokens,
+                    [],
+                    output_mask=target_mask,
+                    input_mask=target_mask,
+                    build_output=False,
+                )
+                target_metadata = target_masks.metadata[tidx]
+                target_metadata.mask = target_mask
+                student_indices = [
+                    s_idx for s_idx, tid in enumerate(source_to_target) if tid == tidx
+                ]
+                batch.add_target_stream(tidx, student_indices, stream_name, sdata, target_metadata)
+
+        source_in_steps = input_steps.max().item()
+        target_in_steps = np.array([tc.get("num_steps_input", 1) for _, tc in target_cfgs.items()])
+        target_in_steps = 1 if len(target_in_steps) == 0 else target_in_steps.max().item()
+        batch = self._preprocess_model_batch(batch, source_in_steps, target_in_steps)
+
+        # context needed to fill the target slots later (single sample processed at a time)
+        self._materialize_ctx = {
+            "idx": idx,
+            "num_forecast_steps": num_forecast_steps,
+            "num_output_steps": num_output_steps,
+            "masks_streams": masks_streams,
+            "source_select": source_select,
+            "target_select": target_select,
+        }
+        return batch
+
+    def _materialize_target_chunk(self, batch: ModelBatch, step_range):
+        """
+        Fill the target slots for one chunk of forecast steps (absolute [start, end) range).
+
+        Mirrors the output-building half of `_get_batch` but writes in place into the
+        already-added source/target StreamData objects, reading and tokenizing only the
+        windows for this chunk. Pass step_range=None to materialize the full range (used to
+        validate equivalence with the eager path).
+        """
+        ctx = self._materialize_ctx
+        idx = ctx["idx"]
+        num_fc = ctx["num_forecast_steps"]
+        start, end = self._output_step_range(num_fc, step_range)
+
+        for stream_name, stream_data in self.streams_datasets.items():
+            stream_info, stream_ds = stream_data.info, stream_data.readers
+            (target_masks, source_masks, source_to_target) = ctx["masks_streams"][stream_name]
+
+            output_data = self._get_output_windows(idx, num_fc, stream_ds, step_range=(start, end))
+            output_tokens = self.tokenizer.get_tokens_windows(stream_info, output_data, False)
+
+            # target_coords live in the source samples
+            for sidx in range(len(source_masks.masks)):
+                tidx = source_to_target[sidx].item()
+                sdata = batch.get_source_sample(sidx).get_stream_data(stream_name)
+                self._build_stream_data_output(
+                    ctx["source_select"],
+                    sdata,
+                    idx,
+                    stream_info,
+                    num_fc,
+                    output_data,
+                    output_tokens,
+                    target_masks.masks[tidx],
+                    step_range=(start, end),
+                )
+
+            # target_values live in the target samples
+            for tidx, target_mask in enumerate(target_masks.masks):
+                sdata = batch.get_target_sample(tidx).get_stream_data(stream_name)
+                self._build_stream_data_output(
+                    ctx["target_select"],
+                    sdata,
+                    idx,
+                    stream_info,
+                    num_fc,
+                    output_data,
+                    output_tokens,
+                    target_mask,
+                    step_range=(start, end),
+                )
+
+        # conditions are indexed by the same absolute forecast step as the targets
+        for _, condition_data in self.condition_datasets.items():
+            condition_ds = condition_data.readers
+            self._build_condition_data(
+                batch, condition_ds[0], idx, ctx["num_output_steps"], step_range=(start, end)
+            )
+
+        return batch
+
+    def _release_target_chunk(self, batch: ModelBatch, step_range):
+        """
+        Free the target tensors for a consumed chunk by resetting its slots to the empty
+        StreamData defaults. This is what actually bounds peak memory during a long rollout:
+        once a chunk has been forecast and written, its targets are no longer needed.
+        """
+        start, end = step_range
+        n_cells = self.num_healpix_cells
+
+        def reset_slots(sd):
+            for i in range(start, end):
+                sd.target_coords[i] = torch.tensor([])
+                sd.target_coords_lens[i] = torch.tensor([0 for _ in range(n_cells)])
+                sd.target_tokens[i] = torch.tensor([])
+                sd.target_coords_raw[i] = []
+                sd.target_times_raw[i] = np.array([], dtype="datetime64[ns]")
+                sd.idxs_inv[i] = torch.tensor([], dtype=torch.int64)
+
+        for stream_name in self.streams_datasets:
+            for s in range(batch.len_sources()):
+                reset_slots(batch.get_source_sample(s).get_stream_data(stream_name))
+            for t in range(batch.len_targets()):
+                reset_slots(batch.get_target_sample(t).get_stream_data(stream_name))
+
     def __iter__(self) -> ModelBatch:
         """
         Return one batch of data
@@ -844,13 +1105,21 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 idx: TIndex = perms[idx_raw % perms.shape[0]]
                 idx_raw += 1
 
-                batch = self._get_batch(idx, num_forecast_steps)
-
-                # ensure the batch is valid, i.e. not completely empty and no NaN values
-                # student teacher has no classical targets
                 mode = self.mode_cfg.get("training_mode")
-                not_valid = batch.sources_empty() or batch.is_nan()
-                not_valid = not_valid or (batch.targets_empty() if "masking" in mode else False)
+                if self._lazy_targets:
+                    # targets are materialized later per chunk; only the source side exists
+                    # here, so gate validity on sources alone.
+                    batch = self._build_batch_skeleton(idx, num_forecast_steps)
+                    not_valid = batch.sources_empty() or batch.sources_nan()
+                else:
+                    batch = self._get_batch(idx, num_forecast_steps)
+
+                    # ensure the batch is valid, i.e. not completely empty and no NaN values
+                    # student teacher has no classical targets
+                    not_valid = batch.sources_empty() or batch.is_nan()
+                    not_valid = not_valid or (
+                        batch.targets_empty() if "masking" in mode else False
+                    )
 
                 # skip completely empty batch item or when all targets are empty -> no grad
                 if not_valid:

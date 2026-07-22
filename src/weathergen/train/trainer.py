@@ -235,13 +235,16 @@ class Trainer(TrainerBase):
         source_samples = batch.get_source_samples()
         num_samples_write = mode_cfg.get("output", {}).get("num_samples", 0) * batch_size
         should_write_output = bidx < num_samples_write
+        # lazy targets: materialize one chunk of targets at a time (long single-sample rollout)
+        lazy = getattr(self.dataset_val, "_lazy_targets", False)
         if should_write_output:
             denormalize_data_fct = (
                 (lambda x0, x1: x1)
                 if mode_cfg.get("output", {}).get("normalized_samples", False)
                 else self.dataset_val.denormalize_target_channels
             )
-            if not targets_and_auxs:
+            # in lazy mode targets do not exist yet; they are built (and checked) per chunk below
+            if not lazy and not targets_and_auxs:
                 raise ValueError(
                     "Writing validation output requires targets. "
                     "Configure validation losses or set output.num_samples=0."
@@ -250,6 +253,7 @@ class Trainer(TrainerBase):
         output_idxs = batch.get_output_idxs()
         forecast_step_offset = output_idxs[0] if len(output_idxs) > 0 else 0
 
+        cum_steps = 0
         with tqdm.tqdm(
             total=len(chunks),
             disable=self.cf.with_ddp or len(chunks) <= 1,
@@ -261,6 +265,21 @@ class Trainer(TrainerBase):
                     f"running {chunk_idx + 1}/{len(chunks)} ({chunk_size} steps)"
                 )
                 chunk_pbar.refresh()
+
+                # absolute forecast-step range this chunk covers; matches the post-call
+                # chunk_step_offset but is known before the model reads target_coords/conditions
+                chunk_abs_range = (
+                    forecast_step_offset + cum_steps,
+                    forecast_step_offset + cum_steps + chunk_size,
+                )
+                if lazy:
+                    # build this chunk's targets, move them to device (the coord-conditioned
+                    # decoder and conditions read them during the forward), then compute the
+                    # per-chunk target/aux used for output writing.
+                    self.dataset_val._materialize_target_chunk(batch, chunk_abs_range)
+                    batch.to_device(self.device)
+                    if should_write_output:
+                        targets_and_auxs = self._get_output_target_and_auxs(mode_cfg, batch)
 
                 if self.ema_model is None:
                     source_samples = self.model(
@@ -314,6 +333,11 @@ class Trainer(TrainerBase):
                     ):
                         raise ValueError("Missing latent_state for chunked forecast continuation.")
 
+                if lazy:
+                    # chunk consumed (forecast + written): drop its targets to bound memory
+                    self.dataset_val._release_target_chunk(batch, chunk_abs_range)
+
+                cum_steps += chunk_size
                 chunk_pbar.update(1)
 
     def inference(self, cf, devices, run_id_contd, mini_epoch_contd):
@@ -336,13 +360,20 @@ class Trainer(TrainerBase):
 
         # make sure number of loaders does not exceed requested samples
         loader_num_workers = min(self.test_cfg.samples_per_mini_epoch, cf.data_loading.num_workers)
+        # lazy target materialization needs the data readers in the main process (the trainer
+        # calls back into the dataset per chunk), so it runs without dataloader workers. This is
+        # the single-sample long-rollout regime, where worker parallelism gains nothing anyway.
+        if getattr(self.dataset, "_lazy_targets", False):
+            loader_num_workers = 0
         loader_params = {
             "batch_size": None,
             "batch_sampler": None,
             "shuffle": False,
             "num_workers": loader_num_workers,
             "pin_memory": cf.data_loading.get("memory_pinning", False),
-            "persistent_workers": cf.data_loading.get("persistent_workers", False),
+            # persistent_workers is only valid with at least one worker
+            "persistent_workers": loader_num_workers > 0
+            and cf.data_loading.get("persistent_workers", False),
         }
         self.data_loader_validation = torch.utils.data.DataLoader(
             self.dataset, **loader_params, sampler=None
@@ -745,10 +776,17 @@ class Trainer(TrainerBase):
                         batch = batch.pin_memory()
 
                     should_write_output = bidx < num_samples_write
+                    lazy = getattr(self.dataset_val, "_lazy_targets", False)
                     if compute_loss:
+                        # lazy targets currently only supports the pure-rollout write path
+                        assert not lazy, (
+                            "Lazy target materialization does not support compute_loss=true; "
+                            "set compute_loss=false for chunked long rollouts."
+                        )
                         batch.to_device(self.device)
                     else:
-                        if should_write_output:
+                        if should_write_output and not lazy:
+                            # eager: build all targets up front; lazy builds them per chunk
                             targets_and_auxs = self._get_output_target_and_auxs(mode_cfg, batch)
                         else:
                             targets_and_auxs = {}
