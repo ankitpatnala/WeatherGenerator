@@ -26,6 +26,7 @@ import weathergen.common.config as config
 from weathergen.common.config import Config
 from weathergen.datasets.multi_stream_data_sampler import MultiStreamDataSampler
 from weathergen.model.ema import EMAModel
+from weathergen.model.engines import LatentState
 from weathergen.model.model import ModelOutput
 from weathergen.model.model_interface import (
     init_model_and_shard,
@@ -220,6 +221,61 @@ class Trainer(TrainerBase):
             [remainder_fsteps] if remainder_fsteps else []
         )
 
+    def _rollout_state_path(self):
+        """File where the resumable rollout state (carried latent + progress) is stored."""
+        return config.get_path_run(self.cf) / "rollout_state.pt"
+
+    def _save_rollout_state(self, latent_state: LatentState, done_steps: int, idx: int):
+        """
+        Persist the state needed to resume a long rollout after this chunk.
+
+        The rollout is Markovian in the latent tokens, so the carried LatentState plus the
+        number of completed forecast steps (and the initial-condition index) is sufficient to
+        continue exactly. Written atomically (tmp + replace) so a crash mid-save cannot corrupt
+        an existing checkpoint. Completed forecast steps are already persisted in the output
+        store, so only the continuation state lives here.
+        """
+
+        def to_cpu(t):
+            return t.detach().to("cpu") if isinstance(t, torch.Tensor) else t
+
+        cpu_state = LatentState(
+            class_token=to_cpu(latent_state.class_token),
+            register_tokens=to_cpu(latent_state.register_tokens),
+            patch_tokens=to_cpu(latent_state.patch_tokens),
+            z_pre_norm=to_cpu(latent_state.z_pre_norm),
+        )
+        path = self._rollout_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".pt.tmp")
+        torch.save(
+            {
+                "latent_state": cpu_state,
+                "done_steps": int(done_steps),
+                "idx": int(idx),
+                "run_id": self.cf.general.run_id,
+            },
+            tmp,
+        )
+        tmp.replace(path)
+
+    def _load_rollout_state(self):
+        """Load a previously saved rollout state, or None if there is nothing to resume."""
+        path = self._rollout_state_path()
+        if not path.exists():
+            return None
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        ls = state["latent_state"]
+        state["latent_state"] = LatentState(
+            class_token=ls.class_token.to(self.device) if ls.class_token is not None else None,
+            register_tokens=(
+                ls.register_tokens.to(self.device) if ls.register_tokens is not None else None
+            ),
+            patch_tokens=ls.patch_tokens.to(self.device) if ls.patch_tokens is not None else None,
+            z_pre_norm=ls.z_pre_norm.to(self.device),
+        )
+        return state
+
     def _process_validation_chunks(
         self,
         batch,
@@ -253,14 +309,48 @@ class Trainer(TrainerBase):
         output_idxs = batch.get_output_idxs()
         forecast_step_offset = output_idxs[0] if len(output_idxs) > 0 else 0
 
+        # resumable long rollout (lazy path only): the rollout is Markovian in the latent, so
+        # we can checkpoint the carried latent per chunk and continue from it after a crash.
+        forecast_cfg = mode_cfg.get("forecast", {})
+        save_state = lazy and forecast_cfg.get("checkpoint_rollout", True)
+        rollout_idx = self.dataset_val._materialize_ctx["idx"] if lazy else None
+
         cum_steps = 0
+        chunk_start = 0
+        if lazy and forecast_cfg.get("resume", False):
+            resumed = self._load_rollout_state()
+            if resumed is not None:
+                done = resumed["done_steps"]
+                assert resumed["idx"] == int(rollout_idx), (
+                    f"resume idx mismatch: saved {resumed['idx']} vs current {rollout_idx}; "
+                    "the initial condition differs, refusing to resume."
+                )
+                # state is saved on chunk boundaries, so skip whole completed chunks
+                acc = 0
+                while chunk_start < len(chunks) and acc + chunks[chunk_start] <= done:
+                    acc += chunks[chunk_start]
+                    chunk_start += 1
+                assert acc == done, f"saved done_steps={done} not on a chunk boundary"
+                cum_steps = done
+                # seed the rollout from the saved latent at the completed step offset; an empty
+                # physical list makes the model resume at exactly `done` steps
+                seed = ModelOutput(0, batch=batch.get_source_samples(), step_offset=done)
+                seed.latent = [{"latent_state": resumed["latent_state"]}]
+                source_samples = seed
+                logger.info(
+                    f"Resuming rollout from step {done} (skipping {chunk_start}/{len(chunks)} "
+                    "completed chunks)."
+                )
+
         with tqdm.tqdm(
             total=len(chunks),
+            initial=chunk_start,
             disable=self.cf.with_ddp or len(chunks) <= 1,
             leave=False,
             desc=f"batch {bidx + 1} chunks",
         ) as chunk_pbar:
-            for chunk_idx, chunk_size in enumerate(chunks):
+            for chunk_idx in range(chunk_start, len(chunks)):
+                chunk_size = chunks[chunk_idx]
                 chunk_pbar.set_postfix_str(
                     f"running {chunk_idx + 1}/{len(chunks)} ({chunk_size} steps)"
                 )
@@ -338,6 +428,15 @@ class Trainer(TrainerBase):
                     self.dataset_val._release_target_chunk(batch, chunk_abs_range)
 
                 cum_steps += chunk_size
+
+                # checkpoint the carried latent after every chunk (including the last) so the
+                # rollout can be resumed after a crash or extended later to more forecast steps.
+                # Kept on completion so a finished rollout stays continuable.
+                if save_state:
+                    self._save_rollout_state(
+                        source_samples.get_last_latent_state(), cum_steps, rollout_idx
+                    )
+
                 chunk_pbar.update(1)
 
     def inference(self, cf, devices, run_id_contd, mini_epoch_contd):
