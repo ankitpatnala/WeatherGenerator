@@ -39,6 +39,7 @@ from weathergen.model.engines import (
 )
 from weathergen.model.layers import MLP, NamedLinear
 from weathergen.model.utils import get_num_parameters
+from weathergen.train.loss_modules.utils import compute_cos_sim_to_prev
 from weathergen.utils.distributed import is_root
 from weathergen.utils.utils import get_dtype, is_stream_forcing
 
@@ -446,6 +447,10 @@ class Model(torch.nn.Module):
                 v.type for _, v in cf.validation_config.losses.items() if v.get("enabled", True)
             ]
 
+        # cos_sim_to_prev is only needed by the latent (cosine-band) loss; compute it
+        # (and keep prev_tokens around for it) only when that loss is configured.
+        self.compute_cos_sim_to_prev = "LossLatent" in loss_terms
+
         if "LossPhysical" in loss_terms:
             for i_stream, si in enumerate(self.data_streams):
                 stream_name = self.data_stream_names[i_stream]
@@ -773,7 +778,17 @@ class Model(torch.nn.Module):
                             tokens, condition, coords=model_params.rope_coords
                         )
                     continue
+                prev_tokens = tokens if self.compute_cos_sim_to_prev else None
                 tokens = self.forecast_engine(tokens, condition, coords=model_params.rope_coords)
+
+                # per-token cosine similarity between current and previous patch tokens,
+                # consumed by LossLatent (cosine-band regulariser)
+                if self.compute_cos_sim_to_prev:
+                    output.add_latent_prediction(
+                        step,
+                        "cos_sim_to_prev",
+                        compute_cos_sim_to_prev(tokens, prev_tokens, self.num_aux_tokens),
+                    )
             # decoder predictions
             output = self.predict_decoders(
                 model_params, step, step + batch_step_offset, tokens, batch_ctx, output
