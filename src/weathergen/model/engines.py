@@ -30,7 +30,7 @@ from weathergen.model.embeddings import (
 )
 from weathergen.model.layers import MLP
 from weathergen.model.utils import ActivationFactory
-from weathergen.utils.utils import get_dtype
+from weathergen.utils.utils import get_dtype, is_stream_fe_only
 
 
 class EmbeddingEngine(torch.nn.Module):
@@ -51,13 +51,13 @@ class EmbeddingEngine(torch.nn.Module):
         self.data_stream_names = [
             stream_name
             for stream_name, stream_cfg in cf.streams.items()
-            if stream_cfg.get("type") != "condition"
+            if not is_stream_fe_only(stream_cfg)
         ]
 
         self.data_streams = [
             stream_cfg
             for stream_cfg in cf.streams.values()
-            if stream_cfg.get("type") != "condition"
+            if not is_stream_fe_only(stream_cfg)
         ]
 
         for i, (si, stream_name) in enumerate(
@@ -877,7 +877,10 @@ class TargetPredictionEngine(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, 9, self.cf.ae_global_dim_embed))
         dim_aux = self.cf.ae_global_dim_embed
 
-        target_readout_num_heads = next(self.cf.streams.values())["target_readout"]["num_heads"]
+        # first real data stream (condition/forcing streams have no target_readout)
+        target_readout_num_heads = next(
+            s for s in self.cf.streams.values() if not is_stream_fe_only(s)
+        )["target_readout"]["num_heads"]
         for ith, dim in enumerate(self.dims_embed[:-1]):
             if self.cf.decoder_type == "PerceiverIO":
                 # a single cross attention layer as per https://arxiv.org/pdf/2107.14795

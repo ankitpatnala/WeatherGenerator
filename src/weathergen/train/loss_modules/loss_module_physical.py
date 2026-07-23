@@ -20,6 +20,7 @@ from omegaconf import DictConfig
 import weathergen.train.loss_modules.loss_functions as loss_fns
 from weathergen.train.loss_modules.loss_module_base import LossModuleBase, LossValues
 from weathergen.train.utils import TRAIN, VAL, Stage
+from weathergen.utils.utils import is_stream_fe_only
 
 _logger = logging.getLogger(__name__)
 
@@ -284,7 +285,7 @@ class LossPhysical(LossModuleBase):
         data_streams = [
             stream_cfg
             for stream_cfg in self.cf.streams.values()
-            if stream_cfg.get("type") != "condition"
+            if not is_stream_fe_only(stream_cfg)
         ]
 
         for stream_info in data_streams:

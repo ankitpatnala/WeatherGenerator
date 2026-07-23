@@ -177,6 +177,10 @@ class BatchSamples:
         self.output_idxs = output_idxs
         self.device = None
         self.conditions = [[] for i in range(output_steps)]
+        # Per-step spatial forcing field (e.g. SST) on the FE latent cells (parallel to
+        # `conditions`, but spatial): each entry becomes a (num_cells, 2*num_vars) array of
+        # [cell_values | cell_valid] once built, then a tensor after to_device.
+        self.forcing = [[] for i in range(output_steps)]
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -192,6 +196,11 @@ class BatchSamples:
         self.conditions = [
             torch.tensor(cond, dtype=torch.float32, device=device) if len(cond) > 0 else cond
             for cond in self.conditions
+        ]
+
+        self.forcing = [
+            torch.as_tensor(f, dtype=torch.float32, device=device) if len(f) > 0 else f
+            for f in self.forcing
         ]
 
         self.device = device

@@ -16,6 +16,7 @@ import weathergen.common.config as config
 import weathergen.common.io as io
 from weathergen.common.io import TimeRange, zarrio_writer
 from weathergen.datasets.data_reader_base import TimeWindowHandler
+from weathergen.utils.utils import is_stream_fe_only
 
 _logger = logging.getLogger(__name__)
 
@@ -61,7 +62,7 @@ def write_output(
 
     data_streams = {}
     for stream_name in cf.streams.keys():
-        if cf.streams[stream_name]["type"] != "condition":
+        if not is_stream_fe_only(cf.streams[stream_name]):
             data_streams[stream_name] = {}
 
     # TODO Maybe stopping at forecast_steps explained #1657
@@ -179,10 +180,10 @@ def write_output(
     output_streams = {name: stream_names.index(name) for name in output_stream_names}
     _logger.debug(f"Using output streams: {output_streams} from streams: {stream_names}")
 
-    target_channels: list[list[str]] = [list(stream.val_target_channels) for stream in stream_infos if stream["type"] != "condition"]
-    source_channels: list[list[str]] = [list(stream.val_source_channels) for stream in stream_infos if stream["type"] != "condition"]
+    target_channels: list[list[str]] = [list(stream.val_target_channels) for stream in stream_infos if not is_stream_fe_only(stream)]
+    source_channels: list[list[str]] = [list(stream.val_source_channels) for stream in stream_infos if not is_stream_fe_only(stream)]
 
-    geoinfo_channels = [[] for stream in stream_infos if stream["type"]!="condition"]  # TODO obtain channels
+    geoinfo_channels = [[] for stream in stream_infos if not is_stream_fe_only(stream)]  # TODO obtain channels
 
     # calculate global sample indices for this batch by offsetting by sample_start
     sample_start = batch_idx * batch_size

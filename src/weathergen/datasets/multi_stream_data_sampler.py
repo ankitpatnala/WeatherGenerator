@@ -178,6 +178,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.check_samples(self._get_fsm())
         self.streams_datasets = self._init_data_streams(cf)
         self.condition_datasets = self._init_condition_streams(cf)
+        self.forcing_datasets = self._init_forcing_streams(cf)
         # RNG seed setup
         rs = cf.data_loading.rng_seed
         nw = cf.data_loading.num_workers
@@ -281,7 +282,9 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         """Return all the data streams from the config."""
         streams_datasets: dict[StreamName, _Stream] = {}
         for stream_name, stream_info in cf.streams.items():
-            if stream_info["type"] == "condition":
+            # condition and per-step forcing (e.g. SST) streams feed the forecasting engine
+            # directly, not the assimilation/source path; they are initialised separately.
+            if stream_info["type"] in ("condition", "forcing"):
                 continue
             streams_datasets[stream_name] = _Stream(stream_info, [])
 
@@ -339,6 +342,92 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             )
             condition_datasets[stream_name].readers += [ds]
         return condition_datasets
+
+    def _init_forcing_streams(self, cf) -> dict[StreamName, _Stream]:
+        """
+        Instantiate per-step forcing streams (type: forcing, e.g. SST).
+
+        These are read at every forecast step's valid time and injected into the forecasting
+        engine (they do not go through the assimilation/source path). The forcing grid is
+        fixed, so the scatter index onto the HEALPix latent cells is precomputed once per
+        reader and stored alongside it.
+        """
+        from weathergen.model.forcing import build_forcing_cell_index
+
+        forcing_datasets: dict[StreamName, _Stream] = {}
+        for stream_name, stream_info in cf.streams.items():
+            if stream_info["type"] != "forcing":
+                continue
+            stream = _Stream(stream_info, [])
+
+            dataset = self._get_dataset_class(stream_info, stream_name)
+            for fname in stream_info["filenames"]:
+                fname = pathlib.Path(fname)
+                if fname.exists():
+                    filename = fname
+                else:
+                    filenames = [pathlib.Path(path) / fname for path in cf.data_paths]
+                    if not any(f.exists() for f in filenames):
+                        raise FileNotFoundError(
+                            f"Did not find input data for forcing stream '{stream_name}': "
+                            f"{filenames}."
+                        )
+                    filename = filenames[0]
+
+                ds = dataset(
+                    tw_handler=self.time_window_handler,
+                    stream_info=stream_info,
+                    stage=self._stage,
+                    filename=filename,
+                )
+                # precompute the fixed forcing-grid -> HEALPix-cell scatter index
+                ds.forcing_cell_idx = build_forcing_cell_index(
+                    ds.latitudes, ds.longitudes, self.healpix_level
+                )
+                stream.readers += [ds]
+                if is_root():
+                    logger.info(
+                        f"Opening forcing dataset '{stream_name}' from {filename} "
+                        f"(scatter onto {self.num_healpix_cells} cells)."
+                    )
+            forcing_datasets[stream_name] = stream
+        return forcing_datasets
+
+    def _build_forcing_data(
+        self,
+        batch: ModelBatch,
+        forcing_ds: AnyDataReader,
+        base_idx: TIndex,
+        num_output_steps: int,
+        step_range=None,
+    ):
+        """
+        Collect the per-step forcing field (e.g. SST) for the requested forecast steps.
+
+        Mirrors `_build_condition_data`, but the forcing is spatial: for each step the reader
+        is read at that step's valid time (raw, full grid, normalised by the reader stats),
+        then scatter-averaged onto the HEALPix latent cells using the precomputed index. Each
+        step stores a (num_cells, 2*num_vars) array of [cell_values | cell_valid].
+        """
+        from weathergen.model.forcing import scatter_to_cells
+
+        cell_idx = forcing_ds.forcing_cell_idx
+        num_grid_pts = len(cell_idx)
+        start, end = (0, num_output_steps) if step_range is None else step_range
+        for i in range(start, end):
+            idx = base_idx + (self.time_step * i) // self.step_timedelta
+            rdata = forcing_ds.get_source(idx)
+            # raw, full-grid values in fixed grid order (no coord/geoinfo drops for a
+            # full-grid forcing) -> normalise with the reader stats, then scatter. If the
+            # reader stacked multiple input steps, keep only the most recent grid (this step).
+            values = forcing_ds.normalize_source_channels(rdata.data)
+            values = np.asarray(values)[-num_grid_pts:]
+            values_t = torch.as_tensor(values, dtype=torch.float32)
+            cell_values, cell_valid = scatter_to_cells(
+                values_t.unsqueeze(0), cell_idx, self.num_healpix_cells
+            )
+            field = torch.cat([cell_values[0], cell_valid[0]], dim=-1).numpy()
+            batch.get_source_samples().forcing[i] = field
 
     def reset(self) -> tuple[Sequence[int], Sequence[int]]:
         """
@@ -914,6 +1003,10 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             condition_ds = condition_data.readers
             self._build_condition_data(batch, condition_ds[0], idx, num_output_steps)
 
+        # for per-step forcing streams (e.g. SST)
+        for _, forcing_data in self.forcing_datasets.items():
+            self._build_forcing_data(batch, forcing_data.readers[0], idx, num_output_steps)
+
         source_in_steps = input_steps.max().item()
         target_in_steps = np.array([tc.get("num_steps_input", 1) for _, tc in target_cfgs.items()])
         target_in_steps = 1 if len(target_in_steps) == 0 else target_in_steps.max().item()
@@ -1089,6 +1182,12 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             condition_ds = condition_data.readers
             self._build_condition_data(
                 batch, condition_ds[0], idx, ctx["num_output_steps"], step_range=(start, end)
+            )
+
+        # forcing (e.g. SST) is likewise indexed by the absolute forecast step
+        for _, forcing_data in self.forcing_datasets.items():
+            self._build_forcing_data(
+                batch, forcing_data.readers[0], idx, ctx["num_output_steps"], step_range=(start, end)
             )
 
         return batch

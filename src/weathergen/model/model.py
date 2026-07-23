@@ -37,11 +37,12 @@ from weathergen.model.engines import (
     TargetPredictionEngine,
     TargetPredictionEngineClassic,
 )
+from weathergen.model.forcing import ForcingInjection
 from weathergen.model.layers import MLP, NamedLinear
 from weathergen.model.utils import get_num_parameters
 from weathergen.train.loss_modules.utils import compute_cos_sim_to_prev
 from weathergen.utils.distributed import is_root
-from weathergen.utils.utils import get_dtype, is_stream_forcing
+from weathergen.utils.utils import get_dtype, is_stream_fe_only, is_stream_forcing
 
 logger = logging.getLogger(__name__)
 
@@ -423,18 +424,43 @@ class Model(torch.nn.Module):
         self.target_token_engines = torch.nn.ModuleDict()
         self.pred_heads = torch.nn.ModuleDict()
 
-        # determine stream names once so downstream components use consistent keys
+        # determine stream names once so downstream components use consistent keys.
+        # condition and per-step forcing (e.g. SST) streams feed the forecasting engine
+        # directly, not the assimilation/decoder path, so they are excluded here.
         self.data_stream_names = [
             stream_name
             for stream_name, stream_cfg in cf.streams.items()
-            if stream_cfg.get("type") != "condition"
+            if not is_stream_fe_only(stream_cfg)
         ]
 
         self.data_streams = [
             stream_cfg
             for stream_cfg in cf.streams.values()
-            if stream_cfg.get("type") != "condition"
+            if not is_stream_fe_only(stream_cfg)
         ]
+
+        # per-step spatial forcing injected into the FE (SST etc.); None if no such stream
+        self.forcing_module = None
+        for stream_cfg in cf.streams.values():
+            if stream_cfg.get("type") != "forcing":
+                continue
+            inj = stream_cfg.get("injection", {})
+            mode = inj.get("mode", "none")
+            if mode == "none":
+                continue
+            source_channels = stream_cfg.get("train_source_channels") or stream_cfg.get(
+                "val_source_channels", []
+            )
+            # dim_embed must equal the FE token dim so additive/cross_attn line up; the
+            # global/adaln_local modes then project this down to the conditioning dim.
+            self.forcing_module = ForcingInjection(
+                num_vars=len(source_channels),
+                dim_embed=cf.ae_global_dim_embed,
+                mode=mode,
+                dim_aux=self.forecast_aux_infos,
+                num_heads=cf.fe_num_heads,
+            )
+            break  # one forcing stream supported for now
 
         for i_stream, _ in enumerate(self.data_streams):
             stream_name = self.data_stream_names[i_stream]
@@ -771,6 +797,19 @@ class Model(torch.nn.Module):
             if self.forecast_engine:
                 without_grad = p_fwd and self.training and step != rollout_steps - 1
                 condition = batch_ctx.conditions[step + batch_step_offset]
+                # inject the per-step spatial forcing (e.g. SST) into the FE latent state /
+                # conditioning before advancing; no-op when no forcing module or field.
+                if self.forcing_module is not None:
+                    forcing_list = getattr(batch_ctx, "forcing", None)
+                    fidx = step + batch_step_offset
+                    forcing_field = (
+                        forcing_list[fidx]
+                        if forcing_list is not None and fidx < len(forcing_list)
+                        else None
+                    )
+                    tokens, condition = self.forcing_module(
+                        tokens, condition, forcing_field, self.num_aux_tokens
+                    )
                 if without_grad:
                     # Pushforward mode: advance tokens without grad; no decoding
                     with torch.no_grad():
