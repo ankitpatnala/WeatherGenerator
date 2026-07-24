@@ -25,7 +25,7 @@
 #   SST is NaN over land; land_sea_mask + sea_ice_cover disambiguate.
 SST :
   type : forcing
-  filenames : ['/capstor/store/cscs/userlab/ch17/data/ERA5-1deg-6h-mean-forcing-1978-2024.zarr']
+  filenames : ['/e/data1/slmet/ml_training/ERA5-1deg-6h-mean-forcing-1978-2024.zarr']
   stream_id : 10
   entry_point : "forecast_engine"
   frequency : 06:00:00
@@ -47,7 +47,7 @@ SST :
   #   global      : forcing pooled to a global vector -> existing AdaLN condition path
   #   adaln_local : per-cell AdaLN conditioning (daytime condition + per-cell forcing)
   injection :
-    mode : additive   # none | additive | cross_attn | global | adaln_local
+    mode : adaln_local   # none | additive | cross_attn | global | adaln_local
   embed :
     net : transformer
     num_tokens : 1
