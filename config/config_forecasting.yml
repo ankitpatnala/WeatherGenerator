@@ -174,17 +174,17 @@ training_config:
         },
     # cosine-band regulariser on consecutive forecast-engine latent steps: penalises
     # per-token cosine similarity outside [cosine_low, cosine_high] to curb latent collapse
-    # (too-similar) and noise/chaos (too-dissimilar) in long rollouts. Remove/disable to omit.
-     "cosine_matching": {
-        type: LossLatent,
-        weight: 1.0,
-        loss_fcts: {
-            "params": {
-                cosine_low: 0.68,
-                cosine_high: 0.78,
-            },
-        },
-        },
+    # (too-similar) and noise/chaos (too-dissimilar) in long rollouts. Disabled for now.
+    #  "cosine_matching": {
+    #     type: LossLatent,
+    #     weight: 1.0,
+    #     loss_fcts: {
+    #         "params": {
+    #             cosine_low: 0.68,
+    #             cosine_high: 0.78,
+    #         },
+    #     },
+    #     },
     }
   
   model_input: {

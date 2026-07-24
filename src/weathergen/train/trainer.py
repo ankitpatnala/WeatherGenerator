@@ -953,7 +953,12 @@ class Trainer(TrainerBase):
         if self.cf.with_ddp and self.cf.with_fsdp:
             cpu_state_dict = {}
             for param_name, sharded_param in maybe_sharded_sd.items():
-                full_param = sharded_param.full_tensor()
+                # buffers (e.g. ForcingEmbed.mean/stdev) are not sharded by FSDP2 and stay
+                # plain tensors, identical on every rank -- only DTensor params need gathering.
+                if isinstance(sharded_param, DTensor):
+                    full_param = sharded_param.full_tensor()
+                else:
+                    full_param = sharded_param
                 if is_root():
                     cpu_state_dict[param_name] = full_param.cpu()
                 else:
