@@ -1,0 +1,10 @@
+train :
+  plot :
+    qcufw2lt:
+      slurm_id: 0
+      description: "Fourier_time_embed"
+      eval: vgbndhco
+    pqay7yjl:
+      slurm_id: 0
+      description: "Fourier_time_embed_with_cosine_regularizer"
+      eval: vgbndhco
