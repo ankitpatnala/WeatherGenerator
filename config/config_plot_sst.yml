@@ -1,0 +1,18 @@
+train:
+  plot:
+    y9f7kj9o:
+      slurm_id: 0
+      description: "Additive"
+      eval: vgbndhco
+    qgfhodku:
+      slurm_id: 0
+      description: "Cross_attn"
+      eval: vgbndhco
+    beafw6am:
+      slurm_id: 0
+      description: "Global"
+      eval: vgbndhco
+    evpj2nm8:
+      slurm_id: 0
+      description: "adaln_local"
+      eval: vgbndhco
