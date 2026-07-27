@@ -180,8 +180,8 @@ training_config:
         weight: 1.0,
         loss_fcts: {
             "params": {
-                cosine_low: 0.68,
-                cosine_high: 0.78,
+                cosine_low: 0.25,
+                cosine_high: 0.38,
             },
         },
         },
