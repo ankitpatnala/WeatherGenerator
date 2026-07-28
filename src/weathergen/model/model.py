@@ -778,12 +778,17 @@ class Model(torch.nn.Module):
                             tokens, condition, coords=model_params.rope_coords
                         )
                     continue
-                prev_tokens = tokens if self.compute_cos_sim_to_prev else None
+                # cos_sim_to_prev is only meaningful between consecutive FORECAST latents.
+                # At step 0 the "previous" is the encoder output (pre-FE) -- a different regime
+                # (the analysis->forecast contraction, cos ~0.64 vs ~0.8 for rollout steps), so
+                # step 0 is excluded from the cosine-band regulariser.
+                capture_cos = self.compute_cos_sim_to_prev and step >= 1
+                prev_tokens = tokens if capture_cos else None
                 tokens = self.forecast_engine(tokens, condition, coords=model_params.rope_coords)
 
                 # per-token cosine similarity between current and previous patch tokens,
                 # consumed by LossLatent (cosine-band regulariser)
-                if self.compute_cos_sim_to_prev:
+                if capture_cos:
                     output.add_latent_prediction(
                         step,
                         "cos_sim_to_prev",
