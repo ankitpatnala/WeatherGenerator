@@ -12,3 +12,7 @@ train :
       slurm_id: 0
       description: "Fourier_time_embed_with_cosine_regularizer"
       eval: vgbndhco
+    ql4f5rne:
+      slurm_id: 0
+      description: "Fourier_time_embed_with_cosine_regularizer_after_step_offset"
+      eval: vgbndhco
