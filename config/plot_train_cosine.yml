@@ -23,4 +23,3 @@ train :
     sx2d3d33:
       slurm_id: 0
       description: "Fourier_time_embed_v3"
-      eval: vgbndhco
