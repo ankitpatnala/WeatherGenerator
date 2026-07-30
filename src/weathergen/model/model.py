@@ -731,6 +731,7 @@ class Model(torch.nn.Module):
         model_params: ModelParams,
         batch: BatchSamples | ModelOutput,
         rollout_steps: int,
+        output_step_offset: int = 0,
     ) -> ModelOutput:
         """Forward pass of the model
 
@@ -758,10 +759,14 @@ class Model(torch.nn.Module):
             output.add_latent_prediction(0, "posteriors", latent_state)
         output.batch = batch_ctx
         output.step_offset = step_offset
-        batch_step_offset = step_offset
-        if batch_ctx is not None and rollout_steps != batch_ctx.get_output_len():
-            output_idxs = batch_ctx.get_output_idxs()
-            batch_step_offset += output_idxs[0] if len(output_idxs) > 0 else 0
+        # Index of the first output step this call writes, within the batch's output arrays.
+        # This used to be inferred from `rollout_steps != batch_ctx.get_output_len()`, which
+        # keyed the prediction<->target alignment off a value callers set for an unrelated
+        # reason (chunking): the training loop passes get_output_len() (-> offset 0) while the
+        # chunked validation loop passes chunk_size (-> offset += output_idxs[0]). The same
+        # model on the same batch then matched targets[i] to a different number of forecast
+        # steps in each loop. Callers now state the offset explicitly.
+        batch_step_offset = step_offset + output_step_offset
 
         # Allow for pushforward trick
         p_fwd = self.cf.training_config.get("forecast", {}).get("pushforward", False)
