@@ -16,3 +16,11 @@ train :
       slurm_id: 0
       description: "Cosine_regularizer"
       eval: vgbndhco
+    bqpuzbdf:
+      slurm_id: 0
+      description: "Fourier_time_embed_v2"
+      eval: vgbndhco
+    sx2d3d33:
+      slurm_id: 0
+      description: "Fourier_time_embed_v3"
+      eval: vgbndhco
