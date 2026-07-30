@@ -8,3 +8,7 @@ train :
       slurm_id: 0
       description: "Fourier_time_embed_with_cosine_regularizer"
       eval: vgbndhco
+    inpx0yjh:
+      slurm_id: 0
+      description: "Cosine_regularizer"
+      eval: vgbndhco
