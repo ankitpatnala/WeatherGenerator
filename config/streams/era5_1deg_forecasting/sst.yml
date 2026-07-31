@@ -48,6 +48,13 @@ SST :
   #   adaln_local : per-cell AdaLN conditioning (daytime condition + per-cell forcing)
   injection :
     mode : adaln_local   # none | additive | cross_attn | global | adaln_local
+    # False (default): per-cell forcing is a fixed CPU-side scatter-mean over grid points,
+    # computed once in the dataloader, no gradient. True: the raw per-point grid is passed
+    # to the model instead, and pooled by a small learned per-variable segment-softmax
+    # (LearnedForcingPool in model/forcing.py) -- lets the pooling itself be trained, at the
+    # cost of moving the full raw grid through the batch pipeline every step instead of the
+    # much smaller (num_cells, 2*num_vars) summary.
+    learned_pool : False
   embed :
     net : transformer
     num_tokens : 1

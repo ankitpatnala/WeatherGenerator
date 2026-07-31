@@ -107,6 +107,85 @@ def scatter_to_cells(
     return cell_values, cell_valid
 
 
+class LearnedForcingPool(nn.Module):
+    """
+    Learnable replacement for the fixed scatter-mean in :func:`scatter_to_cells`.
+
+    HEALPix cells don't have a fixed number of forcing grid points each (coastal cells vs.
+    open-ocean cells differ), so a standard attention module (fixed-size Q/K/V + masking)
+    doesn't fit directly. This instead scores every point with a small per-point MLP and
+    normalises the scores *within each cell* via a segment-softmax (two ``scatter_add_``
+    calls, the same primitive ``scatter_to_cells`` already uses for the mean) -- so cells
+    with more points just have more terms in their softmax, no padding required.
+
+    Same NaN-masking discipline as ``scatter_to_cells``: invalid (e.g. land) points get
+    zero weight rather than corrupting the pooled value -- and, like ``scatter_to_cells``,
+    each variable is masked/normalised *independently*, since e.g. ``land_sea_mask`` is
+    defined everywhere while ``sst``/``sea_ice_cover`` are NaN over land at the same points.
+    """
+
+    def __init__(self, num_vars: int, hidden_factor: int = 4) -> None:
+        super().__init__()
+        self.num_vars = num_vars
+        hidden = max(hidden_factor * num_vars, 8)
+        # per-variable logits: shape (P, V) out, not a single shared per-point score, so each
+        # variable's segment-softmax only involves points valid for *that* variable.
+        self.score = nn.Sequential(
+            nn.Linear(num_vars, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, num_vars),
+        )
+
+    def forward(
+        self, values: torch.Tensor, cell_idx: torch.Tensor, num_cells: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        values : ``(num_points, num_vars)`` raw per-point forcing values for this step.
+        cell_idx : ``(num_points,)`` cell index per point (from ``build_forcing_cell_index``).
+        num_cells : number of HEALPix cells.
+
+        Returns
+        -------
+        (cell_values, cell_valid), same shapes/semantics as ``scatter_to_cells``:
+        ``cell_values`` a ``(num_cells, num_vars)`` learned weighted mean (0 where no valid
+        point contributed), ``cell_valid`` the ``(num_cells, num_vars)`` valid-point fraction.
+        """
+        num_points, num_vars = values.shape
+        device = values.device
+        cell_idx = cell_idx.to(device)
+        idx = cell_idx.view(num_points, 1).expand(num_points, num_vars)  # (P, V)
+
+        valid = torch.isfinite(values)  # (P, V)
+        filled = torch.where(valid, values, torch.zeros_like(values))
+
+        logits = self.score(filled)  # (P, V) -- one logit per (point, variable)
+        logits = logits.masked_fill(~valid, -1e9)
+
+        # segment-softmax per variable: normalise exp(logits) within each cell, independently
+        # per column, using the same scatter_add_ primitive scatter_to_cells uses for the mean.
+        exp_logits = torch.exp(logits - logits.detach().amax(dim=0, keepdim=True))
+        denom = torch.zeros(num_cells, num_vars, device=device, dtype=values.dtype)
+        denom.scatter_add_(0, idx, exp_logits)
+        weights = exp_logits / denom.gather(0, idx).clamp_min(1e-12)  # (P, V)
+
+        cell_values = torch.zeros(num_cells, num_vars, device=device, dtype=values.dtype)
+        cell_values.scatter_add_(0, idx, weights * filled)
+
+        counts = torch.zeros(num_cells, num_vars, device=device, dtype=values.dtype)
+        counts.scatter_add_(0, idx, valid.to(values.dtype))
+        total = torch.zeros(num_cells, num_vars, device=device, dtype=values.dtype)
+        total.scatter_add_(0, idx, torch.ones_like(filled))
+        cell_valid = torch.where(total > 0, counts / total.clamp_min(1.0), torch.zeros_like(counts))
+
+        # cells with no valid points for a variable: weights there are garbage over masked-out
+        # (-1e9 logit) points; zero explicitly rather than rely on the exp(-1e9) underflow.
+        cell_values = torch.where(cell_valid > 0, cell_values, torch.zeros_like(cell_values))
+
+        return cell_values, cell_valid
+
+
 class ForcingEmbed(nn.Module):
     """
     Per-cell forcing embedding shared by all injection modes.
@@ -214,6 +293,7 @@ class ForcingInjection(nn.Module):
         mode: str,
         dim_aux: int = 0,
         num_heads: int = 8,
+        learned_pool: bool = False,
     ) -> None:
         super().__init__()
         assert mode in self._MODES, f"unknown forcing mode {mode!r}, expected {self._MODES}"
@@ -221,6 +301,7 @@ class ForcingInjection(nn.Module):
         self.num_vars = num_vars
         self.dim_embed = dim_embed
         self.dim_aux = dim_aux
+        self.learned_pool_module = LearnedForcingPool(num_vars) if learned_pool else None
 
         if mode == "none":
             return
@@ -246,13 +327,35 @@ class ForcingInjection(nn.Module):
     def _is_empty(x) -> bool:
         return x is None or not torch.is_tensor(x) or x.numel() == 0
 
-    def _cell_emb(self, forcing_field: torch.Tensor, dtype) -> torch.Tensor:
-        """Per-cell embedding (num_cells, dim) from the scattered field (num_cells, 2*num_vars)."""
+    def _cell_emb(
+        self,
+        forcing_field: torch.Tensor,
+        dtype,
+        cell_idx: torch.Tensor | None,
+        num_cells: int | None,
+    ) -> torch.Tensor:
+        """
+        Per-cell embedding (num_cells, dim).
+
+        Two input shapes for ``forcing_field``, selected by ``learned_pool_module``:
+          * fixed mean (default): already-scattered ``(num_cells, 2*num_vars)`` = [cell_values
+            | cell_valid], produced upstream in the dataloader (see ``scatter_to_cells``).
+          * learned pool: raw, unscattered ``(num_points, num_vars)`` per-point values --
+            pooled here, on the GPU, so ``learned_pool_module`` gets gradients.
+        """
         if forcing_field.dim() == 3:  # tolerate a leading batch dim
             forcing_field = forcing_field[0]
-        num_vars = forcing_field.shape[-1] // 2
-        cell_values = forcing_field[..., :num_vars]
-        cell_valid = forcing_field[..., num_vars:]
+
+        if self.learned_pool_module is not None:
+            assert cell_idx is not None and num_cells is not None, (
+                "learned_pool requires cell_idx/num_cells (raw per-point forcing_field)"
+            )
+            cell_values, cell_valid = self.learned_pool_module(forcing_field, cell_idx, num_cells)
+        else:
+            num_vars = forcing_field.shape[-1] // 2
+            cell_values = forcing_field[..., :num_vars]
+            cell_valid = forcing_field[..., num_vars:]
+
         return self.embed(cell_values, cell_valid).to(dtype)
 
     def forward(
@@ -261,6 +364,8 @@ class ForcingInjection(nn.Module):
         condition: torch.Tensor,
         forcing_field: torch.Tensor,
         num_aux: int,
+        cell_idx: torch.Tensor | None = None,
+        num_cells: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Parameters
@@ -270,10 +375,13 @@ class ForcingInjection(nn.Module):
         condition :
             FE conditioning fed to the AdaLN, global ``(dim_aux,)`` vector (or empty).
         forcing_field :
-            Scattered forcing for this step ``(num_cells, 2*num_vars)`` = [cell_values |
-            cell_valid]; empty when no forcing is available (then this is a no-op).
+            Forcing data for this step; empty when no forcing is available (then this is a
+            no-op). Shape depends on the pooling mode -- see ``_cell_emb``.
         num_aux :
             Number of leading auxiliary tokens to leave untouched.
+        cell_idx, num_cells :
+            Only required when ``learned_pool=True`` was passed to ``__init__`` -- the
+            point -> HEALPix-cell index and cell count needed to pool ``forcing_field`` here.
 
         Returns
         -------
@@ -282,7 +390,7 @@ class ForcingInjection(nn.Module):
         if self.mode == "none" or self._is_empty(forcing_field):
             return tokens, condition
 
-        cell_emb = self._cell_emb(forcing_field, tokens.dtype)  # (num_cells, dim)
+        cell_emb = self._cell_emb(forcing_field, tokens.dtype, cell_idx, num_cells)  # (num_cells, dim)
 
         if self.mode == "additive":
             patch = tokens[:, num_aux:] + self.gate * cell_emb

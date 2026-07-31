@@ -459,6 +459,7 @@ class Model(torch.nn.Module):
                 mode=mode,
                 dim_aux=self.forecast_aux_infos,
                 num_heads=cf.fe_num_heads,
+                learned_pool=inj.get("learned_pool", False),
             )
             break  # one forcing stream supported for now
 
@@ -807,8 +808,16 @@ class Model(torch.nn.Module):
                         if forcing_list is not None and fidx < len(forcing_list)
                         else None
                     )
+                    # only used by learned_pool (raw forcing_field, pooled here on GPU);
+                    # None/unused for the default fixed-mean (already-scattered) path.
+                    forcing_cell_idx = getattr(batch_ctx, "forcing_cell_idx", None)
                     tokens, condition = self.forcing_module(
-                        tokens, condition, forcing_field, self.num_aux_tokens
+                        tokens,
+                        condition,
+                        forcing_field,
+                        self.num_aux_tokens,
+                        cell_idx=forcing_cell_idx,
+                        num_cells=self.num_healpix_cells,
                     )
                 if without_grad:
                     # Pushforward mode: advance tokens without grad; no decoding

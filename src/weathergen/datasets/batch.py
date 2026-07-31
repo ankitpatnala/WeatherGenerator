@@ -178,9 +178,15 @@ class BatchSamples:
         self.device = None
         self.conditions = [[] for i in range(output_steps)]
         # Per-step spatial forcing field (e.g. SST) on the FE latent cells (parallel to
-        # `conditions`, but spatial): each entry becomes a (num_cells, 2*num_vars) array of
-        # [cell_values | cell_valid] once built, then a tensor after to_device.
+        # `conditions`, but spatial): each entry becomes either a (num_cells, 2*num_vars)
+        # array of [cell_values | cell_valid] (fixed CPU-side scatter-mean, the default), or
+        # a raw (num_points, num_vars) grid (learned_pool mode, pooled on the model side
+        # instead) -- see MultiStreamDataSampler._build_forcing_data. Either way, a tensor
+        # after to_device.
         self.forcing = [[] for i in range(output_steps)]
+        # Fixed point -> HEALPix-cell index, only set when learned_pool is enabled (same
+        # index every step/sample, since the forcing grid doesn't move).
+        self.forcing_cell_idx: torch.Tensor | None = None
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -202,6 +208,8 @@ class BatchSamples:
             torch.as_tensor(f, dtype=torch.float32, device=device) if len(f) > 0 else f
             for f in self.forcing
         ]
+        if self.forcing_cell_idx is not None:
+            self.forcing_cell_idx = self.forcing_cell_idx.to(device, non_blocking=True)
 
         self.device = device
 

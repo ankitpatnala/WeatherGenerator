@@ -405,29 +405,44 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         Collect the per-step forcing field (e.g. SST) for the requested forecast steps.
 
         Mirrors `_build_condition_data`, but the forcing is spatial: for each step the reader
-        is read at that step's valid time (raw, full grid, normalised by the reader stats),
-        then scatter-averaged onto the HEALPix latent cells using the precomputed index. Each
-        step stores a (num_cells, 2*num_vars) array of [cell_values | cell_valid].
-        """
-        from weathergen.model.forcing import scatter_to_cells
+        is read at that step's valid time (raw, full grid, normalised by the reader stats).
 
+        Two modes, selected by `injection.learned_pool` in the forcing stream's config:
+          * default (False): scatter-averaged onto the HEALPix latent cells here (CPU, no
+            gradient) using the precomputed index. Each step stores a (num_cells, 2*num_vars)
+            array of [cell_values | cell_valid].
+          * learned_pool (True): the raw (num_points, num_vars) grid is stored as-is and
+            pooling happens on the model side instead (see LearnedForcingPool in forcing.py),
+            so the pooling itself can be trained. The fixed cell index is attached to the
+            batch once so the model has it to pool with.
+        """
+        learned_pool = forcing_ds.stream_info.get("injection", {}).get("learned_pool", False)
         cell_idx = forcing_ds.forcing_cell_idx
         num_grid_pts = len(cell_idx)
+        source_samples = batch.get_source_samples()
+        if learned_pool:
+            source_samples.forcing_cell_idx = cell_idx
+
         start, end = (0, num_output_steps) if step_range is None else step_range
         for i in range(start, end):
             idx = base_idx + (self.time_step * i) // self.step_timedelta
             rdata = forcing_ds.get_source(idx)
             # raw, full-grid values in fixed grid order (no coord/geoinfo drops for a
-            # full-grid forcing) -> normalise with the reader stats, then scatter. If the
-            # reader stacked multiple input steps, keep only the most recent grid (this step).
+            # full-grid forcing) -> normalise with the reader stats. If the reader stacked
+            # multiple input steps, keep only the most recent grid (this step).
             values = forcing_ds.normalize_source_channels(rdata.data)
             values = np.asarray(values)[-num_grid_pts:]
-            values_t = torch.as_tensor(values, dtype=torch.float32)
-            cell_values, cell_valid = scatter_to_cells(
-                values_t.unsqueeze(0), cell_idx, self.num_healpix_cells
-            )
-            field = torch.cat([cell_values[0], cell_valid[0]], dim=-1).numpy()
-            batch.get_source_samples().forcing[i] = field
+
+            if learned_pool:
+                source_samples.forcing[i] = values
+            else:
+                from weathergen.model.forcing import scatter_to_cells
+
+                values_t = torch.as_tensor(values, dtype=torch.float32)
+                cell_values, cell_valid = scatter_to_cells(
+                    values_t.unsqueeze(0), cell_idx, self.num_healpix_cells
+                )
+                source_samples.forcing[i] = torch.cat([cell_values[0], cell_valid[0]], dim=-1).numpy()
 
     def reset(self) -> tuple[Sequence[int], Sequence[int]]:
         """
