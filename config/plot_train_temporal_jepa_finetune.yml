@@ -1,0 +1,14 @@
+train:
+  plot:
+    
+    # gjl6a0kb:
+    #   slurm_id: 0
+    #   description: "temporal JEPA pretraining, all years"
+
+    zblsmcgn:
+      slurm_id: 0
+      description: "adamw"
+
+    rttv2im1:
+      slurm_id: 0
+      description: "muon"
