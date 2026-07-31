@@ -1,0 +1,6 @@
+train :
+  plot :
+    ynsacr6l:
+      slurm_id: 0
+      description: "Fourier_time_embed_with_cosine_regularize_after_step_offset"
+      eval: vgbndhco
