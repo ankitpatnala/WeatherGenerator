@@ -225,8 +225,17 @@ class ForcingEmbed(nn.Module):
             mean = np.zeros(num_vars, dtype=np.float32)
         if stdev is None:
             stdev = np.ones(num_vars, dtype=np.float32)
-        self.register_buffer("mean", torch.as_tensor(np.asarray(mean), dtype=torch.float32))
-        self.register_buffer("stdev", torch.as_tensor(np.asarray(stdev), dtype=torch.float32))
+        # kept as plain numpy (not a tensor/buffer) so reset_parameters() can restore these
+        # exact values after an FSDP2 meta-device to_empty() wipes the buffers -- see
+        # ForcingInjection.reset_parameters() for why this is necessary. np.array(..., copy=True)
+        # (not asarray) so this is never aliased into the buffer below: torch.as_tensor shares
+        # memory with a same-dtype CPU numpy array rather than copying, so without an explicit
+        # copy here, in-place mutation of the buffer (e.g. the to_empty() corruption itself)
+        # would silently corrupt this "backup" too.
+        self._mean_init = np.array(mean, dtype=np.float32, copy=True)
+        self._stdev_init = np.array(stdev, dtype=np.float32, copy=True)
+        self.register_buffer("mean", torch.as_tensor(self._mean_init).clone())
+        self.register_buffer("stdev", torch.as_tensor(self._stdev_init).clone())
 
         # input = normalised values (num_vars) concatenated with validity (num_vars)
         in_dim = 2 * num_vars
@@ -236,6 +245,22 @@ class ForcingEmbed(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden, dim_embed),
         )
+
+    def reset_parameters(self) -> None:
+        """
+        Restore mean/stdev to their intended values and reinitialise the MLP.
+
+        FSDP2's meta-device build (``model.to_empty()`` + ``Model.reset_parameters()``)
+        only auto-resets ``nn.Linear``/``nn.LayerNorm`` submodules (see model.py); buffers
+        registered directly here (mean/stdev) are left as uninitialised memory otherwise,
+        which silently breaks the "identity if unspecified" normalisation this class
+        documents (observed in practice as stdev=0 -> division amplifying values ~1e6x).
+        """
+        self.mean.data.copy_(torch.as_tensor(self._mean_init, device=self.mean.device))
+        self.stdev.data.copy_(torch.as_tensor(self._stdev_init, device=self.stdev.device))
+        for module in self.mlp.modules():
+            if isinstance(module, nn.Linear):
+                module.reset_parameters()
 
     def forward(self, cell_values: torch.Tensor, cell_valid: torch.Tensor) -> torch.Tensor:
         """
@@ -322,6 +347,35 @@ class ForcingInjection(nn.Module):
             self.cross_attn = nn.MultiheadAttention(dim_embed, num_heads, batch_first=True)
         elif mode in ("global", "adaln_local"):
             self.cond_proj = nn.Linear(dim_embed, dim_aux)
+
+    def reset_parameters(self) -> None:
+        """
+        Restore the documented zero-init-gate no-op-at-init guarantee.
+
+        Model.reset_parameters()'s generic sweep (model.py) only auto-resets
+        nn.Linear/nn.LayerNorm submodules, so it's called explicitly on this module too --
+        self-contained (doesn't rely on that generic sweep for its own children) so it also
+        works standalone from model_interface.py's "new module not found in checkpoint" path
+        (module_to_init.reset_parameters()), which previously raised AttributeError here
+        since this method didn't exist.
+
+        Without this, gate/embed.mean/embed.stdev -- none of which are nn.Linear/nn.LayerNorm
+        -- are left as whatever uninitialised memory model.to_empty() produced (observed in
+        practice: stdev=0, amplifying forcing values ~1e6x once gate drifts off zero).
+        """
+        if self.mode == "none":
+            return
+        self.gate.data.zero_()
+        self.embed.reset_parameters()
+        if self.mode == "cross_attn":
+            self.norm_q.reset_parameters()
+            self.cross_attn._reset_parameters()  # nn.MultiheadAttention's own (underscored) API
+        elif self.mode in ("global", "adaln_local"):
+            self.cond_proj.reset_parameters()
+        if self.learned_pool_module is not None:
+            for module in self.learned_pool_module.score.modules():
+                if isinstance(module, nn.Linear):
+                    module.reset_parameters()
 
     @staticmethod
     def _is_empty(x) -> bool:

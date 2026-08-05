@@ -1,0 +1,8 @@
+train:
+  plot:
+    vwchgjt5:
+      slurm_id: 0
+      description: "adamw"
+    jsctankc:
+      slurm_id: 0
+      description: "muon"

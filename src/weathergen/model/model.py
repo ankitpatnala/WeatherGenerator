@@ -673,6 +673,13 @@ class Model(torch.nn.Module):
 
         self.apply(_reset_params)
 
+        # forcing_module owns bespoke Parameters/buffers (gate, embed.mean/.stdev) that
+        # aren't nn.Linear/nn.LayerNorm, so the generic sweep above misses them -- reset
+        # explicitly. Without this they're left as whatever uninitialised memory
+        # model.to_empty() produced on a fresh FSDP2 build (observed: embed.stdev=0).
+        if self.forcing_module is not None:
+            self.forcing_module.reset_parameters()
+
     def print_num_parameters(self) -> None:
         """Print number of parameters for entire model and each module used to build the model"""
 
