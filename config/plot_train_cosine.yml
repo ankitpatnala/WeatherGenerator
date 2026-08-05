@@ -20,11 +20,23 @@ train :
       slurm_id: 0
       description: "Fourier_time_embed_v2"
       eval: vgbndhco
+    df9x6ek9:
+      slurm_id: 0
+      description: "Fourier_time_embed_v2_continue"
+      eval: vgbndhco
     sx2d3d33:
+      slurm_id: 0
+      description: "Fourier_time_embed_v3"
+      eval: vgbndhco
+    dy8dxtuo:
       slurm_id: 0
       description: "Fourier_time_embed_v3"
       eval: vgbndhco
     ovd4j94y:
       slurm_id: 0
       description: "Fourier_time_embed_with_cosine_regularizer_after_step_offset_after_indexing_issue"
+      eval: vgbndhco
+    aatvj6d8:
+      slurm_id: 0
+      description: "Fourier_time_embed_with_cosine_regularizer_after_step_offset_after_indexing_issue_continue"
       eval: vgbndhco
