@@ -215,11 +215,12 @@ class Trainer(TrainerBase):
         return output_target_and_auxs
 
     def _get_forecast_chunks(self, forecast_cfg):
-        n_full_chunks = forecast_cfg.num_steps // forecast_cfg.chunk_size
-        remainder_fsteps = forecast_cfg.num_steps % forecast_cfg.chunk_size
-        return [forecast_cfg.chunk_size] * n_full_chunks + (
-            [remainder_fsteps] if remainder_fsteps else []
-        )
+        # chunk_size defaults to null (no chunking): one chunk covering the whole rollout.
+        # Same fallback as MultiStreamDataSampler's chunk_size handling.
+        chunk_size = forecast_cfg.get("chunk_size") or forecast_cfg.num_steps
+        n_full_chunks = forecast_cfg.num_steps // chunk_size
+        remainder_fsteps = forecast_cfg.num_steps % chunk_size
+        return [chunk_size] * n_full_chunks + ([remainder_fsteps] if remainder_fsteps else [])
 
     def _rollout_state_path(self):
         """File where the resumable rollout state (carried latent + progress) is stored."""

@@ -25,13 +25,16 @@
 #   SST is NaN over land; land_sea_mask + sea_ice_cover disambiguate.
 SST :
   type : forcing
-  filenames : ['/e/data1/slmet/ml_training/ERA5-1deg-6h-mean-forcing-1978-2024.zarr']
+  #filenames : ['/e/data1/slmet/ml_training/ERA5-1deg-6h-mean-forcing-1978-2024.zarr']
+  filenames : ['/e/data1/slmet/ml_training/aifs-ea-an-oper-0001-mars-o96-1979-2023-6h-v2-s2s-predictors.zarr']
   stream_id : 10
   entry_point : "forecast_engine"
   frequency : 06:00:00
   # forcing: not predicted (empty target channels -> is_stream_forcing -> no decoder)
-  train_source_channels : ['sea_surface_temperature', 'sea_ice_cover', 'land_sea_mask']
-  val_source_channels   : ['sea_surface_temperature', 'sea_ice_cover', 'land_sea_mask']
+  #train_source_channels : ['sea_surface_temperature', 'sea_ice_cover', 'land_sea_mask']
+  #val_source_channels   : ['sea_surface_temperature', 'sea_ice_cover', 'land_sea_mask']
+  train_source_channels : ['sst']
+  val_source_channels   : ['sst']
   train_target_channels : []
   val_target_channels   : []
   geoinfo_channels : []
