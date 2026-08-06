@@ -57,7 +57,7 @@ SST :
     # (LearnedForcingPool in model/forcing.py) -- lets the pooling itself be trained, at the
     # cost of moving the full raw grid through the batch pipeline every step instead of the
     # much smaller (num_cells, 2*num_vars) summary.
-    learned_pool : False
+    learned_pool : True
   embed :
     net : transformer
     num_tokens : 1
