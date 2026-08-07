@@ -1,0 +1,67 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Sea-surface-temperature forcing stream.
+#
+# SST is a slowly-varying lower boundary condition. It is NOT predicted -- it is
+# prescribed and re-read at every forecast step's valid time, then injected into
+# the forecasting engine so the rolling latent state is continually reminded of
+# the ocean state (ENSO/PDO/warming trend). This is exactly the signal a
+# free-running atmosphere loses on long (decadal) rollouts.
+#
+# Tagging (mirrors the `condition` stream in forecast.yml):
+#   type: forcing            -> dedicated DataReaderForcing (anemoi-backed reader,
+#                               routed through the per-step forcing path)
+#   entry_point: forecast_engine -> injected into the FE at every forecast step
+#
+# Source: anemoi-format zarr, 1-deg (65160 pts), 6-hourly, 1978-2025.
+#   variables: sea_surface_temperature, sea_ice_cover, land_sea_mask
+#   SST is NaN over land; land_sea_mask + sea_ice_cover disambiguate.
+SST :
+  type : forcing
+  #filenames : ['/e/data1/slmet/ml_training/ERA5-1deg-6h-mean-forcing-1978-2024.zarr']
+  #filenames : ['/e/data1/slmet/ml_training/aifs-ea-an-oper-0001-mars-o96-1979-2023-6h-v2-s2s-predictors.zarr']
+  filenames : ['/e/data1/climateai/hclimrep/data/eerie_1_degree/production/atmos-daily-1970-2014-anemoi-merged.zarr']
+  stream_id : 10
+  entry_point : "forecast_engine"
+  frequency : 24:00:00
+  # forcing: not predicted (empty target channels -> is_stream_forcing -> no decoder)
+  #train_source_channels : ['sea_surface_temperature', 'sea_ice_cover', 'land_sea_mask']
+  #val_source_channels   : ['sea_surface_temperature', 'sea_ice_cover', 'land_sea_mask']
+  train_source_channels : ['msst']
+  val_source_channels   : ['msst']
+  train_target_channels : []
+  val_target_channels   : []
+  geoinfo_channels : []
+  loss_weight : 0.
+  location_weight : cosine_latitude
+  token_size : 8
+  tokenize_spacetime : True
+  # How the per-step forcing field is injected into the forecasting engine (generic;
+  # any type:forcing stream uses the same mechanism, SST is just the first instance):
+  #   none        : no injection (baseline / disabled)
+  #   additive    : per-cell forcing embedding added to the FE latent tokens each step
+  #   cross_attn  : latent tokens cross-attend to per-cell forcing tokens each step
+  #   global      : forcing pooled to a global vector -> existing AdaLN condition path
+  #   adaln_local : per-cell AdaLN conditioning (daytime condition + per-cell forcing)
+  injection :
+    mode : adaln_local   # none | additive | cross_attn | global | adaln_local
+    # False (default): per-cell forcing is a fixed CPU-side scatter-mean over grid points,
+    # computed once in the dataloader, no gradient. True: the raw per-point grid is passed
+    # to the model instead, and pooled by a small learned per-variable segment-softmax
+    # (LearnedForcingPool in model/forcing.py) -- lets the pooling itself be trained, at the
+    # cost of moving the full raw grid through the batch pipeline every step instead of the
+    # much smaller (num_cells, 2*num_vars) summary.
+    learned_pool : True
+  embed :
+    net : transformer
+    num_tokens : 1
+    num_heads : 8
+    dim_embed : 512
+    num_blocks : 2
