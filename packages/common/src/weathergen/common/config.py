@@ -43,7 +43,7 @@ Config = DictConfig
 def parse_timedelta(val: str | int | float | np.timedelta64) -> np.timedelta64:
     """
     Parse a value into a numpy timedelta64[ms].
-    Integers and floats are interpreted as hours.
+    Integers and floats are interpreted as seconds.
     Strings are parsed using pandas.to_timedelta.
     """
     if isinstance(val, int | float | np.number):
@@ -51,11 +51,17 @@ def parse_timedelta(val: str | int | float | np.timedelta64) -> np.timedelta64:
     return np.timedelta64(pd.to_timedelta(val)).astype("timedelta64[ms]")
 
 
-def timedelta_to_str(val: np.timedelta64 | pd.Timedelta) -> str:
+def timedelta_to_str(val: np.timedelta64 | pd.Timedelta | str | int | float) -> str:
     """
     Put timedelta into string in format HH:MM:SS
     """
-    dt = pd.to_timedelta(val)
+    # Go through parse_timedelta so the number-is-seconds convention is applied
+    # consistently. A stream's `frequency` is a string ("24:00:00") when read from the
+    # yaml config but an int of seconds (86400) when reloaded from a saved run config,
+    # which is what train_continue does. Calling pd.to_timedelta on the bare int would
+    # read it as *nanoseconds* and collapse it to "00:00:00", which downstream makes
+    # anemoi's _frequency_to_indices compute a zero step ("range() arg 3 must not be zero").
+    dt = pd.to_timedelta(parse_timedelta(val))
     total_seconds = int(dt.total_seconds())
 
     # Calculate HH:MM:SS
