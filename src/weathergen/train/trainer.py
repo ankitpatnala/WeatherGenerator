@@ -214,13 +214,19 @@ class Trainer(TrainerBase):
 
         return output_target_and_auxs
 
-    def _get_forecast_chunks(self, forecast_cfg):
-        # chunk_size defaults to null (no chunking): one chunk covering the whole rollout.
-        # Same fallback as MultiStreamDataSampler's chunk_size handling.
-        chunk_size = forecast_cfg.get("chunk_size") or forecast_cfg.num_steps
-        n_full_chunks = forecast_cfg.num_steps // chunk_size
-        remainder_fsteps = forecast_cfg.num_steps % chunk_size
-        return [chunk_size] * n_full_chunks + ([remainder_fsteps] if remainder_fsteps else [])
+    def _get_forecast_chunks(self, forecast_cfg, total_steps: int | None = None):
+        """
+        Split `total_steps` (default: forecast.num_steps) into chunks of forecast.chunk_size.
+
+        The loss path passes the batch's full output length so the chunks tile the same range
+        the training loop rolls out over; the write-only long-rollout path keeps num_steps.
+        """
+        total_steps = forecast_cfg.num_steps if total_steps is None else total_steps
+        n_full_chunks = total_steps // forecast_cfg.chunk_size
+        remainder_fsteps = total_steps % forecast_cfg.chunk_size
+        return [forecast_cfg.chunk_size] * n_full_chunks + (
+            [remainder_fsteps] if remainder_fsteps else []
+        )
 
     def _rollout_state_path(self):
         """File where the resumable rollout state (carried latent + progress) is stored."""
@@ -287,8 +293,15 @@ class Trainer(TrainerBase):
         targets_and_auxs,
         preds_full,
     ):
-        # chunks = self._get_fcst_chunks(mode_cfg)
-        chunks = self._get_forecast_chunks(mode_cfg.get("forecast", {}))
+        # When a loss is computed the rollout must cover exactly the range the training loop
+        # covers -- the batch's full output length, starting at index 0 -- otherwise the same
+        # model scores differently in the two loops (see Model.forward/output_step_offset).
+        # The write-only long-rollout path keeps the forecast-step range it was built for.
+        compute_loss = mode_cfg.get("compute_loss", True)
+        chunks = self._get_forecast_chunks(
+            mode_cfg.get("forecast", {}),
+            total_steps=batch.get_output_len() if compute_loss else None,
+        )
         source_samples = batch.get_source_samples()
         num_samples_write = mode_cfg.get("output", {}).get("num_samples", 0) * batch_size
         should_write_output = bidx < num_samples_write
@@ -308,7 +321,9 @@ class Trainer(TrainerBase):
                 )
 
         output_idxs = batch.get_output_idxs()
-        forecast_step_offset = output_idxs[0] if len(output_idxs) > 0 else 0
+        # index of the first output step this rollout writes: 0 on the loss path (matching the
+        # training loop), the first forecast index on the write-only long-rollout path
+        forecast_step_offset = 0 if compute_loss else (output_idxs[0] if len(output_idxs) else 0)
 
         # resumable long rollout (lazy path only): the rollout is Markovian in the latent, so
         # we can checkpoint the carried latent per chunk and continue from it after a crash.
@@ -377,12 +392,14 @@ class Trainer(TrainerBase):
                         self.model_params,
                         source_samples,
                         chunk_size,
+                        output_step_offset=forecast_step_offset,
                     )
                 else:
                     source_samples = self.ema_model.forward_eval(
                         self.model_params,
                         source_samples,
                         chunk_size,
+                        output_step_offset=forecast_step_offset,
                     )
 
                 chunk_step_offset = forecast_step_offset + source_samples.step_offset
@@ -722,6 +739,7 @@ class Trainer(TrainerBase):
                     self.model_params,
                     x,
                     x.get_output_len(),
+                    output_step_offset=0,
                 )
 
                 targets_and_auxs = {}
@@ -735,18 +753,6 @@ class Trainer(TrainerBase):
                         self.model_params,
                         self.model,
                     )
-
-                    targets_and_auxs = {}
-                    for loss_name, target_aux in self.target_and_aux_calculators.items():
-                        # find targets for this target-aux calculator
-                        target_idxs = get_target_idxs_from_cfg(self.training_cfg, loss_name)
-                        # apply target-aux calculator
-                        targets_and_auxs[loss_name] = target_aux.compute(
-                            self.cf.general.istep,
-                            batch.get_target_samples(target_idxs),
-                            self.model_params,
-                            self.model,
-                        )
 
                 loss = self.loss_calculator.compute_loss(
                     preds=preds,
@@ -954,12 +960,7 @@ class Trainer(TrainerBase):
         if self.cf.with_ddp and self.cf.with_fsdp:
             cpu_state_dict = {}
             for param_name, sharded_param in maybe_sharded_sd.items():
-                # buffers (e.g. ForcingEmbed.mean/stdev) are not sharded by FSDP2 and stay
-                # plain tensors, identical on every rank -- only DTensor params need gathering.
-                if isinstance(sharded_param, DTensor):
-                    full_param = sharded_param.full_tensor()
-                else:
-                    full_param = sharded_param
+                full_param = sharded_param.full_tensor()
                 if is_root():
                     cpu_state_dict[param_name] = full_param.cpu()
                 else:
