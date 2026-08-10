@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=decadal_freerun
-#SBATCH --partition=debug
-#SBATCH --time=00:30:00
+#SBATCH --partition=booster
+#SBATCH --time=12:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH -A ch17
+#SBATCH -A hclimrep
 #SBATCH --output=logs/decadal-%j.out
 #SBATCH --error=logs/decadal-%j.err
 
@@ -20,13 +20,13 @@
 #   sbatch weathergen_decadal_chain.sh <RUN_ID> <NUM_STEPS> [MAX_LINKS]
 
 set -uo pipefail
-REPO=/users/apatnala/WeatherGen/WeatherGenerator
+REPO=/e/project1/weatherai/patnala1/WeatherGen/WeatherGenerator
 cd "$REPO"
 
 RUN_ID=${1:?"usage: sbatch weathergen_decadal_chain.sh RUN_ID NUM_STEPS [MAX_LINKS]"}
 NUM_STEPS=${2:?"usage: sbatch weathergen_decadal_chain.sh RUN_ID NUM_STEPS [MAX_LINKS]"}
 MAX=${3:-25}
-CKPT=oq9o0t86
+CKPT=ynsacr6l
 SCRIPT="$REPO/weathergen_decadal_chain.sh"
 STATE="$REPO/results/$RUN_ID/rollout_state.pt"
 

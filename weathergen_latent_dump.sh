@@ -12,12 +12,12 @@
 
 #SBATCH --job-name=latent_dump
 #SBATCH --exclusive --mem=450G
-#SBATCH --partition=debug
+#SBATCH --partition=booster
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --time=00:30:00
-#SBATCH -A ch17
+#SBATCH --time=02:00:00
+#SBATCH -A hclimrep
 #SBATCH --output=logs/weathergen-%x.%j.out
 #SBATCH --error=logs/weathergen-%x.%j.err
 
@@ -29,7 +29,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 SET=$1
 MAX=${2:-25}
-CKPT=${CKPT:-oq9o0t86}
+CKPT=${CKPT:-ynsacr6l}
 START=201501010000
 END=201507050000
 NUM_STEPS=${STEPS:-500}
