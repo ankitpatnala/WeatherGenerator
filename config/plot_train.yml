@@ -1,18 +1,10 @@
 train:
   plot:
-    yc9osoe5:
+    b95dmhtw:
       slurm_id: 0
-      description: "adamw"
+      description: "ERA5"
       eval: vgbndhco 
-    z5keukgi:
+    pppcna9q:
       slurm_id: 0
-      description: "Muon"
-      eval: vgbndhco 
-    w39jmufn:
-      slurm_id: 0
-      description: "adamw_finetune"
-      eval: vgbndhco 
-    dnotyjzs:
-      slurm_id: 0
-      description: "Muon_finetune"
+      description: "EERIE"
       eval: vgbndhco 
