@@ -26,7 +26,7 @@ cd "$REPO"
 RUN_ID=${1:?"usage: sbatch weathergen_decadal_chain.sh RUN_ID NUM_STEPS [MAX_LINKS]"}
 NUM_STEPS=${2:?"usage: sbatch weathergen_decadal_chain.sh RUN_ID NUM_STEPS [MAX_LINKS]"}
 MAX=${3:-25}
-CKPT=ynsacr6l
+CKPT=v2fekj7f
 SCRIPT="$REPO/weathergen_decadal_chain.sh"
 STATE="$REPO/results/$RUN_ID/rollout_state.pt"
 

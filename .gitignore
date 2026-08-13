@@ -228,3 +228,16 @@ output
 models
 results
 reports
+
+# large local experiment artefacts
+# NOTE: the "?.*" rule above only matches single-character stems, so 0.pt was
+# ignored but 10.pt / 100.pt were not. Those escaped and got staged, leaving
+# ~9.3 GB of dangling blobs in .git. Match them by extension instead.
+latent_*/
+*.pt
+*.pth
+*.npy
+*.npz
+*.mp4
+bias_maps_sample*/
+counter_dict/

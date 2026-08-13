@@ -7,4 +7,8 @@ train:
     pppcna9q:
       slurm_id: 0
       description: "EERIE"
-      eval: vgbndhco 
+      eval: vgbndhco
+    i9eqk382: 
+      slurm_id: 0
+      description: "EERIE_after_fix"
+      eval: vgbndhco
