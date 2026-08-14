@@ -27,7 +27,7 @@ SST :
   type : forcing
   #filenames : ['/e/data1/slmet/ml_training/ERA5-1deg-6h-mean-forcing-1978-2024.zarr']
   #filenames : ['/e/data1/slmet/ml_training/aifs-ea-an-oper-0001-mars-o96-1979-2023-6h-v2-s2s-predictors.zarr']
-  filenames : ['/e/data1/climateai/hclimrep/data/eerie_1_degree/production/atmos-daily-1970-2014-anemoi-merged.zarr']
+  filenames : ['/e/data1/slmet/ml_training/eerie_1_degree/production/atmos-daily-1970-2014-anemoi-merged.zarr']
   stream_id : 10
   entry_point : "forecast_engine"
   frequency : 24:00:00
