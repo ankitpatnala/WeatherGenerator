@@ -1,0 +1,63 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Sea-surface temperature as a regular *data stream* (NOT a forcing/condition).
+#
+# Contrast with config/streams/era5_1deg_forecasting/sst.yml, where SST is
+# `type: forcing` + `entry_point: forecast_engine`: there it is prescribed, never
+# predicted, and injected into the forecasting engine each step via AdaLN.
+#
+# Here SST goes through the normal assimilation path instead:
+#   type: anemoi        -> ordinary DataReaderAnemoi, no forcing/condition routing
+#   no entry_point      -> tokenized, embedded and fed to the encoder like ERA5
+#   target channels set -> decoded by its own target readout + pred head, and it
+#                          contributes to the physical loss (loss_weight below)
+# i.e. the model now *co-predicts* SST alongside the atmosphere and the ocean state
+# lives in the shared latent, rather than being an external boundary condition.
+#
+# Source: anemoi zarr, o96 (40320 pts, same grid as the ERA5 stream), 6-hourly,
+# 1979-01-01 .. 2023-12-31.
+#
+# Land handling: `sst` is NaN over land (~28.7% of points). `ci` (sea-ice cover)
+# carries the exact same NaN mask, so listing it as a geoinfo channel makes
+# ReaderData.remove_nan_coords_and_geoinfos() drop the land points outright --
+# the stream then carries ocean points only, on both the source and target side,
+# and no NaN reaches the embedding or the loss.
+SST :
+  type : anemoi
+  filenames : ['/e/data1/slmet/ml_training/aifs-ea-an-oper-0001-mars-o96-1979-2023-6h-v2-s2s-predictors.zarr']
+  stream_id : 10
+  frequency : 06:00:00
+  # predicted: non-empty target channels -> not is_stream_forcing -> full decoder
+  train_source_channels : ['sst']
+  val_source_channels   : ['sst']
+  train_target_channels : ['sst']
+  val_target_channels   : ['sst']
+  # 'ci' doubles as the land mask (see note above) and as sea-ice information
+  geoinfo_channels : ['ci', 'insolation', 'cos_local_time', 'sin_local_time', 'cos_julian_day', 'sin_julian_day']
+  loss_weight : 1.
+  location_weight : cosine_latitude
+  token_size : 8
+  tokenize_spacetime : True
+  max_num_targets: 20000
+  embed :
+    net : transformer
+    num_tokens : 1
+    num_heads : 8
+    dim_embed : 512
+    num_blocks : 2
+  embed_target_coords :
+    net : linear
+    dim_embed : 512
+  target_readout :
+    num_layers : 2
+    num_heads : 4
+  pred_head :
+    ens_size : 1
+    num_layers : 1

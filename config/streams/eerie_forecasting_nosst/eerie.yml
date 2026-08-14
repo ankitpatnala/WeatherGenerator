@@ -14,7 +14,7 @@ EERIE_ATMO :
   filenames : ['/e/data1/slmet/ml_training/eerie_1_degree/production/atmos-daily-1970-2014-anemoi-merged.zarr']
   stream_id : 0
   source_exclude : ['mw_1', 'mw_10', 'mw_100', 'mw_1000', 'mw_150', 'mw_20', 'mw_200', 'mw_250', 'mw_30', 'mw_300', 'mw_400', 'mw_5', 'mw_50', 'mw_500', 'mw_600', 'mw_70', 'mw_700', 'mw_850', 'mw_925', 'mskt', 'mtcw', 'cprate', 'tprate', 'mq_50', 'mq_100']
-  target_exclude : ['mw_1', 'mw_10', 'mw_100', 'mw_1000', 'mw_150', 'mw_20', 'mw_200', 'mw_250', 'mw_30', 'mw_300', 'mw_400', 'mw_5', 'mw_50', 'mw_500', 'mw_600', 'mw_70', 'mw_700', 'mw_850', 'mw_925', 'mskt', 'mtcw', 'cprate', 'tprate', 'mq_50', 'mq_100', 'mblh']
+  target_exclude : ['mw_1', 'mw_10', 'mw_100', 'mw_1000', 'mw_150', 'mw_20', 'mw_200', 'mw_250', 'mw_30', 'mw_300', 'mw_400', 'mw_5', 'mw_50', 'mw_500', 'mw_600', 'mw_70', 'mw_700', 'mw_850', 'mw_925', 'mskt', 'mtcw', 'cprate', 'tprate', 'mq_50', 'mq_100', 'mblh', 'msst']
   geoinfo_channels : ['mblh', 'insolation', 'cos_local_time', 'sin_local_time', 'cos_julian_day', 'sin_julian_day']
   loss_weight : 1.
   location_weight : cosine_latitude
