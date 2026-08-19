@@ -1,0 +1,14 @@
+train:
+  plot:
+    pksn7ivl:
+      slurm_id: 0
+      description: "EERIE SST-forced and SST prognostic"
+      eval: vgbndhco 
+    lggd8ixh:
+      slurm_id: 0
+      description: "EERIE SST-forced and SST prognostic (5e-5)"
+      eval: vgbndhco 
+    zpjzqp1z:
+      slurm_id: 0
+      description: "SST forcing"
+      eval: vgbndhco

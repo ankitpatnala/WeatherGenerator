@@ -1,0 +1,22 @@
+train:
+  plot:
+    i9eqk382:
+      slurm_id: 0
+      description: "EERIE SST-forced and SST prognostic"
+      eval: vgbndhco 
+    lzazynst:
+      slurm_id: 0
+      description: "EERIE SST-forced and SST prognostic"
+      eval: vgbndhco 
+    c3zwpxki:
+      slurm_id: 0
+      description: "EERIE SST-forced and SST forcing"
+      eval: vgbndhco
+    zj30357w: 
+      slurm_id: 0
+      description: "SST prognostic"
+      eval: vgbndhco
+    yb2f28i8:
+      slurm_id: 0
+      description: "SST forcing"
+      eval: vgbndhco

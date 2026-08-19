@@ -1,0 +1,14 @@
+train:
+  plot:
+    fjsgnee6:
+      slurm_id: 0
+      description: "ERA5 SST-forced"
+      eval: vgbndhco
+    c54dprw4: 
+      slurm_id: 0
+      description: "SST prognostic"
+      eval: vgbndhco
+    f7pfe5e3:
+      slurm_id: 0
+      description: "SST forcing"
+      eval: vgbndhco
