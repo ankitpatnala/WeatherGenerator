@@ -1,32 +1,31 @@
 #!/bin/bash
-# Generate eval-style decadal animations for several fields, with parallel frame rendering.
-#   sbatch weathergen_animate.sh                          # default 5 fields
-#   FIELDS="2t msl" sbatch weathergen_animate.sh          # custom fields
+# Generate eval-style animations on a compute node, with parallel frame rendering.
+#
+#   FIELDS=2t sbatch weathergen_animate.sh                      # raw field, default runs
+#   FIELDS=2t REF=sst_exp1_1y_0K RUNS="sst_exp1_1y_2K sst_exp1_1y_4K" \
+#       sbatch weathergen_animate.sh                            # run-vs-run difference
+#
+# All knobs (FIELDS / RUNS / REF / WORKERS) are read by diagnostics/run_animations.sh, which
+# this script just wraps with a compute-node allocation -- the loop lives in one place only.
+# sbatch exports the submitting environment by default, so the prefix assignments above reach
+# the job.
 
 #SBATCH --job-name=decadal_anim
 #SBATCH --exclusive --mem=450G
-#SBATCH --partition=debug
-#SBATCH --gres=gpu:1
+#SBATCH --partition=booster
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --time=00:30:00
-#SBATCH -A ch17
+#SBATCH --time=04:00:00
+#SBATCH -A hclimrep
 #SBATCH --output=logs/weathergen-%x.%j.out
 #SBATCH --error=logs/weathergen-%x.%j.err
 
 set -uo pipefail
 REPO="${SLURM_SUBMIT_DIR:-$PWD}"
 cd "$REPO"
-source .venv/bin/activate
 export MPLBACKEND=Agg
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-FIELDS="${FIELDS:-t_850 z_500 z_850 u_850 v_850}"
-WORKERS="${WORKERS:-64}"
+# frame rendering is pure CPU (matplotlib/cartopy); no GPU is requested or used
+export WORKERS="${WORKERS:-64}"
 
-for f in $FIELDS; do
-  echo "===== $(date +%H:%M:%S) $f (workers=$WORKERS) ====="
-  srun .venv/bin/python3 diagnostics/animate_decadal.py --field "$f" --fps 8 --workers "$WORKERS" --max-frames "${MAXFRAMES:-0}" \
-    || echo "FAILED: $f"
-done
-echo "===== $(date +%H:%M:%S) all done ====="
+bash diagnostics/run_animations.sh

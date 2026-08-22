@@ -77,6 +77,77 @@ def compute_forcing_geoinfos(
     }
 
 
+def parse_channel_offsets(
+    offsets_cfg, variables: list[str], stream_name: str
+) -> NDArray[np.float32] | None:
+    """
+    Build a per-variable additive offset vector from a `warmup_offset_k` stream config entry.
+
+    The config maps *dataset variable names* to a constant offset applied everywhere (all grid
+    points, all times) in the raw physical units of the variable, before normalisation, e.g.
+
+        warmup_offset_k:
+          sst: 2      # or "2k" / "+2 K" / -1.5
+
+    This is the knob for prescribed-warming experiments: shift the ocean boundary condition by
+    a fixed amount and re-run, without touching the zarr on disk.
+
+    Parameters
+    ----------
+    offsets_cfg :
+        Mapping channel name -> offset (numeric, or a string with an optional trailing "k"/"K").
+    variables :
+        The dataset's variable names, in dataset order.
+    stream_name :
+        Stream name, only used for error messages / logging.
+
+    Returns
+    -------
+    Array of shape (len(variables),) that can be broadcast-added onto the raw
+    (num_points, num_variables) data, or None if no (non-zero) offset was requested.
+    """
+    if not offsets_cfg:
+        return None
+
+    if OmegaConf.is_config(offsets_cfg):
+        offsets_cfg = OmegaConf.to_container(offsets_cfg, resolve=True)
+
+    lookup = {v.lower(): i for i, v in enumerate(variables)}
+    offsets = np.zeros(len(variables), dtype=np.float32)
+
+    for channel, value in offsets_cfg.items():
+        idx = lookup.get(str(channel).lower())
+        if idx is None:
+            raise ValueError(
+                f"warmup_offset_k for stream '{stream_name}' names channel '{channel}', "
+                f"which is not a variable of the dataset. Available: {variables}"
+            )
+        offsets[idx] = _parse_offset_value(value, channel, stream_name)
+
+    if not np.any(offsets):
+        return None
+
+    if is_root():
+        shifted = {variables[i]: float(offsets[i]) for i in np.nonzero(offsets)[0]}
+        _logger.info(f"{stream_name}: applying constant channel offsets (raw units): {shifted}")
+
+    return offsets
+
+
+def _parse_offset_value(value, channel: str, stream_name: str) -> float:
+    """Accept a number, or a string such as "2", "2k", "+2 K", "-1.5"."""
+    if isinstance(value, str):
+        stripped = value.strip().removesuffix("K").removesuffix("k").strip()
+        try:
+            return float(stripped)
+        except ValueError as e:
+            raise ValueError(
+                f"warmup_offset_k for stream '{stream_name}', channel '{channel}': "
+                f"cannot parse offset {value!r}."
+            ) from e
+    return float(value)
+
+
 class DataReaderAnemoi(DataReaderTimestep):
     "Wrapper for Anemoi datasets"
 
@@ -214,6 +285,12 @@ class DataReaderAnemoi(DataReaderTimestep):
         self.mean = ds.statistics["mean"]
         self.stdev = ds.statistics["stdev"]
 
+        # optional constant per-channel offset applied to the raw data (e.g. +2K on sst for
+        # prescribed-warming runs); see parse_channel_offsets
+        self._channel_offsets = parse_channel_offsets(
+            stream_info.get("warmup_offset_k"), list(ds.variables), stream_info["name"]
+        )
+
         # cache of the time-invariant geoinfo channels (z, lsm, ...), filled lazily from the
         # first available window and reused to build target queries for free-running forecast
         # steps that lie beyond the dataset coverage.
@@ -224,6 +301,7 @@ class DataReaderAnemoi(DataReaderTimestep):
         super().init_empty()
         self.ds = None
         self.len = 0
+        self._channel_offsets = None
 
     @override
     def length(self) -> int:
@@ -273,6 +351,11 @@ class DataReaderAnemoi(DataReaderTimestep):
         # coords-first representation and collapse multiple steps
         data = data.transpose([0, 2, 1]).reshape((data.shape[0] * data.shape[2], -1))
 
+        # apply the configured constant per-channel offsets (raw units, before normalisation
+        # and before source/target/geoinfo selection, so every consumer sees the same shift)
+        if self._channel_offsets is not None:
+            data = data + self._channel_offsets
+
         # extract geoinfo channels (can be time-varying, so read from dataset)
         geoinfos = data[:, list(self.geoinfo_idx)]
         # extract channels
@@ -310,6 +393,8 @@ class DataReaderAnemoi(DataReaderTimestep):
             return
         raw = self.ds[0:1][:, :, 0].astype(np.float32)
         raw = raw.transpose([0, 2, 1]).reshape((raw.shape[0] * raw.shape[2], -1))
+        if self._channel_offsets is not None:
+            raw = raw + self._channel_offsets
         self._static_geoinfo = raw[:, list(self.geoinfo_idx)]
 
     def get_target_query(self, when: datetime.datetime) -> ReaderData:

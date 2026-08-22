@@ -98,9 +98,25 @@ def main():
         choices=["prediction", "target", "bias"],
         help="field to animate: model output, ERA5 truth, or bias (prediction - target)",
     )
+    ap.add_argument("--ref-zip", action="append", default=None,
+                    help="reference run to subtract, giving a run-vs-run difference animation:\n"
+                         "  <--zip run> MINUS <--ref-zip run>, same --source group in both.\n"
+                         "This is a *model vs model* delta (e.g. the 2K rollout minus the 0K\n"
+                         "rollout, isolating the response to the prescribed SST warming), and\n"
+                         "is a different quantity from `--source bias`, which is\n"
+                         "prediction - target *within a single run*. Repeatable, layered like\n"
+                         "--zip. Colour range is symmetric about zero.")
     args = ap.parse_args()
-    zips = args.zip or ["results/decadal_2023_Jan_3y_2nd/validation_chkpt00000_rank0000.zip"]
+    if args.ref_zip and args.source == "bias":
+        # would compute (pred - target) - pred_ref, which is not a quantity anyone wants
+        ap.error("--ref-zip cannot be combined with --source bias: pick prediction or target")
+    zips = args.zip or ["results/sst_exp3_1y_0K/validation_chkpt00000_rank0000.zip"]
     suffix = "" if args.source == "prediction" else f"_{args.source}"
+    # run-vs-run difference: name the mp4 after the reference run so the pair is unambiguous
+    ref_name = ""
+    if args.ref_zip:
+        ref_name = Path(args.ref_zip[-1]).parent.name
+        suffix += f"_minus_{ref_name}"
     out = (
         args.out
         or zips[-1].rsplit("/", 1)[0] + f"/decadal_{args.field}{suffix}_animation.mp4"
@@ -117,14 +133,29 @@ def main():
         for k in ks:
             src[k] = grp
         print(f"  {z}: steps {ks[0]}..{ks[-1]} ({len(ks)})")
+    ref_src = {}
+    for z in args.ref_zip or []:
+        grp = zarr.open_group(store=zs.ZipStore(z, mode="r"), mode="r")[f"0/{args.stream}"]
+        ks = sorted(int(k) for k in grp.keys())
+        for k in ks:
+            ref_src[k] = grp
+        print(f"  [ref] {z}: steps {ks[0]}..{ks[-1]} ({len(ks)})")
+
     steps = sorted(src)[:: args.stride]
     if args.max_frames:
         steps = steps[: args.max_frames]
+    if ref_src:
+        # a step missing from the reference would otherwise surface as a KeyError deep inside
+        # the per-step load loop, after minutes of reading
+        missing = [s for s in steps if s not in ref_src]
+        if missing:
+            raise ValueError(
+                f"reference run is missing {len(missing)} of {len(steps)} steps "
+                f"(first: {missing[:5]}); refusing to subtract"
+            )
     era5 = src[steps[0]]
-    # prediction is (pts, chan, ens); target is (pts, chan) -- and the two groups carry their
-    # own channel lists, so the index is resolved per group rather than assumed shared.
-    def _chan(group):
-        return list(era5[f"{steps[0]}/{group}"].attrs["channels"]).index(args.field)
+    # prediction is (pts, chan, ens); target is (pts, chan) -- and each group carries its own
+    # channel list, so _load resolves the index per group rather than assuming a shared one.
 
     # every zip must describe the same grid/channels or the frames would not be comparable
     for grp in {id(v): v for v in src.values()}.values():
@@ -161,19 +192,23 @@ def main():
     print(f"{n} frames, field={args.field}, source={args.source}, {len(lat)} pts, "
           f"{args.workers} workers -> {out}")
 
-    def _load(group):
-        ch = _chan(group)
-        has_ens = era5[f"{steps[0]}/{group}/data"].ndim == 3
+    def _load(group, smap=None, root=None, label=None):
+        smap = src if smap is None else smap
+        root = era5 if root is None else root
+        label = group if label is None else label
+        # channel index is resolved against *this* run's own channel list, never assumed shared
+        ch = list(root[f"{steps[0]}/{group}"].attrs["channels"]).index(args.field)
+        has_ens = root[f"{steps[0]}/{group}/data"].ndim == 3
         arr = np.empty((n, len(lat)), dtype=np.float32)
         tms = np.empty(n, dtype="datetime64[ns]")
         for i, s in enumerate(steps):
-            nd = src[s][f"{s}/{group}"]
+            nd = smap[s][f"{s}/{group}"]
             d = nd["data"]
             v = np.asarray(d[:, ch, 0] if has_ens else d[:, ch])
             arr[i] = v[_step_key(np.asarray(nd["coords"]))]   # -> canonical order
             tms[i] = np.asarray(nd["times"][0])
             if i % 500 == 0:
-                print(f"  [{group}] loaded {i}/{n}", flush=True)
+                print(f"  [{label}] loaded {i}/{n}", flush=True)
         return arr, tms
 
     if args.source == "prediction":
@@ -193,14 +228,34 @@ def main():
             raise ValueError(f"prediction/target times differ at {bad}/{n} steps")
         F = P - T
 
+    # run-vs-run difference: same field, same group, same steps, other run
+    if ref_src:
+        ref_root = ref_src[steps[0]]
+        rc = np.asarray(ref_root[f"{steps[0]}/{ref_group}/coords"])
+        if rc.shape != coords.shape:
+            raise ValueError(
+                f"reference grid has {rc.shape[0]} points, this run has {coords.shape[0]}; "
+                "refusing to subtract"
+            )
+        # both runs are mapped into the same canonical (lat, lon) ordering before comparison,
+        # so this checks the grids really are the same set of locations
+        if not np.allclose(coords, rc[_order(rc)], atol=1e-5):
+            raise ValueError("reference run is on a different grid; refusing to subtract")
+        R, times_r = _load(ref_group, smap=ref_src, root=ref_root, label=f"ref:{ref_name}")
+        bad = int((times != times_r).sum())
+        if bad:
+            raise ValueError(f"reference run valid times differ at {bad}/{n} steps")
+        F = F - R
+
     finite = F[np.isfinite(F)]
-    if args.source == "bias":
+    if args.source == "bias" or ref_src:
         # diverging field: symmetric about zero so the colour map reads sign correctly
         m = float(max(abs(finite.min()), abs(finite.max())))
         vmin = args.vmin if args.vmin is not None else -m
         vmax = args.vmax if args.vmax is not None else m
-        print(f"symmetric bias colour range: [{vmin:.3g}, {vmax:.3g}]  "
-              f"mean bias={float(finite.mean()):+.4g}  rms={float(np.sqrt((finite**2).mean())):.4g}")
+        what = f"delta vs {ref_name}" if ref_src else "bias"
+        print(f"symmetric {what} colour range: [{vmin:.3g}, {vmax:.3g}]  "
+              f"mean={float(finite.mean()):+.4g}  rms={float(np.sqrt((finite**2).mean())):.4g}")
     else:
         vmin = args.vmin if args.vmin is not None else float(finite.min())
         vmax = args.vmax if args.vmax is not None else float(finite.max())
@@ -228,7 +283,8 @@ def main():
                 [times_np[i] for i in c], [steps[i] for i in c],
                 args.field, args.region, vmin, vmax, args.cmap, args.markersize,
                 args.dpi, args.figsize, args.stream, str(frame_dir),
-                "" if args.source == "prediction" else f"  [{args.source}]",
+                f"  [minus {ref_name}]" if ref_src
+                else ("" if args.source == "prediction" else f"  [{args.source}]"),
             )
             for c in chunks
         )

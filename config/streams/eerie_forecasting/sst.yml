@@ -40,6 +40,11 @@ SST :
   val_target_channels   : []
   geoinfo_channels : []
   loss_weight : 0.
+  # Prescribed-warming experiment knob: constant offset added to the named channel(s)
+  # everywhere (all points, all times), in raw physical units, before normalisation.
+  # Uncomment to run a +2K warmed-ocean experiment without touching the zarr on disk.
+  #warmup_offset_k :
+  #  msst : 2k
   location_weight : cosine_latitude
   token_size : 8
   tokenize_spacetime : True

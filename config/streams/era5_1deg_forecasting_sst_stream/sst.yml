@@ -42,6 +42,11 @@ SST :
   # 'ci' doubles as the land mask (see note above) and as sea-ice information
   geoinfo_channels : ['ci', 'insolation', 'cos_local_time', 'sin_local_time', 'cos_julian_day', 'sin_julian_day']
   loss_weight : 1.
+  # Prescribed-warming experiment knob: constant offset added to the named channel(s)
+  # everywhere (all points, all times), in raw physical units, before normalisation.
+  # Uncomment to run a +2K warmed-ocean experiment without touching the zarr on disk.
+  #warmup_offset_k :
+  #  sst : 2k
   forcing: True
   location_weight : cosine_latitude
   token_size : 8
