@@ -4,12 +4,12 @@
 #SBATCH --output=./logs/output_%j.txt
 #SBATCH --error=./logs/error_%j.txt
 #SBATCH --exclusive --mem=450G
-#SBATCH --partition=normal
+#SBATCH --partition=booster
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=02:00:00
-#SBATCH -A ch17
+#SBATCH -A e-ext-2025e01-128
 #SBATCH --output=logs/weathergen-%x.%j.out
 #SBATCH --error=logs/weathergen-%x.%j.err
 

@@ -38,6 +38,10 @@ _ref="${REF:-}"
 # Fixed colour range shared across runs. Without it every run is scaled to its own min/max,
 # which re-normalises a real warming away and makes the videos look identical.
 # diagnostics/compare_runs.py prints the range to use over a set of runs.
+# SOURCE=prediction (default) | target | bias  -- which field animate_decadal.py renders
+_source_args=()
+[ -n "${SOURCE:-}" ] && _source_args+=(--source "$SOURCE")
+
 _range_args=()
 [ -n "${VMIN:-}" ] && _range_args+=(--vmin "$VMIN")
 [ -n "${VMAX:-}" ] && _range_args+=(--vmax "$VMAX")
@@ -51,7 +55,7 @@ if [ -n "$_ref" ]; then
   fi
 fi
 
-echo "===== runs: ${_runs[*]} | fields: ${_fields[*]} | workers: $_workers${_ref:+ | minus $_ref}${VMIN:+ | range ${VMIN}..${VMAX}} ====="
+echo "===== runs: ${_runs[*]} | fields: ${_fields[*]} | workers: $_workers${_ref:+ | minus $_ref}${VMIN:+ | range ${VMIN}..${VMAX}}${SOURCE:+ | source $SOURCE} ====="
 
 # fail fast on a missing/misspelled run rather than after the first hour of rendering
 for r in "${_runs[@]}"; do
@@ -66,7 +70,7 @@ for r in "${_runs[@]}"; do
     echo "===== $(date +%H:%M) generating $r / $f ====="
     .venv/bin/python3 diagnostics/animate_decadal.py \
       --zip "results/$r/validation_chkpt00000_rank0000.zip" \
-      "${_ref_args[@]}" "${_range_args[@]}" \
+      "${_ref_args[@]}" "${_range_args[@]}" "${_source_args[@]}" \
       --field "$f" --fps 8 --workers "$_workers" || echo "FAILED: $r / $f"
   done
 done

@@ -10,7 +10,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=02:00:00
-#SBATCH -A hclimrep
+#SBATCH -A e-ext-2025e01-128
 #SBATCH --output=logs/weathergen-%x.%j.out
 #SBATCH --error=logs/weathergen-%x.%j.err
 

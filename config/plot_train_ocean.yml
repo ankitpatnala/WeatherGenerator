@@ -1,0 +1,23 @@
+train:
+   plot:
+        i4sig3bm:
+            slurm_id: 0
+            description: Baseline (1 step) - "dynamic_loss" { window 128, L 20.0 }
+        bqm2zmg7:
+            slurm_id: 0
+            description: Baseline (2 step) - "dynamic_loss" { window 128, L 20.0 }
+        nlodlbc1:
+            slurm_id: 0
+            description: Baseline (4 step) - "dynamic_loss" { window 128, L 20.0 }
+        qkrckr9v:
+            slurm_id: 0
+            description: 2 step adapting window and L - "dynamic_loss" { window 64, L 50.0 }
+        pre9m9bx:
+            slurm_id: 0
+            description: 2 step adapting window and L - "dynamic_loss" { window 64, L 10.0 }
+        t88de523:
+            slurm_id: 0
+            description: 4 step adapting window and L - "dynamic_loss" { window 256, L 50.0 }
+        pvjiwaew:
+            slurm_id: 0
+            description: 4 step adapting window and L - "dynamic_loss + Muon" { window 61, L 10.0 }

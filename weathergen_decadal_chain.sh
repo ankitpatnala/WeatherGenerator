@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH -A hclimrep
+#SBATCH -A e-ext-2025e01-128
 #SBATCH --output=logs/decadal-%j.out
 #SBATCH --error=logs/decadal-%j.err
 
