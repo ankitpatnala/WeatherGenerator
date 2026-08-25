@@ -1,0 +1,74 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# ---------------------------------------------------------------------------------------------
+# ssp370 PROJECTIONS variant of config/streams/climatedt/climatedt_ocean.yml, for the test phase.
+#
+# Identical to the training stream except for two keys:
+#   filenames       -> the ssp370 projections zarr (2015-01-01 .. 2049-12-31)
+#   statistics_from -> the HISTORICAL zarr the model was trained on
+#
+# statistics_from is essential, not cosmetic. Each anemoi dataset carries its own mean/stdev, so
+# normalising ssp370 by its own statistics would re-centre the projection's trend to zero -- the
+# warming being tested would be subtracted out before the model saw it. Concretely: co2 is
+# continuous to 0.01 ppm across the 2014/2015 handover, but with each file's own statistics the
+# normalised input jumps -4.0 sigma; pinned to the historical statistics it stays at +2.43.
+# ---------------------------------------------------------------------------------------------
+
+CLIMATEDT_OCEAN :
+  type : anemoi
+  filenames : ['/e/data1/climateai/hclimrep/data/ifs_nemo/anemoi-climatedt-gen2-ifs-nemo-projections-ssp370-5km-r1-H64-20150101-20491231.zarr']
+  # normalise exactly as training did -- see the banner above
+  statistics_from : '/e/data1/climateai/hclimrep/data/ifs_nemo/anemoi-climatedt-gen2-ifs-nemo-baseline-hist-5km-r1-H64-19900101-20141231.zarr'
+  stream_id : 1
+  # Same zarr as CLIMATEDT_ATMO, restricted to the NEMO ocean / sea-ice fields, which are excluded
+  # from the atmo stream. Given as explicit include lists rather than excludes: the alternative is
+  # listing the 114 atmospheric channels in source_exclude / target_exclude.
+  # All six carry an identical NaN mask over the NEMO land mask (15521 of 49152 points, 31.6% of
+  # the grid). This is handled: NaN source tokens are replaced by the mask value, and both the
+  # p-norm and kernel-CRPS losses zero out NaN targets, so masked points contribute no gradient.
+  source : ['mean_sea_surface_temperature', 'mean_sea_surface_salinity', 'mean_sea_surface_height',
+            'mean_sea_ice_area_fraction', 'mean_sea_ice_thickness', 'mean_total_column_heat_content']
+  target : ['mean_sea_surface_temperature', 'mean_sea_surface_salinity', 'mean_sea_surface_height',
+            'mean_sea_ice_area_fraction', 'mean_sea_ice_thickness', 'mean_total_column_heat_content']
+  # land_sea_mask lets the model tell masked land points from genuine ocean values.
+  # orography is omitted; it carries no information over water.
+  geoinfo_channels : ['land_sea_mask', 'insolation', 'cos_latitude', 'sin_latitude',
+                      'cos_longitude', 'sin_longitude', 'cos_julian_day', 'sin_julian_day']
+  loss_weight : 1.
+  # Prescribed-warming experiment knob: constant offset added to the named channel(s)
+  # everywhere (all points, all times), in raw physical units, before normalisation.
+  # Uncomment to run a +2K warmed-ocean experiment without touching the zarr on disk.
+  # NOTE: offsets are per-reader, so warming SST here does NOT warm skin_temperature in
+  # CLIMATEDT_ATMO -- and over ice-free ocean the two are the same field to within 0.27 K.
+  # Shift skin_temperature by the same amount there, or the model sees a warmed ocean and an
+  # un-warmed one at the same points.
+  #warmup_offset_k :
+  #  mean_sea_surface_temperature : 2k
+  location_weight : cosine_latitude
+  token_size : 8
+  tokenize_spacetime : True
+  max_num_targets: 20000
+  frequency : 24:00:00
+  embed :
+    net : transformer
+    num_tokens : 1
+    num_heads : 8
+    dim_embed : 512
+    num_blocks : 2
+  embed_target_coords :
+    net : linear
+    dim_embed : 512
+  target_readout :
+    num_layers : 2
+    num_heads : 4
+    # sampling_rate : 0.2
+  pred_head :
+    ens_size : 1
+    num_layers : 1

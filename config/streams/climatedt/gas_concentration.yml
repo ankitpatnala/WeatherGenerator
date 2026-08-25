@@ -1,0 +1,63 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# Greenhouse-gas and ozone concentration forcing stream.
+#
+# These are prescribed lower/radiative boundary conditions, NOT predicted: re-read at every
+# forecast step's valid time and injected into the forecasting engine, so a free-running
+# rollout stays anchored to the scenario's radiative forcing rather than drifting to the
+# climatology it was trained on. Same mechanism as the SST forcing in
+# config/streams/era5_1deg_forecasting/sst.yml.
+#
+# Two physically distinct groups share this stream:
+#   co2/ch4/n2o/cfc11/cfc12_vmr : well-mixed GHGs, spatially uniform (verified: spatial stdev
+#                                 at float roundoff). They vary only in time and carry the
+#                                 scenario trend -- co2_vmr runs 353.5 ppm (1990) to 398.8 ppm
+#                                 (2014) across this file.
+#   vmro3_<level>               : ozone volume mixing ratio, spatially varying, on the same 16
+#                                 pressure levels as CLIMATEDT_ATMO.
+#
+# Grid: H64 (49152 points), matching the main dataset and the ssp370 projections forcings, so
+# the forcing grid is consistent across the historical and projection periods. (An H128 variant
+# of this file also exists locally; it was used previously and made the grid change at 2015.)
+#
+# The zarr's variables_with_nans attribute claims vmro3/cfc11_vmr/ch4_vmr contain NaNs; no NaNs
+# were found in any sampled timestep. The attribute appears stale.
+GAS_CONCENTRATION :
+  type : forcing
+  filenames : ['/e/data1/climateai/hclimrep/data/ifs_nemo/forcings-ghg-ozone-climatedt-gen2-ifs-nemo-baseline-hist-5km-r1-H64-19900101-20141231.zarr']
+  stream_id : 11
+  entry_point : "forecast_engine"
+  frequency : 24:00:00
+  # forcing: not predicted (empty target channels -> is_stream_forcing -> no decoder)
+  train_source_channels : ['co2_vmr', 'ch4_vmr', 'n2o_vmr', 'cfc11_vmr', 'cfc12_vmr', 'vmro3_5', 'vmro3_10', 'vmro3_30',
+                            'vmro3_50', 'vmro3_100', 'vmro3_150', 'vmro3_200', 'vmro3_250', 'vmro3_300', 'vmro3_400', 'vmro3_500',
+                            'vmro3_600', 'vmro3_700', 'vmro3_850', 'vmro3_925', 'vmro3_1000']
+  val_source_channels   : ['co2_vmr', 'ch4_vmr', 'n2o_vmr', 'cfc11_vmr', 'cfc12_vmr', 'vmro3_5', 'vmro3_10', 'vmro3_30',
+                            'vmro3_50', 'vmro3_100', 'vmro3_150', 'vmro3_200', 'vmro3_250', 'vmro3_300', 'vmro3_400', 'vmro3_500',
+                            'vmro3_600', 'vmro3_700', 'vmro3_850', 'vmro3_925', 'vmro3_1000']
+  train_target_channels : []
+  val_target_channels   : []
+  geoinfo_channels : []
+  loss_weight : 0.
+  location_weight : cosine_latitude
+  token_size : 8
+  tokenize_spacetime : True
+  # See sst.yml for the full description of the injection modes.
+  # adaln_local and global route the forcing through the FE conditioning (AdaLN) and therefore
+  # require a condition stream to be present -- Forecast_conditions in forecast.yml supplies it.
+  injection :
+    mode : adaln_local   # none | additive | cross_attn | global | adaln_local
+    learned_pool : True
+  embed :
+    net : transformer
+    num_tokens : 1
+    num_heads : 8
+    dim_embed : 512
+    num_blocks : 2

@@ -1,0 +1,143 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+
+CLIMATEDT_ATMO :
+  type : anemoi
+  filenames : ['/e/data1/climateai/hclimrep/data/ifs_nemo/anemoi-climatedt-gen2-ifs-nemo-baseline-hist-5km-r1-H64-19900101-20141231.zarr']
+  stream_id : 0
+  source_exclude : ['mean_sea_ice_area_fraction', 'mean_sea_ice_thickness', 'mean_sea_surface_height',
+                    'mean_sea_surface_salinity', 'mean_sea_surface_temperature',
+                    'mean_total_column_heat_content']
+  target_exclude : ['mean_sea_ice_area_fraction', 'mean_sea_ice_thickness', 'mean_sea_surface_height',
+                    'mean_sea_surface_salinity', 'mean_sea_surface_temperature',
+                    'mean_total_column_heat_content']
+  # constant-in-time and computed-forcing variables are dropped from source/target automatically,
+  # so orography / land_sea_mask / lat-lon / insolation / julian day are only picked up here.
+  geoinfo_channels : ['orography', 'land_sea_mask', 'insolation', 'cos_latitude', 'sin_latitude',
+                      'cos_longitude', 'sin_longitude', 'cos_julian_day', 'sin_julian_day']
+  loss_weight : 1.
+  location_weight : cosine_latitude
+  token_size : 8
+  tokenize_spacetime : True
+  max_num_targets: 20000
+  frequency : 24:00:00
+  embed :
+    net : transformer
+    num_tokens : 1
+    num_heads : 8
+    dim_embed : 512
+    num_blocks : 2
+  embed_target_coords :
+    net : linear
+    dim_embed : 512
+  target_readout :
+    num_layers : 2
+    num_heads : 4
+    # sampling_rate : 0.2
+  pred_head :
+    ens_size : 1
+    num_layers : 1
+  channel_weights :
+    specific_humidity_5: 0.2
+    specific_humidity_10: 0.2
+    specific_humidity_30: 0.2
+    specific_humidity_50: 0.2
+    specific_humidity_100: 0.23
+    specific_humidity_150: 0.26
+    specific_humidity_200: 0.29
+    specific_humidity_250: 0.33
+    specific_humidity_300: 0.36
+    specific_humidity_400: 0.42
+    specific_humidity_500: 0.48
+    specific_humidity_600: 0.55
+    specific_humidity_700: 0.61
+    specific_humidity_850: 0.71
+    specific_humidity_925: 0.75
+    specific_humidity_1000: 0.8
+    temperature_5: 0.2
+    temperature_10: 0.2
+    temperature_30: 0.2
+    temperature_50: 0.2
+    temperature_100: 0.23
+    temperature_150: 0.26
+    temperature_200: 0.29
+    temperature_250: 0.33
+    temperature_300: 0.36
+    temperature_400: 0.42
+    temperature_500: 0.48
+    temperature_600: 0.55
+    temperature_700: 0.61
+    temperature_850: 0.71
+    temperature_925: 0.75
+    temperature_1000: 0.8
+    u_component_of_wind_5: 0.2
+    u_component_of_wind_10: 0.2
+    u_component_of_wind_30: 0.2
+    u_component_of_wind_50: 0.2
+    u_component_of_wind_100: 0.23
+    u_component_of_wind_150: 0.26
+    u_component_of_wind_200: 0.29
+    u_component_of_wind_250: 0.33
+    u_component_of_wind_300: 0.36
+    u_component_of_wind_400: 0.42
+    u_component_of_wind_500: 0.48
+    u_component_of_wind_600: 0.55
+    u_component_of_wind_700: 0.61
+    u_component_of_wind_850: 0.71
+    u_component_of_wind_925: 0.75
+    u_component_of_wind_1000: 0.8
+    v_component_of_wind_5: 0.2
+    v_component_of_wind_10: 0.2
+    v_component_of_wind_30: 0.2
+    v_component_of_wind_50: 0.2
+    v_component_of_wind_100: 0.23
+    v_component_of_wind_150: 0.26
+    v_component_of_wind_200: 0.29
+    v_component_of_wind_250: 0.33
+    v_component_of_wind_300: 0.36
+    v_component_of_wind_400: 0.42
+    v_component_of_wind_500: 0.48
+    v_component_of_wind_600: 0.55
+    v_component_of_wind_700: 0.61
+    v_component_of_wind_850: 0.71
+    v_component_of_wind_925: 0.75
+    v_component_of_wind_1000: 0.8
+    geopotential_5: 0.2
+    geopotential_10: 0.2
+    geopotential_30: 0.2
+    geopotential_50: 0.2
+    geopotential_100: 0.23
+    geopotential_150: 0.26
+    geopotential_200: 0.29
+    geopotential_250: 0.33
+    geopotential_300: 0.36
+    geopotential_400: 0.42
+    geopotential_500: 0.48
+    geopotential_600: 0.55
+    geopotential_700: 0.61
+    geopotential_850: 0.71
+    geopotential_925: 0.75
+    geopotential_1000: 0.8
+    vertical_velocity_5: 0.2
+    vertical_velocity_10: 0.2
+    vertical_velocity_30: 0.2
+    vertical_velocity_50: 0.2
+    vertical_velocity_100: 0.23
+    vertical_velocity_150: 0.26
+    vertical_velocity_200: 0.29
+    vertical_velocity_250: 0.33
+    vertical_velocity_300: 0.36
+    vertical_velocity_400: 0.42
+    vertical_velocity_500: 0.48
+    vertical_velocity_600: 0.55
+    vertical_velocity_700: 0.61
+    vertical_velocity_850: 0.71
+    vertical_velocity_925: 0.75
+    vertical_velocity_1000: 0.8
