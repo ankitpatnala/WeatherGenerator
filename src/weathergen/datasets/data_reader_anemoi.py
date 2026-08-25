@@ -134,6 +134,60 @@ def parse_channel_offsets(
     return offsets
 
 
+def resolve_statistics(stream_info, ds, stream_name: str) -> dict[str, NDArray[np.float32]]:
+    """
+    Normalisation statistics for a dataset, optionally taken from a *different* dataset.
+
+    By default a dataset is normalised by its own statistics. That is wrong whenever train and
+    test read different files: each carries its own mean/stdev, so a physically continuous
+    quantity jumps discontinuously in normalised space at the handover, and any trend that is
+    common to the test file (warming, rising CO2) is re-centred to zero by its own mean --
+    i.e. normalised away, which is usually the very signal being measured.
+
+    ``statistics_from`` pins the statistics to a reference dataset (normally the training one)::
+
+        statistics_from : '/path/to/training.zarr'
+
+    The reference is matched **by variable name**, not position, and must contain every variable
+    of the dataset being read; grid, resolution and time span may differ freely.
+
+    Parameters
+    ----------
+    stream_info :
+        Stream config; read for the optional ``statistics_from`` key.
+    ds :
+        The dataset being read.
+    stream_name :
+        Stream name, only used for error messages / logging.
+
+    Returns
+    -------
+    Dict with "mean" and "stdev", aligned to ``ds.variables`` order.
+    """
+    source = stream_info.get("statistics_from")
+    if not source:
+        return {"mean": ds.statistics["mean"], "stdev": ds.statistics["stdev"]}
+
+    ref = anemoi_datasets.open_dataset(str(source))
+    missing = [v for v in ds.variables if v not in ref.variables]
+    if missing:
+        raise ValueError(
+            f"statistics_from for stream '{stream_name}' ({source}) is missing variables "
+            f"present in the dataset being read: {missing}"
+        )
+
+    # match by name: the reference may order or extend its variables differently
+    idx = [ref.variables.index(v) for v in ds.variables]
+    stats = {k: ref.statistics[k][idx] for k in ("mean", "stdev")}
+
+    if is_root():
+        _logger.info(
+            f"{stream_name}: normalising with statistics from {source} "
+            f"instead of the dataset's own ({len(ds.variables)} variables matched by name)"
+        )
+    return stats
+
+
 def _parse_offset_value(value, channel: str, stream_name: str) -> float:
     """Accept a number, or a string such as "2", "2k", "+2 K", "-1.5"."""
     if isinstance(value, str):
@@ -266,10 +320,14 @@ class DataReaderAnemoi(DataReaderTimestep):
             self.geoinfo_channels = stream_info.get("geoinfo_channels")
             self.geoinfo_idx = [ds.variables.index(ch) for ch in self.geoinfo_channels]
 
+        # normalization statistics, optionally pinned to a reference dataset so that a test run
+        # on a different file is normalised exactly as training was; see resolve_statistics
+        stats = resolve_statistics(stream_info, ds, stream_info["name"])
+
         # set geoinfo normalization statistics
         if len(self.geoinfo_idx) > 0:
-            self.mean_geoinfo = ds.statistics["mean"][self.geoinfo_idx]
-            self.stdev_geoinfo = ds.statistics["stdev"][self.geoinfo_idx]
+            self.mean_geoinfo = stats["mean"][self.geoinfo_idx]
+            self.stdev_geoinfo = stats["stdev"][self.geoinfo_idx]
         else:
             self.mean_geoinfo = np.zeros(0)
             self.stdev_geoinfo = np.ones(0)
@@ -282,8 +340,8 @@ class DataReaderAnemoi(DataReaderTimestep):
         self.properties = {
             "stream_id": 0,
         }
-        self.mean = ds.statistics["mean"]
-        self.stdev = ds.statistics["stdev"]
+        self.mean = stats["mean"]
+        self.stdev = stats["stdev"]
 
         # optional constant per-channel offset applied to the raw data (e.g. +2K on sst for
         # prescribed-warming runs); see parse_channel_offsets
