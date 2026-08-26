@@ -176,6 +176,7 @@ training_config:
         type: LossPhysical,
         loss_fcts: { 
           "mse": { }, 
+          "dynamic_loss": { window: 64, L: 10.0 }
         },
         },
     }
