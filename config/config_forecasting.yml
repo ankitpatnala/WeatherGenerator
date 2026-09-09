@@ -135,15 +135,15 @@ training_config:
   # training_mode: "masking", "student_teacher", "latent_loss"
   training_mode: ["masking"]
 
-  num_mini_epochs: 96
+  num_mini_epochs: 256
   samples_per_mini_epoch: 4096
   shuffle: True
 
   start_date: 1979-01-01T00:00
-  end_date: 2022-12-31T00:00
+  end_date: 2014-12-31T00:00
 
-  time_window_step: 06:00:00
-  time_window_len: 06:00:00
+  time_window_step: 24:00:00
+  time_window_len: 24:00:00
   
   learning_rate_scheduling :
     lr_start: 1e-6
@@ -208,7 +208,7 @@ training_config:
     }
 
   forecast :
-      time_step: 06:00:00
+      time_step: 24:00:00
       offset: 1
       num_steps: 3
       policy: "fixed"
@@ -220,8 +220,8 @@ validation_config:
   samples_per_mini_epoch: 256
   shuffle: False
 
-  start_date: 2023-10-01T00:00
-  end_date: 2023-12-31T00:00
+  start_date: 2014-10-01T00:00
+  end_date: 2014-12-31T00:00
   
   # whether to track the exponential moving average of weights for validation
   validate_with_ema: 

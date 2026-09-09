@@ -10,7 +10,7 @@
 Forecast_conditions :
   type : condition
   filenames : []
-  variables : ['start_day', 'start_time', 'end_day', 'end_time']
+  variables : ['start_day', 'end_day']
   transform : "fourier"  # absolute, absolute_normalized, cos_sin, fourier
   entry_point : "forecast_engine"
   emb_dimension : 16

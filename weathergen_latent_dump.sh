@@ -7,8 +7,9 @@
 #   sbatch weathergen_latent_dump.sh C    # encoder  : consecutive 1-step from truth, PRE-FE
 #                                         #            (pre-FE = encode(real(t)), assimilation latent)
 #
-# All self-chain on the 30-min debug partition and are resume-safe (chunk files never clobber).
-# Set C is a SEPARATE set so it never overrides Set B. Length via STEPS (default 500). oq9o0t86, 2015.
+# All self-chain and are resume-safe (chunk files never clobber). Set C is a SEPARATE set so it
+# never overrides Set B. Length via STEPS (default 500), checkpoint via CKPT.
+# Default: ytjqlya5 (ifs_nemo/ClimateDT), 1990-2014, daily steps.
 
 #SBATCH --job-name=latent_dump
 #SBATCH --exclusive --mem=450G
@@ -29,9 +30,12 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 SET=$1
 MAX=${2:-25}
-CKPT=${CKPT:-ynsacr6l}
-START=201501010000
-END=201507050000
+CKPT=${CKPT:-ytjqlya5}
+START=199001010000
+END=201412310000
+# time-window step of the run, in hours: ClimateDT (ifs_nemo) is daily. Used only by the B/C
+# date-offset resume; a wrong value there silently restarts at the wrong valid time.
+STEP_H=24
 NUM_STEPS=${STEPS:-500}
 CHUNK=50
 export LATENT_FLUSH_EVERY=$CHUNK      # one .npy per CHUNK steps (aligned to rollout chunk_size)
@@ -92,7 +96,7 @@ elif [ "$SET" = "B" ] || [ "$SET" = "C" ]; then
   if [ "$MAX" -le 0 ]; then echo "[chain] max links reached at $RESUME/$NUM_STEPS."; exit 0; fi
 
   export LATENT_START_INDEX=$RESUME
-  RSTART=$(.venv/bin/python3 -c "import datetime;print((datetime.datetime(2015,1,1)+datetime.timedelta(hours=6*$RESUME)).strftime('%Y%m%d%H%M'))")
+  RSTART=$(.venv/bin/python3 -c "import datetime;print((datetime.datetime.strptime('$START','%Y%m%d%H%M')+datetime.timedelta(hours=$STEP_H*$RESUME)).strftime('%Y%m%d%H%M'))")
   REMAIN=$((NUM_STEPS - RESUME))
   echo "[chain] set$SET resume start_date=$RSTART remaining=$REMAIN"
 

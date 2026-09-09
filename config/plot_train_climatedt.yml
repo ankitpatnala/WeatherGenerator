@@ -1,0 +1,34 @@
+train:
+  plot:
+    c3cjxl08:
+      slurm_id: 0
+      description: "AdamW basic pre-training"
+      eval: vgbndhco 
+    drgwijhz:
+      slurm_id: 0
+      description: "Muon with dynamic loss"
+      eval: vgbndhco
+    vhkqtucx:
+      slurm_id: 0
+      description: "Muon with dynamic loss"
+      eval: vgbndhco
+    td1n3jyv:
+      slurm_id: 0
+      description: "Muon with dynamic loss + cosine_regularizer(0.45-0.55)"
+      eval: vgbndhco
+    mk9q6lrk:
+      slurm_id: 0
+      description: "Muon with dynamic loss(only atmo)"
+      eval: vgbndhco
+    rwvxywj8:
+      slurm_id: 0
+      description: "Muon with dynamic loss (rotational grid)"
+      eval: vgbndhco
+    ytjqlya5:
+      slurm_id: 0
+      description: "Muon with dynamic loss (finetuning)-no noise"
+      eval: vgbndhco
+    hmpvo4s9:
+      slurm_id: 0
+      description: "Muon with dynamic loss (finetuning)"
+      eval: vgbndhco

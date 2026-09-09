@@ -14,7 +14,9 @@ Reads a WeatherGenerator validation zarr (ZipStore):
 
 Usage:
   python diagnostics/animate_decadal.py --field 2t --workers 48
-  # -> results/decadal_2023_2026/decadal_2t_animation.mp4
+  # -> results/decadal_2023_2026/decadal_ERA5_2t_animation.mp4
+  python diagnostics/animate_decadal.py --zip results/ifs_nemo_v2/validation_chkpt00000_rank0000.zip \
+      --stream CLIMATEDT_OCEAN --field mean_sea_surface_temperature
 """
 
 import argparse
@@ -117,9 +119,12 @@ def main():
     if args.ref_zip:
         ref_name = Path(args.ref_zip[-1]).parent.name
         suffix += f"_minus_{ref_name}"
+    # stream is part of the name: a run can hold several streams and a field name can occur in
+    # more than one of them
     out = (
         args.out
-        or zips[-1].rsplit("/", 1)[0] + f"/decadal_{args.field}{suffix}_animation.mp4"
+        or zips[-1].rsplit("/", 1)[0]
+        + f"/decadal_{args.stream}_{args.field}{suffix}_animation.mp4"
     )
 
     import zarr
@@ -153,7 +158,7 @@ def main():
                 f"reference run is missing {len(missing)} of {len(steps)} steps "
                 f"(first: {missing[:5]}); refusing to subtract"
             )
-    era5 = src[steps[0]]
+    stream_root = src[steps[0]]
     # prediction is (pts, chan, ens); target is (pts, chan) -- and each group carries its own
     # channel list, so _load resolves the index per group rather than assuming a shared one.
 
@@ -161,11 +166,11 @@ def main():
     for grp in {id(v): v for v in src.values()}.values():
         k = min(int(x) for x in grp.keys())
         assert list(grp[f"{k}/prediction"].attrs["channels"]) == list(
-            era5[f"{steps[0]}/prediction"].attrs["channels"]
+            stream_root[f"{steps[0]}/prediction"].attrs["channels"]
         ), "channel lists differ between zips"
 
     ref_group = "target" if args.source == "target" else "prediction"
-    coords = np.asarray(era5[f"{steps[0]}/{ref_group}/coords"])
+    coords = np.asarray(stream_root[f"{steps[0]}/{ref_group}/coords"])
 
     # The point ORDER is not constant across steps: free-running steps beyond the data emit the
     # full grid in raw order, while data-driven steps use the tokenized order. Reading coords
@@ -189,15 +194,26 @@ def main():
             _key_cache[h] = k
         return k
     n = len(steps)
-    print(f"{n} frames, field={args.field}, source={args.source}, {len(lat)} pts, "
-          f"{args.workers} workers -> {out}")
+    # the eval Plotter only knows marker sizes for era5/imerg/cerra and falls back to 0.5, which
+    # on a dense gridded stream (CLIMATEDT_*, ~50k healpix points) renders as dots on white.
+    markersize = args.markersize
+    if markersize is None and len(lat) >= 20000:
+        markersize = 2.5
+    print(f"{n} frames, stream={args.stream}, field={args.field}, source={args.source}, "
+          f"{len(lat)} pts, {args.workers} workers -> {out}")
 
     def _load(group, smap=None, root=None, label=None):
         smap = src if smap is None else smap
-        root = era5 if root is None else root
+        root = stream_root if root is None else root
         label = group if label is None else label
         # channel index is resolved against *this* run's own channel list, never assumed shared
-        ch = list(root[f"{steps[0]}/{group}"].attrs["channels"]).index(args.field)
+        channels = list(root[f"{steps[0]}/{group}"].attrs["channels"])
+        if args.field not in channels:
+            raise SystemExit(
+                f"field '{args.field}' is not in stream {args.stream} "
+                f"({len(channels)} channels: {', '.join(channels)})"
+            )
+        ch = channels.index(args.field)
         has_ens = root[f"{steps[0]}/{group}/data"].ndim == 3
         arr = np.empty((n, len(lat)), dtype=np.float32)
         tms = np.empty(n, dtype="datetime64[ns]")
@@ -220,7 +236,7 @@ def main():
         T, times_t = _load("target")
         # the two groups are written from the same batch, but subtracting silently across a
         # mismatch would produce a plausible-looking and completely wrong field, so check.
-        tc = np.asarray(era5[f"{steps[0]}/target/coords"])
+        tc = np.asarray(stream_root[f"{steps[0]}/target/coords"])
         if not np.allclose(coords, tc, atol=1e-5):
             raise ValueError("prediction and target coords differ; refusing to subtract")
         bad = int((times != times_t).sum())
@@ -281,7 +297,7 @@ def main():
             delayed(_render_frames)(
                 npy_path, lat, lon, list(c),
                 [times_np[i] for i in c], [steps[i] for i in c],
-                args.field, args.region, vmin, vmax, args.cmap, args.markersize,
+                args.field, args.region, vmin, vmax, args.cmap, markersize,
                 args.dpi, args.figsize, args.stream, str(frame_dir),
                 f"  [minus {ref_name}]" if ref_src
                 else ("" if args.source == "prediction" else f"  [{args.source}]"),

@@ -65,9 +65,17 @@ def mean_series(src, field, steps, group, regions=REGIONS, equator_band=0.5):
     times = np.empty(len(steps), dtype="datetime64[ns]")
     mask_cache = {}
     _reported = False
+    n_empty = 0
     for i, s in enumerate(steps):
         nd = src[s][f"{s}/{group}"]
         d = nd["data"]
+        # Steps beyond the target window carry EMPTY arrays (length 0), not zeros and not
+        # missing groups: a free-running rollout outruns the data it can be scored against.
+        # Reading them raises BoundsCheckError, so they are recorded as NaN and skipped.
+        if d.shape[0] == 0 or nd["times"].shape[0] == 0:
+            times[i] = np.datetime64("NaT")
+            n_empty += 1
+            continue
         v = np.asarray(d[:, ch, 0] if has_ens else d[:, ch])
         masks = _region_masks(np.asarray(nd["coords"]), mask_cache, equator_band)
         if not _reported:
@@ -82,7 +90,35 @@ def mean_series(src, field, steps, group, regions=REGIONS, equator_band=0.5):
         times[i] = np.asarray(nd["times"][0])
         if i % 500 == 0:
             print(f"    [{group}] {i}/{len(steps)}", flush=True)
+    if n_empty:
+        first_empty = int(np.argmax(~np.isfinite(out[regions[0]])))
+        print(f"    [{group}] {n_empty}/{len(steps)} steps carry no data "
+              f"(first at step index {first_empty}); left blank", flush=True)
     return out, times
+
+
+def mask_missing_target(series, label="target"):
+    """
+    Blank out steps where the target is not real data.
+
+    Free-running steps beyond the dataset's coverage are written as ZEROS, not as missing, so a
+    rollout that outruns ERA5 has a target that is valid for a while and then 0. Plotted raw
+    that reads as the truth collapsing to 0 K. Any target step whose regional mean is ~0 (an
+    impossible 2t in Kelvin) or non-finite is therefore set to NaN, which breaks the line
+    instead of drawing a false one.
+    """
+    for name in list(series):
+        if not name.startswith(label):
+            continue
+        v = np.asarray(series[name], dtype=float).copy()
+        missing = ~np.isfinite(v) | (np.abs(v) < 1e-6)
+        if missing.any():
+            v[missing] = np.nan
+            series[name] = v
+            first = int(np.argmax(missing)) if missing.any() else None
+            print(f"  '{name}': {int(missing.sum())}/{len(v)} steps have no truth "
+                  f"(first missing at index {first}); those points are left blank")
+    return series
 
 
 def _read_csv(path):
@@ -130,6 +166,7 @@ def main():
         stem = Path(args.from_csv).stem
         region = next((r for r in REGIONS if r != "global" and stem.endswith(f"_{r}")), "global")
         suffix = "" if region == "global" else f"_{region}"
+        mask_missing_target(series)
         if args.max_frames:  # --max-frames also truncates a re-plot, e.g. to the first 50 days
             times = times[: args.max_frames]
             series = {k: v[: args.max_frames] for k, v in series.items()}
@@ -171,11 +208,15 @@ def main():
             else:
                 tgt = got_t[0]
                 # free-running steps beyond data coverage are written as zeros, not truth
-                if np.allclose(np.nan_to_num(tgt["global"]), 0.0):
+                finite = np.isfinite(tgt["global"])
+                if not finite.any() or np.allclose(np.nan_to_num(tgt["global"][finite]), 0.0):
                     print("  target group is all zeros (free-running beyond coverage); skipping")
                 else:
                     for r in REGIONS:
                         series[r]["target (ERA5)"] = tgt[r]
+                    # partial coverage: real truth for a while, then zeros -> blank those
+                    for r in REGIONS:
+                        mask_missing_target(series[r])
 
     for region in REGIONS:
         reg_series = series[region]
