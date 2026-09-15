@@ -33,6 +33,8 @@ NUM_STEPS=${2:?"usage: sbatch weathergen_decadal_chain.sh RUN_ID NUM_STEPS [MAX_
 MAX=${3:-2}
 # continuing a rollout MUST reuse the checkpoint that produced the saved latent
 CKPT=${CKPT:-ytjqlya5}
+# must tile so a resume lands on a chunk boundary: done_steps % CHUNK == 0
+CHUNK=${CHUNK:-50}
 SCRIPT="$REPO/weathergen_decadal_chain.sh"
 STATE="$REPO/results/$RUN_ID/rollout_state.pt"
 
@@ -52,14 +54,14 @@ if [ "$MAX" -le 0 ]; then
 fi
 
 # queue the successor now so the chain survives this job being killed at the 30-min wall
-sbatch --export=ALL,CKPT="$CKPT" --dependency=afterany:"$SLURM_JOB_ID" "$SCRIPT" "$RUN_ID" "$NUM_STEPS" $((MAX - 1))  \
+sbatch --export=ALL,CKPT="$CKPT",CHUNK="$CHUNK" --dependency=afterany:"$SLURM_JOB_ID" "$SCRIPT" "$RUN_ID" "$NUM_STEPS" $((MAX - 1))  \
   || echo "[chain] WARNING: failed to submit successor job"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 srun uv --offline run inference --from-run-id "$CKPT" --run-id "$RUN_ID" \
   --options test_config.start_date=199001010000 test_config.end_date=201412310000 \
   test_config.output.num_samples=1 test_config.samples_per_mini_epoch=1 \
-  test_config.forecast.num_steps="$NUM_STEPS" test_config.forecast.chunk_size=50 \
+  test_config.forecast.num_steps="$NUM_STEPS" test_config.forecast.chunk_size="$CHUNK" \
   test_config.forecast.free_running=true test_config.forecast.resume=true \
   test_config.output.streams=["CLIMATEDT_ATMO","CLIMATEDT_OCEAN"] test_config.compute_loss=false \
   streams.CLIMATEDT_ATMO.max_num_targets=-1 streams.CLIMATEDT_OCEAN.max_num_targets=-1

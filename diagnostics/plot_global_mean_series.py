@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Global-mean time series of one field for several rollouts, plus the ERA5 target.
+Global-mean time series of one field for several rollouts, plus the truth target.
 
 One line per run (and one for the truth), each point the global mean of that field at that
 forecast step. This is the absolute view that complements the difference animations: it shows
@@ -53,13 +53,31 @@ def _region_masks(coords, cache, equator_band=0.5):
     return m
 
 
-def mean_series(src, field, steps, group, regions=REGIONS, equator_band=0.5):
-    """Per-step area mean of `field` per region, or None if that group is absent."""
+def mean_series(src, field, steps, group, regions=REGIONS, equator_band=0.5, mask_group=None):
+    """
+    Per-step area mean of `field` per region, or None if that group is absent.
+
+    `mask_group` (e.g. "target") restricts the mean to points where THAT group's same field is
+    finite. Ocean fields are NaN over land in the target but finite everywhere in the
+    prediction, so without this the target mean is ocean-only while the prediction mean
+    includes land -- two different quantities plotted as if comparable.
+    """
     root = src[steps[0]]
     if group not in root[str(steps[0])]:
         return None
     ch = list(root[f"{steps[0]}/{group}"].attrs["channels"]).index(field)
     has_ens = root[f"{steps[0]}/{group}/data"].ndim == 3
+    m_ch = m_ens = None
+    if mask_group is not None:
+        if mask_group not in root[str(steps[0])]:
+            raise ValueError(f"--mask-land needs the '{mask_group}' group, which is absent")
+        m_ch = list(root[f"{steps[0]}/{mask_group}"].attrs["channels"]).index(field)
+        m_ens = root[f"{steps[0]}/{mask_group}/data"].ndim == 3
+        # positional masking is only valid if both groups order their points the same way
+        a = np.asarray(root[f"{steps[0]}/{group}/coords"])
+        b = np.asarray(root[f"{steps[0]}/{mask_group}/coords"])
+        if a.shape != b.shape or not np.allclose(a, b, atol=1e-5):
+            raise ValueError(f"{group} and {mask_group} coords differ; refusing to mask")
 
     out = {r: np.full(len(steps), np.nan, dtype=np.float64) for r in regions}
     times = np.empty(len(steps), dtype="datetime64[ns]")
@@ -77,6 +95,11 @@ def mean_series(src, field, steps, group, regions=REGIONS, equator_band=0.5):
             n_empty += 1
             continue
         v = np.asarray(d[:, ch, 0] if has_ens else d[:, ch])
+        if mask_group is not None:
+            md = src[s][f"{s}/{mask_group}"]["data"]
+            if md.shape[0] == v.shape[0]:
+                mv = np.asarray(md[:, m_ch, 0] if m_ens else md[:, m_ch])
+                v = np.where(np.isfinite(mv), v, np.nan)
         masks = _region_masks(np.asarray(nd["coords"]), mask_cache, equator_band)
         if not _reported:
             n_tot = len(v)
@@ -84,6 +107,10 @@ def mean_series(src, field, steps, group, regions=REGIONS, equator_band=0.5):
                       for r in regions}
             print(f"    points per region (of {n_tot}): {counts}"
                   f"  [excluded |lat| < {equator_band} deg from nh/sh]", flush=True)
+            if mask_group is not None:
+                nv = int(np.isfinite(v).sum())
+                print(f"    masked by {mask_group}: {nv}/{n_tot} valid "
+                      f"({100 * (1 - nv / n_tot):.1f}% dropped as land/missing)", flush=True)
             _reported = True
         for r in regions:
             out[r][i] = np.nanmean(v[masks[r]])
@@ -141,12 +168,16 @@ def main():
     ap.add_argument("--stream", default="ERA5")
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--max-frames", type=int, default=0)
-    ap.add_argument("--no-target", action="store_true", help="skip the ERA5 truth line")
+    ap.add_argument("--no-target", action="store_true", help="skip the truth line")
     ap.add_argument("--out-dir", default="results/comparison")
     ap.add_argument("--smooth-days", type=float, default=0,
                     help="overlay a running mean of this many days on top of the raw 6-hourly "
                          "series (0 = off). The raw signal carries a strong diurnal cycle; a "
                          "1-day mean removes it, a 30-day mean leaves only the seasonal march.")
+    ap.add_argument("--mask-land", action="store_true",
+                    help="restrict the mean to points where the TARGET is finite. Ocean fields "
+                         "are NaN over land in the target but filled in the prediction, so "
+                         "without this the two means cover different areas")
     ap.add_argument("--equator-band", type=float, default=0.5,
                     help="exclude |lat| < this many degrees from the NH/SH means; the o96 grid "
                          "rows at +/-0.4675 deg straddle the equator and belong to neither "
@@ -189,7 +220,8 @@ def main():
         if args.max_frames:
             steps = steps[: args.max_frames]
         got = mean_series(src, args.field, steps, "prediction",
-                          equator_band=args.equator_band)
+                          equator_band=args.equator_band,
+                          mask_group="target" if args.mask_land else None)
         if got is None:
             raise ValueError(f"{run} has no prediction group")
         per_region, t = got
@@ -198,7 +230,7 @@ def main():
         if times is None:
             times, ref_steps = t, steps
 
-        # the truth is the same ERA5 field for every run, so read it once, from the first
+        # the truth is the same field for every run, so read it once, from the first
         if not target_done:
             target_done = True
             got_t = mean_series(src, args.field, steps, "target",
@@ -213,7 +245,7 @@ def main():
                     print("  target group is all zeros (free-running beyond coverage); skipping")
                 else:
                     for r in REGIONS:
-                        series[r]["target (ERA5)"] = tgt[r]
+                        series[r][f"target ({args.stream})"] = tgt[r]
                     # partial coverage: real truth for a while, then zeros -> blank those
                     for r in REGIONS:
                         mask_missing_target(series[r])
@@ -261,7 +293,10 @@ def _apply_labels(args, series):
     if unknown:
         raise ValueError(f"--label names series not present: {unknown}; have {list(series)}")
     renamed = {mapping.get(k, k): v for k, v in series.items()}
-    return renamed, mapping.get(args.run[0], args.run[0])
+    # difference panel is prediction - target, so the truth is the baseline when present;
+    # with no target line, fall back to the first run (run-vs-run spread)
+    base = next((k for k in renamed if k.startswith("target")), None)
+    return renamed, base or mapping.get(args.run[0], args.run[0])
 
 
 _REGION_TITLE = {"global": "global", "nh": "northern-hemisphere", "sh": "southern-hemisphere"}
@@ -294,13 +329,12 @@ def _plot(out_dir, args, times, series, region="global", suffix=""):
 
     ax.set_ylabel(f"{_REGION_TITLE[region]}-mean {args.field} (K)")
     smooth_note = f"  ({args.smooth_days:g}-day running mean; faint = raw 6-hourly)" if win > 1 else ""
-    ax.set_title(f"{_REGION_TITLE[region].capitalize()}-mean {args.field} "
-                 f"through the free-running rollout{smooth_note}")
+    ax.set_title(f"{_REGION_TITLE[region].capitalize()}-mean {args.field}{smooth_note}")
     ax.legend(loc="best", fontsize=9, ncol=2)
     ax.grid(alpha=0.25)
 
-    # lower panel: same series minus the first run, which makes the spread readable when the
-    # seasonal cycle (tens of K) dwarfs the differences between runs (order 1 K)
+    # lower panel: each run minus the truth (bias), readable where the seasonal cycle
+    # (tens of K) dwarfs the differences (order 1 K). No truth -> minus the first run.
     base = series[base_name]
     for name, v in series.items():
         if name == base_name:

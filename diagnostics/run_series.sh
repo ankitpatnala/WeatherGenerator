@@ -3,6 +3,7 @@
 # run_comparison.sh; reading the 58GB zips belongs on a compute node, not the login node.
 #
 #   RUNS="a b c" FIELD=2t sbatch diagnostics/run_series.sh
+#   RUNS=ifs_nemo_v2_kmihf0u3 STREAM=CLIMATEDT_ATMO FIELD=2m_temperature sbatch diagnostics/run_series.sh
 
 #SBATCH --job-name=global_mean_series
 #SBATCH --exclusive --mem=450G
@@ -21,6 +22,10 @@ export MPLBACKEND=Agg
 
 read -r -a _runs <<< "${RUNS:-sst_exp1_1y_0K sst_exp1_1y_2K sst_exp1_1y_4K}"
 FIELD="${FIELD:-2t}"
+# channel names are stream-specific (ClimateDT uses long names, ERA5 short ones)
+STREAM="${STREAM:-ERA5}"
+# MASK_LAND=1 restricts the mean to points where the target is finite (ocean fields)
+_mask=(); [ -n "${MASK_LAND:-}" ] && _mask=(--mask-land)
 _args=(); for r in "${_runs[@]}"; do _args+=(--run "$r"); done
 # LABELS="run=Display;run2=Display2" renames series in the figures (CSV keeps the run ids)
 if [ -n "${LABELS:-}" ]; then
@@ -28,14 +33,14 @@ if [ -n "${LABELS:-}" ]; then
   for l in "${_labels[@]}"; do _args+=(--label "$l"); done
 fi
 
-echo "===== $(date +%H:%M) series: runs=${_runs[*]} field=$FIELD ====="
+echo "===== $(date +%H:%M) series: runs=${_runs[*]} stream=$STREAM field=$FIELD ====="
 OUT_DIR="${OUT_DIR:-results/comparison}"
 # smoke output lives under OUT_DIR, not a fixed path -- two jobs running concurrently for
 # different experiments would otherwise overwrite each other's smoke files
-.venv/bin/python3 diagnostics/plot_global_mean_series.py "${_args[@]}" --field "$FIELD" \
+.venv/bin/python3 diagnostics/plot_global_mean_series.py "${_args[@]}" "${_mask[@]}" --stream "$STREAM" --field "$FIELD" \
   --max-frames 8 --out-dir "$OUT_DIR/_smoke" || { echo "SMOKE FAILED"; exit 1; }
 
 echo "===== $(date +%H:%M) full ====="
-.venv/bin/python3 diagnostics/plot_global_mean_series.py "${_args[@]}" --field "$FIELD" \
+.venv/bin/python3 diagnostics/plot_global_mean_series.py "${_args[@]}" "${_mask[@]}" --stream "$STREAM" --field "$FIELD" \
   --out-dir "$OUT_DIR" || echo "FAILED: series"
 echo "===== $(date +%H:%M) all done ====="
