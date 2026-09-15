@@ -10,7 +10,7 @@
 ERA5 :
   type : anemoi
   filenames: ['aifs-ea-an-oper-0001-mars-o96-1979-2024-1h-v3-with-era51.zarr']
-    anemoi_config:
+  anemoi_config:
     dataset: "/e/data1/slmet/ml_training/aifs-ea-an-oper-0001-mars-o96-1979-2024-1h-v3-with-era51.zarr"
     rolling_average: [-23, 0, "frequency"]
   stream_id : 0
